@@ -38,7 +38,7 @@ one of them in the same commit. Reconciled 30 Sep 2026 (the two sides had been b
 `economics.stripe_fee_absorbed`), `restricted_jurisdictions[]`, `legal_versions{doc key → version}`,
 `economics{builder_fee_tenths_bp, builder_split_*_bps, profit_share_creator_cap_bps (1200), platform_profit_share_bps (150), platform_profit_share_mode ("on_top"), subscription_platform_bps, post_platform_fee_micro, post_min_price_micro, min_topup_micro, past_due_grace_hours, stripe_fee_absorbed}`,
 `plans[{key, price_monthly_micro, max_active_strategies|null, features[]}]`, `referral_tiers[{name, min_active_users, min_notional_30d_micro, share_of_pool_bps}]`,
-`features{creator_uploads, payouts}`, `platform_max_leverage`, `max_user_leverage_x100|null` **(new, launch cap)**,
+`features{creator_uploads, payouts}`, `platform_max_leverage`, `max_user_leverage_x100|null` (optional operator limit; `null` by default — owner removed allocation and leverage caps),
 `min_allocation_micro` (100 USD), `min_listing_history_days` (180) **(new)**, `short_history_warning_days` (365) **(new)**, `launch_phase`.
 
 ### `StrategySummary` (list) / `StrategyDetail`
@@ -50,6 +50,7 @@ SILVER (SPEC §12): `free_showcase=true`, `showcase_text` = "Free showcase of th
 Not provided (web guessed, dropped): `creator_name`, `featured`, per-strategy `showcase` embed.
 
 ### `EquitySeriesOut` (GET `/public/strategies/{slug}/equity`)
+Shape: `{slug, version (int|null), since (ISO datetime|null), points: [{t: "YYYY-MM-DD" (UTC day string), pnl_micro, roi_bps|null}], hidden_reason: null|"not_live"|"too_few_subscribers"}`.
 Daily aggregate LIVE record of the **current version** (a new version resets it), from the same inputs as `stats`
 (subscribers' fills `closedPnl − fee` + funding, `app.domain.track_record.daily_series`): one point per UTC day since
 `since` (= the version's `live_since`), at most the latest 1000 days. `t` = the UTC day (`"YYYY-MM-DD"`); `pnl_micro` =
@@ -65,7 +66,7 @@ never went live → `hidden_reason: "not_live"`. Cacheable 60 s like every `/pub
 |---|---|---|---|---|---|
 | GET `/me` | MFA | — | `MeOut {id, email, display_name, role, plan, status, referral_code, country_attested, mfa_enrolled, created_at, consents_complete, wallets[{address, verified_at}], kyc_status|null}` (**kyc_status new**: `pending` \| `provider_approved` (provider passed, awaiting our admin) \| `approved` \| `rejected`) | 403 suspended/not allow-listed | core state |
 | PATCH `/me` | MFA | `{display_name?, referral_code_used?}` | `MeOut` | 409 already bound, 403 self-referral/window, 404 code | main.ts (first-touch ref) |
-| POST `/me/plan` 🔑 | consent | `{plan: "free"\|"pro"\|"max"}` | `PlanChangeOut {plan, charged_micro, period_end|null, fee_balance_micro}` | 402 `insufficient_balance` (details `balance_micro`, `required_micro`) · 409 already on this plan · 409 too many active strategies for the plan (details `active`) | plan picker (see below) |
+| POST `/me/plan` 🔑 | consent | `{plan: "free"\|"pro"\|"max"}` | `PlanChangeOut {plan, charged_micro, period_end|null, fee_balance_micro}` | 402 `insufficient_balance` (details `balance_micro`, `required_micro`) · 409 already on this plan · 409 too many active strategies for the plan (details `active`) | plan picker in the UI (see below) |
 | GET `/consents/status` | MFA | — | `{required, accepted, missing[], complete}` | — | — |
 | POST `/consents` | MFA | `{consents:[{doc, doc_version, context, strategy_id?, accepted_at?, doc_text_sha256, country?}]}` (1–10) | `ConsentStatusOut` | 409 version changed (details.current_version) · **409 reason `legal_text_mismatch`** · 422 missing hash · 451 restricted country · 503 prod without canonical hashes | gate.ts (site + subscribe), creator (creator_agreement) |
 
@@ -119,7 +120,7 @@ action locally with the wallet's current chain id.
 |---|---|---|---|---|---|
 | GET `/subscriptions` | consent | `?limit≤100&cursor` | `Page<SubscriptionOut>` | — | dashboard, subscribe |
 | GET `/subscriptions/{id}` | consent | — | `SubscriptionOut` | 404 | — |
-| POST `/subscriptions` 🔑 | step-up | `{strategy_id, trading_address, allocation_micro (≥ 100 USD), max_leverage_x100 (100–2000, ≤ min(version MAX_LEVERAGE, platform, launch cap)), expected_price_monthly_micro, expected_profit_share_bps}` (+ optional inline `ack`) | 201 `{subscription, charged_micro, fee_balance_micro}` | 402 `insufficient_balance` (price + reserve = min top-up when any profit share can accrue) · 409 reasons `contacts_required` (code), `builder_fee_not_approved`, `terms_changed`, `subscription_ack_required` (ack must be ≤ 30 min old), `agent_not_active`, `trading_address_in_use` · 403 reason `plan_limit`, caps · 404 not listed · 422 leverage (details.max_x100) | subscribe |
+| POST `/subscriptions` 🔑 | step-up | `{strategy_id, trading_address, allocation_micro (≥ 100 USD), max_leverage_x100 (100–2000, ≤ the version's MAX_LEVERAGE; each market's own max leverage + liquidity guards apply at order time), expected_price_monthly_micro, expected_profit_share_bps}` (+ optional inline `ack`) | 201 `{subscription, charged_micro, fee_balance_micro}` | 402 `insufficient_balance` (price + reserve = min top-up when any profit share can accrue) · 409 reasons `contacts_required` (code), `builder_fee_not_approved`, `terms_changed`, `subscription_ack_required` (ack must be ≤ 30 min old), `agent_not_active`, `trading_address_in_use` · 403 reason `plan_limit` (403 allocation limit only if an operator limit is configured; none by default) · 404 not listed · 422 leverage (details.max_x100) | subscribe |
 | PATCH `/subscriptions/{id}` | step-up | `{allocation_micro?, max_leverage_x100?, paused?}` | `SubscriptionOut` | 409 not changeable / `agent_not_active` · 422 | dashboard (pause/resume/edit) |
 | DELETE `/subscriptions/{id}` | step-up | `{"positions": "close"\|"leave"}` (**required**) | `SubscriptionOut` (`closing` or `cancelled`) | 409 already cancelled | core `subscriptions.cancelButtons` from the dashboard |
 

@@ -8,8 +8,9 @@ Create checks (all fail closed):
   * trading address = a verified wallet of the user, or a Hyperliquid sub-account whose master is one;
   * our agent is ACTIVE for that master; the builder-fee approval (checked live on-chain) ≥ required fee;
   * no other live subscription on the trading address (also a DB unique index);
-  * plan allows one more strategy; launch-phase caps (per-user / platform allocation, max leverage);
-  * leverage ≤ min(platform cap, the version's MAX_LEVERAGE, launch cap);
+  * plan allows one more strategy; optional operator allocation / leverage limits from config (owner 30 Sep 2026:
+    none — unset by default; the market's own max leverage and the liquidity guards still apply at order time);
+  * leverage ≤ min(the version's MAX_LEVERAGE, the platform input ceiling, an operator limit if one is set);
   * fee balance ≥ first charge + reserve. DECISION: first charge = the monthly price (prepaid now; creator 97% /
     platform 3%); reserve = economics.min_topup_micro whenever profit share can accrue (creator % > 0 or the
     platform's 1.5% > 0), so the first daily settlement can be paid. For SILVER ($0, 0% creator) the platform
