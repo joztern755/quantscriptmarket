@@ -75,6 +75,19 @@ SQL_CONNECTION_NAME="${PROJECT_ID}:${REGION}:${SQL_INSTANCE}"
 KMS_KEY_NAME="projects/${PROJECT_ID}/locations/${REGION}/keyRings/${KMS_KEYRING}/cryptoKeys/${KMS_KEY}"
 KMS_CODE_KEY_NAME="projects/${PROJECT_ID}/locations/${REGION}/keyRings/${KMS_KEYRING}/cryptoKeys/${KMS_CODE_KEY}"
 KMS_SQL_KEY_NAME="projects/${PROJECT_ID}/locations/${REGION}/keyRings/${KMS_KEYRING}/cryptoKeys/${KMS_SQL_KEY}"
+# Agent attestation (REVIEW_WEB_INFRA H1): ASYMMETRIC_SIGN, EC_SIGN_P256_SHA256, HSM. Only the executor SA may sign
+# (roles/cloudkms.signer); the api SA has NO role on it. Its public key is pinned in web/public/app-config.json
+# (trust.agentAttestPublicKeySpki). Asymmetric keys do not rotate automatically: a new version = a reviewed
+# app-config.json change + KMS_ATTEST_KEY_VERSION bump (DEPLOY.md §12).
+: "${KMS_ATTEST_KEY:=agent-attest}"
+: "${KMS_ATTEST_KEY_VERSION:=1}"
+KMS_ATTEST_KEY_NAME="projects/${PROJECT_ID}/locations/${REGION}/keyRings/${KMS_KEYRING}/cryptoKeys/${KMS_ATTEST_KEY}"
+KMS_ATTEST_KEY_VERSION_NAME="${KMS_ATTEST_KEY_NAME}/cryptoKeyVersions/${KMS_ATTEST_KEY_VERSION}"
+# Binary Authorization attestor key (REVIEW_WEB_INFRA H2): only the image BUILDER SA may sign with it.
+: "${KMS_BINAUTHZ_KEY:=binauthz-attestor}"
+KMS_BINAUTHZ_KEY_NAME="projects/${PROJECT_ID}/locations/${REGION}/keyRings/${KMS_KEYRING}/cryptoKeys/${KMS_BINAUTHZ_KEY}"
+: "${BINAUTHZ_ATTESTOR:=aijalon-ci}"
+: "${BINAUTHZ_ENFORCE:=0}"                        # 0 = dry-run (audit log only) · 1 = block unattested images
 
 # ---- service accounts (ids must be 6-30 chars) ----------------------------------------------------------
 SA_API_ID="aijalon-api"
@@ -83,6 +96,12 @@ SA_SANDBOX_ID="aijalon-sandbox"
 SA_SCHEDULER_ID="aijalon-scheduler"
 SA_DEPLOYER_ID="aijalon-deployer"
 SA_MIGRATOR_ID="aijalon-migrator"
+# REVIEW_WEB_INFRA H2: three CI identities, each reachable only from its own GitHub environment (WIF bindings):
+#   builder  (environment production-build)   push images + sign Binary Authorization attestations; no Run, no actAs
+#   deployer (environment production)         deploy Run services/jobs by digest, pause/resume `tick`; no AR write
+#   hosting  (environment production-hosting) roles/firebasehosting.admin ONLY; no actAs, no Run
+SA_BUILDER_ID="aijalon-builder"
+SA_HOSTING_ID="aijalon-hosting-deployer"
 sa_email() { printf '%s@%s.iam.gserviceaccount.com' "$1" "${PROJECT_ID}"; }
 SA_API="$(sa_email "${SA_API_ID}")"
 SA_EXECUTOR="$(sa_email "${SA_EXECUTOR_ID}")"
@@ -90,6 +109,8 @@ SA_SANDBOX="$(sa_email "${SA_SANDBOX_ID}")"
 SA_SCHEDULER="$(sa_email "${SA_SCHEDULER_ID}")"
 SA_DEPLOYER="$(sa_email "${SA_DEPLOYER_ID}")"
 SA_MIGRATOR="$(sa_email "${SA_MIGRATOR_ID}")"
+SA_BUILDER="$(sa_email "${SA_BUILDER_ID}")"
+SA_HOSTING="$(sa_email "${SA_HOSTING_ID}")"
 # Cloud SQL IAM database user name of a service account = its e-mail without ".gserviceaccount.com"
 DB_IAM_USER_API="${SA_API_ID}@${PROJECT_ID}.iam"
 DB_IAM_USER_EXECUTOR="${SA_EXECUTOR_ID}@${PROJECT_ID}.iam"
@@ -200,11 +221,24 @@ SCHEDULER_SPEC=(
   "referral-tiers|15 1 * * *|referral-tiers|900s|3"
   "verify-chain|40 3 * * *|verify-chain|900s|3"
   "agent-expiry-scan|13 */6 * * *|agent-expiry-scan|300s|1"
+  # REVIEW_WEB_INFRA H1: executor attestation of new agent keys (the subscribe wizard waits for it, so every minute),
+  # and the 10-minute scan for a foreign agent carrying our agent name (offset from fills-ingest/candles-sync).
+  "attest-agents|* * * * *|attest-agents|120s|0"
+  "agent-substitution-scan|3-53/10 * * * *|agent-substitution-scan|300s|0"
 )
+# Deploy-only probe (REVIEW_WEB_INFRA M4): POST <candidate tag URL>/v1/internal/selftest, OIDC as the scheduler SA.
+# Created PAUSED by bootstrap `scheduler`, NOT in SCHEDULER_SPEC (so `make go-live` never resumes it); the deployer
+# may only run/pause/resume it (custom role, bootstrap `sa`), never change its URI.
+SELFTEST_JOB="executor-selftest"
+CANDIDATE_TAG="candidate"
 
 # ---- Workload Identity Federation ------------------------------------------------------------------------
 WIF_POOL="github"
 WIF_PROVIDER="github-oidc"
+# GitHub environments -> the only SA each may impersonate (principalSet on attribute.environment, bootstrap `wif`)
+GH_ENV_DEPLOY="production"
+GH_ENV_BUILD="production-build"
+GH_ENV_HOSTING="production-hosting"
 
 # ---- local outputs (never inside the repo) ---------------------------------------------------------------
 : "${OUT_DIR:=${HOME}/.aijalon-deploy/${PROJECT_ID}}"

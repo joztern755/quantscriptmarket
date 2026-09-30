@@ -222,6 +222,18 @@ step_kms() {
     gcloud kms keys create "${KMS_CODE_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" \
       --purpose=encryption --protection-level=hsm --rotation-period=90d \
       --next-rotation-time="$(utc_in_days 90)" --destroy-scheduled-duration=90d --labels=app=aijalon,data=creator-code
+  # Agent attestation key (REVIEW_WEB_INFRA H1): the executor signs "aijalon-agent-v1|user|agent" after opening the
+  # sealed key; browsers verify with the public key pinned in web/public/app-config.json. P-256 because WebCrypto
+  # verifies it natively. IAM (step `sa`): executor = signer, nobody else.
+  exists gcloud kms keys describe "${KMS_ATTEST_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" || \
+    gcloud kms keys create "${KMS_ATTEST_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" \
+      --purpose=asymmetric-signing --default-algorithm=ec-sign-p256-sha256 --protection-level=hsm \
+      --destroy-scheduled-duration=90d --labels=app=aijalon,data=agent-attest
+  # Binary Authorization attestor key (REVIEW_WEB_INFRA H2): only the image builder SA signs with it (step `binauthz`).
+  exists gcloud kms keys describe "${KMS_BINAUTHZ_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" || \
+    gcloud kms keys create "${KMS_BINAUTHZ_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" \
+      --purpose=asymmetric-signing --default-algorithm=ec-sign-p256-sha256 --protection-level=hsm \
+      --destroy-scheduled-duration=90d --labels=app=aijalon,data=binauthz
   if [[ "${SQL_ENABLE_CMEK}" == "1" ]]; then
     exists gcloud kms keys describe "${KMS_SQL_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" || \
       gcloud kms keys create "${KMS_SQL_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" \

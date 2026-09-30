@@ -471,18 +471,6 @@ _seen_devices = _SeenCache()
 _seen_networks = _SeenCache()
 
 
-def clean_display_name(raw: Any) -> Optional[str]:
-    """F18: provider-supplied names (Google `name`) are untrusted text: NFC, no control/format characters, no angle
-    brackets, whitespace collapsed, ≤ 64 chars."""
-    import unicodedata
-    if not isinstance(raw, str):
-        return None
-    s = unicodedata.normalize("NFC", raw)
-    s = "".join(ch for ch in s if unicodedata.category(ch) not in ("Cc", "Cf") and ch not in "<>")
-    s = " ".join(s.split())[:64].strip()
-    return s or None
-
-
 def _referral_code_from(request: Request, claims: dict[str, Any], svc: Services) -> Optional[str]:
     """First-touch referral: a signed `ref` custom claim wins; else the X-Ref-Code header. Only used at creation."""
     raw = claims.get("ref") if isinstance(claims.get("ref"), str) else None
@@ -499,8 +487,8 @@ def _create_user(conn: Any, svc: Services, request: Request, claims: dict[str, A
     # the signup device and network (peppered) — compared with the referrer's before the binding (F7/M2)
     from app.api import login_events
     from app.api.referral_guard import self_referral_check
-    dev_hash, _ = login_events.device_key({k.lower(): val for k, val in request.headers.items()
-                                          if k.lower() in ("user-agent", "x-device-id")}, svc.config.pepper)
+    hdrs = {k.lower(): val for k, val in request.headers.items() if k.lower() in ("user-agent", "x-device-id")}
+    dev_hash = login_events.device_key(hdrs, svc.config.pepper)[0] if login_events.has_device_id(hdrs) else None
     net_hash = login_events.network_hash(client_ip(request), svc.config.pepper)
     if code:
         ref = svc.store.get_user_by_referral_code(conn, code)
@@ -519,7 +507,7 @@ def _create_user(conn: Any, svc: Services, request: Request, claims: dict[str, A
             conn,
             firebase_uid=uid,
             email=(claims.get("email") or None),
-            display_name=clean_display_name(claims.get("name")),
+            display_name=v.clean_display_name(claims.get("name")),
             referral_code=svc.domain.generate_referral_code(),
             referred_by=referrer_id,
             mfa_enrolled=True,
@@ -587,12 +575,15 @@ def current_user(request: Request, svc: Services = Depends(get_services)) -> Aut
         # (app.api.login_events). The LRU caches keep the DB writes to once per (user, country|device) per instance.
         from app.api import login_events
 
-        dev_hash, dev_label = login_events.device_key({k.lower(): val for k, val in request.headers.items()
-                                                       if k.lower() in ("user-agent", "x-device-id")}, cfg.pepper)
+        hdrs = {k.lower(): val for k, val in request.headers.items() if k.lower() in ("user-agent", "x-device-id")}
+        dev_hash, dev_label = login_events.device_key(hdrs, cfg.pepper)
+        new_device_seen = bool(dev_hash) and _seen_devices.add(f"{user['id']}:{dev_hash}")
         login_events.record_sign_in(
             conn, svc, user=user, claims=claims, country=country, device_hash=dev_hash, device_label_=dev_label,
             ip_hash=ip_hash, check_country=bool(country) and _seen_countries.add(f"{user['id']}:{country}"),
-            check_device=bool(dev_hash) and _seen_devices.add(f"{user['id']}:{dev_hash}"))
+            check_device=new_device_seen)
+        if new_device_seen and login_events.has_device_id(hdrs) and hasattr(svc.store, "mark_device_id"):
+            svc.store.mark_device_id(conn, str(user["id"]), dev_hash)   # F7: a real device id (not the UA fallback)
         net = login_events.network_hash(client_ip(request), cfg.pepper)
         if net and hasattr(svc.store, "record_ip_net") and _seen_networks.add(f"{user['id']}:{net}"):
             svc.store.record_ip_net(conn, str(user["id"]), net)

@@ -192,3 +192,16 @@ def parse_issued_at(value: str) -> datetime:
     if ts.tzinfo is None:
         raise InputError("timestamp must include a timezone")
     return ts.astimezone(timezone.utc)
+
+
+# ------------------------------------------------------------------------------------------------ display names
+def clean_display_name(raw: object) -> str | None:
+    """F18: provider-supplied names (Google `name`) are untrusted text: NFC, no control/format characters, no angle
+    brackets, whitespace collapsed, ≤ 64 chars."""
+    import unicodedata
+    if not isinstance(raw, str):
+        return None
+    s = unicodedata.normalize("NFC", raw)
+    s = "".join(ch for ch in s if unicodedata.category(ch) not in ("Cc", "Cf") and ch not in "<>")
+    s = " ".join(s.split())[:64].strip()
+    return s or None

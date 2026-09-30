@@ -88,9 +88,10 @@ class FakeWorld:
                                       "accepted_at": self.now})
         return row
 
-    def add_wallet(self, user_id: str, address: str) -> None:
-        self.wallets[address] = {"user_id": user_id, "address": address, "verified_at": self.now,
-                                 "created_at": self.now}
+    def add_wallet(self, user_id: str, address: str, *, verified_at: Optional[datetime] = None) -> None:
+        """Verified a week ago by default (older than the 48 h payout-address hold, REVIEW_AUTH_API F5)."""
+        at = verified_at or (self.now - timedelta(days=7))
+        self.wallets[address] = {"user_id": user_id, "address": address, "verified_at": at, "created_at": at}
 
     def add_agent(self, user_id: str, master: str, *, status: str = "active") -> dict:
         row = {"id": _id(), "created_at": self.now, "user_id": user_id, "master_address": master,
@@ -150,7 +151,10 @@ class FakeDatabase:
 _LIVE = ("pending", "active", "past_due", "reduce_only", "paused_user", "closing")
 
 
-class FakeStore:
+from app.api.testing_security import FakeSecurityStoreMixin  # noqa: E402  (security-fix round store fakes)
+
+
+class FakeStore(FakeSecurityStoreMixin):
     def __init__(self, world: FakeWorld) -> None:
         self.w = world
 
@@ -366,19 +370,26 @@ class FakeStore:
         return next((dict(s) for s in self._subs() if s["trading_address"] == address
                      and s["status"] in ("pending", "active", "past_due", "reduce_only", "closing")), None)
 
+    def trading_addresses(self, conn, user_id):
+        subs = {s["trading_address"] for s in self._subs(user_id) if s["status"] in _LIVE}
+        wallets = {a for a, w in self.w.wallets.items() if w["user_id"] == user_id and w["verified_at"]}
+        return sorted(subs | wallets)
+
     def _with_strategy(self, s):
         st = self.w.strategies[s["strategy_id"]]
         return {**s, "strategy_slug": st["slug"], "strategy_name": st["name"], "strategy_markets": st["markets"]}
 
     def insert_subscription(self, conn, *, user_id, strategy_id, version_id, trading_address, master_address,
-                            allocation_micro, max_leverage_x100, status, current_period_end):
+                            allocation_micro, max_leverage_x100, status, current_period_end, price_monthly_micro=None,
+                            profit_share_bps=None):
         if self.live_subscription_on_address(conn, trading_address):
             raise Conflict("already exists")
         row = {"id": _id(), "created_at": self.w.now, "user_id": user_id, "strategy_id": strategy_id,
                "strategy_version_id": version_id, "trading_address": trading_address, "master_address": master_address,
                "allocation_micro": allocation_micro, "max_leverage_x100": max_leverage_x100, "status": status,
                "current_period_end": current_period_end, "hwm_micro": 0, "cum_pnl_micro": 0,
-               "cancel_positions": None, "cancelled_at": None}
+               "cancel_positions": None, "cancelled_at": None, "past_due_since": None,
+               "price_monthly_micro": price_monthly_micro, "profit_share_bps": profit_share_bps}
         self.w.subscriptions[row["id"]] = row
         return self._with_strategy(row)
 

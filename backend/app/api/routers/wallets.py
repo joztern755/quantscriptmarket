@@ -72,6 +72,10 @@ def verify_wallet(body: S.WalletVerifyIn, ctx: AuthCtx = Depends(step_up_user),
             svc.audit.write(conn, actor=ctx.actor, action="wallet.verify_conflict", target=f"wallet:{body.address}",
                             payload={}, ip_hash=ctx.ip_hash)
             raise Conflict("this wallet is linked to another account")
+        # REVIEW_WEB_INFRA H1: keep the verified proof; admins' browsers re-verify it before paying this wallet.
+        from app.api.routers.trust import record_wallet_proof
+        record_wallet_proof(conn, user_id=ctx.user_id, address=body.address, message=body.message,
+                            signature=body.signature, now=now)
         referrer = ctx.user.get("referred_by")
         if referrer:
             # Referral binding is immutable (SPEC §1.2): a match (wallet, device, network) FLAGS the referee — no

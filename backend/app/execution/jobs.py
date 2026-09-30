@@ -822,3 +822,62 @@ def run_creator_signals(*, db: Any, now: datetime, runtime: Runtime | None = Non
                    "error": type(e).__name__, "detail": str(getattr(e, "message", ""))[:200]},
                   dedup=f"creator_signal_failed:{v['version_id']}:{bar_close.isoformat()}")
     return rep
+
+
+# ================================================================== signing-trust jobs (REVIEW_WEB_INFRA H1, M4)
+# Logic in app/execution/trust_jobs.py; these wrappers bind the process runtime (KMS decryptor, info client, rate
+# budget) like the other jobs. Routes: app/api/routers/internal_trust.py (executor only, Scheduler OIDC).
+_ATTEST_SIGNER: Any = None
+_ATTEST_LOCK = threading.Lock()
+
+
+def _attest_signer(rt: Runtime) -> Any:
+    global _ATTEST_SIGNER
+    with _ATTEST_LOCK:
+        if _ATTEST_SIGNER is None:
+            from app.security.kms import make_attestation_signer
+
+            _ATTEST_SIGNER = make_attestation_signer(rt.settings)
+        return _ATTEST_SIGNER
+
+
+def _agent_decryptor(rt: Runtime) -> Any:
+    with rt._lock:
+        if rt._agent_decryptor is None:
+            from app.security.kms import make_decryptor
+
+            rt._agent_decryptor = make_decryptor(rt.settings)   # the same single agent-key decryptor as the tick
+        return rt._agent_decryptor
+
+
+def attest_agents(*, db: Any, now: datetime, runtime: Runtime | None = None, signer: Any = None,
+                  decryptor: Any = None, limit: int = 100) -> dict[str, Any]:
+    """/internal/attest-agents (every minute): executor attestation of each new agent key (see trust_jobs)."""
+    from .trust_jobs import attest_agents as _run
+
+    rt = runtime or get_runtime()
+    return _run(db, _aware(now), decryptor=decryptor or _agent_decryptor(rt), signer=signer or _attest_signer(rt),
+                limit=limit)
+
+
+def agent_substitution_scan(*, db: Any, now: datetime, runtime: Runtime | None = None, info: Any = None) -> dict[str, Any]:
+    """/internal/agent-substitution-scan (every 10 min): a foreign agent named like ours → critical alert."""
+    from .trust_jobs import agent_substitution_scan as _run
+
+    rt = runtime or get_runtime()
+    pdb = _db(db)
+    rt.bind_db(pdb)
+    return _run(db, _aware(now), info=info, settings=rt.settings, rate_budget=rt.rate_budget)
+
+
+def executor_selftest(*, db: Any, now: datetime, runtime: Runtime | None = None) -> dict[str, Any]:
+    """/internal/selftest (deploy: new revision, before traffic): side-effect-free dry-run of the tick's inputs."""
+    from .trust_jobs import executor_selftest as _run
+
+    rt = runtime or get_runtime()
+    pdb = _db(db)
+    rt.bind_db(pdb)
+    return _run(pdb, _aware(now), runtime=rt, signer_factory=lambda: _attest_signer(rt))
+
+
+__all__ += ["attest_agents", "agent_substitution_scan", "executor_selftest"]

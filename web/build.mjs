@@ -153,7 +153,7 @@ if (existsSync(sriPath)) {
   for (const f of ["firebase-app.js", "firebase-auth.js"]) if (!(f in sri)) fail(`sri.json: missing hash for ${f}`);
   for (const [f, v] of Object.entries(sri)) {
     if (f === "version" || f.startsWith("_")) continue;
-    if (!/^[a-z0-9][a-z0-9._-]*\.js$/.test(f)) fail(`sri.json: unexpected module name ${f}`);
+    if (!/^[a-z0-9][a-z0-9._/-]*\.js$/.test(f) || f.includes("..")) fail(`sri.json: unexpected module name ${f}`);
     if (!/^sha(384|512)-[A-Za-z0-9+/]+={0,2}$/.test(String(v))) fail(`sri.json: invalid hash for ${f}`);
     integrity[base + f] = v;
   }

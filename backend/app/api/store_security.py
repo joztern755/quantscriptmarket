@@ -168,6 +168,12 @@ class SecurityStoreMixin:
             RETURNING (xmax = 0) AS inserted""", u=user_id, h=net_hash)
         return bool(row and row["inserted"])
 
+    def mark_device_id(self, conn: Any, user_id: str, device_hash: str) -> None:
+        """The hash came from the web's X-Device-Id (a real device identifier, not the user-agent fallback)."""
+        self._exec(conn, """UPDATE user_devices SET from_device_id = true
+                             WHERE user_id = CAST(:u AS uuid) AND device_hash = :h AND NOT from_device_id
+                            RETURNING device_hash""", u=user_id, h=device_hash)
+
     def set_device_fp_hash(self, conn: Any, user_id: str, device_hash: str) -> None:
         self._exec(conn, """UPDATE users SET device_fp_hash = :h WHERE id = CAST(:u AS uuid) AND device_fp_hash IS NULL
                             RETURNING id""", h=device_hash, u=user_id)
@@ -178,7 +184,7 @@ class SecurityStoreMixin:
             SELECT (SELECT coalesce(json_agg(w.master_address), '[]') FROM wallets w
                      WHERE w.user_id = CAST(:u AS uuid)) AS wallets,
                    (SELECT coalesce(json_agg(d.device_hash), '[]') FROM user_devices d
-                     WHERE d.user_id = CAST(:u2 AS uuid)) AS devices,
+                     WHERE d.user_id = CAST(:u2 AS uuid) AND d.from_device_id) AS devices,
                    (SELECT coalesce(json_agg(n.net_hash), '[]') FROM user_ip_nets n
                      WHERE n.user_id = CAST(:u3 AS uuid) AND n.last_seen >= CAST(:since AS timestamptz)) AS networks,
                    (SELECT u.device_fp_hash FROM users u WHERE u.id = CAST(:u4 AS uuid)) AS device_fp_hash""",

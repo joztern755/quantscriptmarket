@@ -154,54 +154,12 @@ class SqlDatabase:
 # =============================================================================================================
 # Auth
 # =============================================================================================================
-class VerifiedTokenCache:
-    """REVIEW_AUTH_API F19: the prod verifier makes one Firebase Auth backend call per request (revocation check).
-    A token that verified is remembered for at most ``ttl`` seconds (never past its own ``exp``), keyed by its
-    SHA-256, so a busy session costs ~1 backend call per minute instead of one per request. Trade-off (documented):
-    a token revoked meanwhile keeps working for ≤ ttl seconds; step-up freshness is still checked on every request
-    from ``auth_time``. Only successes are cached (a bad token is re-checked every time)."""
-
-    def __init__(self, ttl: float = 60.0, size: int = 20_000, clock: Callable[[], float] = time.time) -> None:
-        self._ttl, self._size, self._clock = float(ttl), int(size), clock
-        self._d: "OrderedDict[str, tuple[float, Any]]" = OrderedDict()
-        self._lock = threading.Lock()
-
-    @staticmethod
-    def key(token: str) -> str:
-        import hashlib
-        return hashlib.sha256(token.encode()).hexdigest()
-
-    def get(self, token: str) -> Any:
-        k, now = self.key(token), self._clock()
-        with self._lock:
-            hit = self._d.get(k)
-            if hit is None:
-                return None
-            if hit[0] <= now:
-                self._d.pop(k, None)
-                return None
-            self._d.move_to_end(k)
-            return hit[1]
-
-    def put(self, token: str, value: Any, exp: Any) -> None:
-        now = self._clock()
-        until = now + self._ttl
-        if isinstance(exp, (int, float)) and not isinstance(exp, bool):
-            until = min(until, float(exp))
-        if until <= now:
-            return
-        with self._lock:
-            self._d[self.key(token)] = (until, value)
-            self._d.move_to_end(self.key(token))
-            while len(self._d) > self._size:
-                self._d.popitem(last=False)
-
-
 class FirebaseAuthAdapter:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._verifier: Any = None
         self._lock = threading.Lock()
+        from app.api.caches import VerifiedTokenCache
         self._cache = VerifiedTokenCache(ttl=float(getattr(settings, "auth_revocation_cache_seconds", 60) or 60))
 
     def _mod(self) -> Any:
@@ -653,6 +611,10 @@ JOB_ENTRYPOINTS: dict[str, tuple[tuple[str, str], ...]] = {
     "funding-scan": (("app.jobs_data", "funding_scan"),),
     "agent-expiry-scan": (("app.jobs_data", "agent_expiry_scan"),),
     "verify-chain": (("app.execution.jobs", "verify_chain"),),     # REVIEW_MONEY M7(a): daily chain check + anchor
+    # REVIEW_WEB_INFRA H1 / M4 (routes: app/api/routers/internal_trust.py)
+    "attest-agents": (("app.execution.jobs", "attest_agents"),),
+    "agent-substitution-scan": (("app.execution.jobs", "agent_substitution_scan"),),
+    "selftest": (("app.execution.jobs", "executor_selftest"),),
 }
 
 

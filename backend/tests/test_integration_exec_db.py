@@ -517,11 +517,12 @@ class ExecIntegrationDbTest(unittest.TestCase):
         """Stand-in for the data-jobs fills sync: attribute by cloid (orders table) and store (idempotent)."""
         from app.hl.fills import attribute_fills
 
-        orders = self.admin.fetchall("""SELECT o.cloid, o.subscription_id::text AS s FROM orders o
+        orders = self.admin.fetchall("""SELECT o.cloid, o.subscription_id::text AS s, o.oid FROM orders o
                                         JOIN subscriptions s ON s.id = o.subscription_id WHERE s.trading_address = :a""",
                                      {"a": address})
         res = attribute_fills(hl.account(address).fills, trading_address=address,
-                              cloid_to_subscription={o["cloid"]: o["s"] for o in orders})
+                              cloid_to_subscription={o["cloid"]: o["s"] for o in orders},
+                              cloid_to_oid={o["cloid"]: o["oid"] for o in orders})   # REVIEW_MONEY H2
         cols = {r["column_name"] for r in self.admin.fetchall(
             "SELECT column_name FROM information_schema.columns WHERE table_name = 'fills'")}
         n = 0
@@ -535,6 +536,10 @@ class ExecIntegrationDbTest(unittest.TestCase):
             if "net_pnl_micro" in cols:
                 extra_cols, extra_vals = ", net_pnl_micro, attributed_via", ", :net, :via"
                 params.update(net=f.net_pnl_micro, via=a.via)
+            if "oid_verified" in cols:                       # 0010: builder fees only for oid-verified fills (H2)
+                extra_cols += ", oid_verified"
+                extra_vals += ", :ov"
+                params.update(ov=a.oid_verified)
             n += len(self.admin.fetchall(f"""
                 INSERT INTO fills (subscription_id, trading_address, coin, tid, oid, px, sz, side, closed_pnl_micro,
                                    fee_micro, builder_fee_micro, cloid, time, raw{extra_cols})

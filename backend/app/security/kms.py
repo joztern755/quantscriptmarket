@@ -444,3 +444,174 @@ def make_decryptor(settings: Any = None, *, kms_client: Any = None) -> EnvelopeD
     s = _settings(settings)
     _require_decrypt_role(s)
     return EnvelopeDecryptor(_build_wrapper(s, allow_unwrap=True, kms_client=kms_client))
+
+
+# ================================================================ agent attestation signer (SECURITY H1)
+# The EXECUTOR (the only role that can decrypt agent keys) proves to the browser that an agent address is really the
+# sealed key it will trade with: after opening the sealed key and re-deriving its address, it signs
+#     aijalon-agent-v1|{user_id}|{agent_address}
+# with a Cloud KMS ASYMMETRIC key (EC_SIGN_P256_SHA256, HSM) on which only the executor SA holds
+# roles/cloudkms.signer. The api SA has NO role on it, so a compromised api (or edge) cannot mint attestations.
+# The browser verifies with WebCrypto against the public key pinned in web/public/app-config.json.
+import os as _os  # noqa: E402 - additive section
+
+from cryptography.exceptions import InvalidSignature  # noqa: E402
+from cryptography.hazmat.primitives import hashes as _hashes  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import ec as _ec  # noqa: E402
+from cryptography.hazmat.primitives.serialization import (  # noqa: E402
+    Encoding as _Encoding,
+    PublicFormat as _PublicFormat,
+    load_der_public_key as _load_der_public_key,
+    load_pem_public_key as _load_pem_public_key,
+)
+
+AGENT_ATTEST_PREFIX = "aijalon-agent-v1"
+_EC_SIGN_P256_SHA256 = 12          # google.cloud.kms.CryptoKeyVersion.CryptoKeyVersionAlgorithm.EC_SIGN_P256_SHA256
+_KMS_KEY_VERSION_RE = re.compile(r"^projects/[^/]+/locations/[^/]+/keyRings/[^/]+/cryptoKeys/[^/]+/cryptoKeyVersions/\d+$")
+_ATTEST_ADDR_RE = re.compile(r"^0x[0-9a-f]{40}$")
+_ATTEST_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+__all__ += ["AGENT_ATTEST_PREFIX", "agent_attestation_message", "AttestationSigner", "CloudKmsAttestationSigner",
+            "LocalAttestationSigner", "make_attestation_signer", "verify_p256_signature"]
+
+
+def agent_attestation_message(user_id: str, agent_address: str) -> bytes:
+    """The exact bytes the executor signs and the browser (web/src/core/attest.ts) re-builds."""
+    uid, addr = str(user_id).lower(), str(agent_address).lower()
+    if not _ATTEST_UUID_RE.match(uid):
+        raise ValueError("user_id must be a uuid")
+    if not _ATTEST_ADDR_RE.match(addr):
+        raise ValueError("agent_address must be a 0x-prefixed 20-byte hex address")
+    return f"{AGENT_ATTEST_PREFIX}|{uid}|{addr}".encode("ascii")
+
+
+def verify_p256_signature(public_key_spki_der: bytes, message: bytes, der_signature: bytes) -> bool:
+    """ECDSA P-256 / SHA-256 verification (DER signature, SPKI DER public key). Never raises."""
+    try:
+        key = _load_der_public_key(bytes(public_key_spki_der))
+        if not isinstance(key, _ec.EllipticCurvePublicKey) or not isinstance(key.curve, _ec.SECP256R1):
+            return False
+        key.verify(bytes(der_signature), bytes(message), _ec.ECDSA(_hashes.SHA256()))
+        return True
+    except (InvalidSignature, ValueError, TypeError):
+        return False
+
+
+class AttestationSigner(ABC):
+    """Signs attestation messages; ``key_version`` identifies the key (stored next to each signature)."""
+
+    key_version: str
+
+    @abstractmethod
+    def sign(self, message: bytes) -> bytes:
+        """DER-encoded ECDSA P-256/SHA-256 signature over ``message``."""
+
+    @abstractmethod
+    def public_key_spki_der(self) -> bytes:
+        """The verifying key (pinned in web/public/app-config.json as base64)."""
+
+
+class CloudKmsAttestationSigner(AttestationSigner):
+    """Cloud KMS asymmetric signing with Google's integrity checks (CRC32C both ways), the algorithm/protection
+    level/key-version checked on the public key, and every signature re-verified locally before it is returned."""
+
+    def __init__(self, key_version_name: str, *, client: Any = None, require_hsm: bool = True,
+                 timeout_s: float = 10.0) -> None:
+        if not _KMS_KEY_VERSION_RE.match(key_version_name or ""):
+            raise ValueError("attestation key must be projects/*/locations/*/keyRings/*/cryptoKeys/*/cryptoKeyVersions/N")
+        if client is None:
+            if _gkms is None:
+                raise RuntimeError("google-cloud-kms is not installed")
+            client = _gkms.KeyManagementServiceClient()
+        self._client = client
+        self.key_version = key_version_name
+        self._require_hsm = require_hsm
+        self._timeout = timeout_s
+        self._spki: bytes | None = None
+
+    def public_key_spki_der(self) -> bytes:
+        if self._spki is None:
+            try:
+                resp = self._client.get_public_key(request={"name": self.key_version}, timeout=self._timeout)
+            except Exception as e:  # noqa: BLE001
+                raise ExternalServiceError("kms get_public_key failed", service="kms", error=type(e).__name__) from e
+            pem = str(resp.pem)
+            if int(getattr(resp, "pem_crc32c", crc32c(pem.encode()))) != crc32c(pem.encode()):
+                raise ExternalServiceError("kms get_public_key: pem corrupted in transit", service="kms")
+            if str(getattr(resp, "name", self.key_version)) != self.key_version:
+                raise ExternalServiceError("kms get_public_key: response from unexpected key", service="kms")
+            if int(getattr(resp, "algorithm", 0)) != _EC_SIGN_P256_SHA256:
+                raise ExternalServiceError("kms attestation key must be EC_SIGN_P256_SHA256", service="kms")
+            if self._require_hsm and int(getattr(resp, "protection_level", 0)) != _HSM:
+                raise ExternalServiceError("kms attestation key is not HSM-protected", service="kms")
+            key = _load_pem_public_key(pem.encode())
+            self._spki = key.public_bytes(_Encoding.DER, _PublicFormat.SubjectPublicKeyInfo)
+        return self._spki
+
+    def sign(self, message: bytes) -> bytes:
+        digest = hashlib.sha256(bytes(message)).digest()
+        try:
+            resp = self._client.asymmetric_sign(
+                request={"name": self.key_version, "digest": {"sha256": digest}, "digest_crc32c": crc32c(digest)},
+                timeout=self._timeout)
+        except Exception as e:  # noqa: BLE001
+            raise ExternalServiceError("kms asymmetric_sign failed", service="kms", error=type(e).__name__) from e
+        if not getattr(resp, "verified_digest_crc32c", False):
+            raise ExternalServiceError("kms sign: digest crc32c not verified by server", service="kms")
+        sig = bytes(resp.signature)
+        if int(resp.signature_crc32c) != crc32c(sig):
+            raise ExternalServiceError("kms sign: signature corrupted in transit", service="kms")
+        if str(getattr(resp, "name", self.key_version)) != self.key_version:
+            raise ExternalServiceError("kms sign: response from unexpected key", service="kms")
+        if not verify_p256_signature(self.public_key_spki_der(), message, sig):
+            raise ExternalServiceError("kms sign: signature does not verify with the key's public key", service="kms")
+        return sig
+
+    def __repr__(self) -> str:
+        return f"CloudKmsAttestationSigner(key_version={self.key_version!r})"
+
+
+class LocalAttestationSigner(AttestationSigner):
+    """DEV/TEST ONLY: P-256 key in process memory (from LOCAL_DEV_ATTEST_KEY_PEM, else ephemeral). Refused in prod."""
+
+    def __init__(self, private_key: Any = None, *, is_prod: bool) -> None:
+        if is_prod:
+            raise RuntimeError("LocalAttestationSigner must never be used in prod")
+        self._key = private_key or _ec.generate_private_key(_ec.SECP256R1())
+        if not isinstance(self._key.curve, _ec.SECP256R1):
+            raise ValueError("attestation key must be P-256")
+        spki = self.public_key_spki_der()
+        self.key_version = "local-dev:" + hashlib.sha256(spki).hexdigest()[:16]
+
+    @classmethod
+    def from_env(cls, *, is_prod: bool) -> "LocalAttestationSigner":
+        pem = _os.environ.get("LOCAL_DEV_ATTEST_KEY_PEM", "")
+        if pem:
+            from cryptography.hazmat.primitives.serialization import load_pem_private_key
+            return cls(load_pem_private_key(pem.encode(), password=None), is_prod=is_prod)
+        return cls(is_prod=is_prod)
+
+    def public_key_spki_der(self) -> bytes:
+        return self._key.public_key().public_bytes(_Encoding.DER, _PublicFormat.SubjectPublicKeyInfo)
+
+    def sign(self, message: bytes) -> bytes:
+        return self._key.sign(bytes(message), _ec.ECDSA(_hashes.SHA256()))
+
+    def __repr__(self) -> str:
+        return f"LocalAttestationSigner(key_version={self.key_version!r})"
+
+
+def make_attestation_signer(settings: Any = None, *, kms_client: Any = None) -> AttestationSigner:
+    """For the executor ONLY (same role rule as make_decryptor). Key: AGENT_ATTEST_KEY_VERSION (full KMS
+    cryptoKeyVersions name; infra/gcp/env.sh KMS_ATTEST_KEY_VERSION_NAME). Required in prod."""
+    s = _settings(settings)
+    role = getattr(s, "service_role", None)
+    allowed = _DECRYPT_ROLES_PROD if s.is_prod else _DECRYPT_ROLES_NONPROD
+    if role not in allowed:
+        raise Forbidden("agent attestation is only available to the executor service", service_role=role)
+    version = str(getattr(s, "agent_attest_key_version", "") or _os.environ.get("AGENT_ATTEST_KEY_VERSION", "") or "")
+    if version:
+        return CloudKmsAttestationSigner(version, client=kms_client, require_hsm=bool(s.is_prod))
+    if s.is_prod:
+        raise RuntimeError("AGENT_ATTEST_KEY_VERSION is required in prod")
+    return LocalAttestationSigner.from_env(is_prod=False)

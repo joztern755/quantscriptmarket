@@ -101,11 +101,14 @@ class Attribution(unittest.TestCase):
 
     def test_window_fallback_and_unmatched(self) -> None:
         raw = copy.deepcopy(self.raw)
-        # our prefix but the orders table lost the row: fallback by (address, coin, time window)
+        # our prefix but no recorded order: REVIEW_MONEY H2 — never attributed by time window any more (a user can put
+        # our prefix on their own orders); the window only becomes an alert hint
         win = SubscriptionWindow("sub-CL", TRADER, frozenset({"xyz:CL"}), CL_START - 1, CL_END + 1)
         res = attribute_fills(raw, trading_address=TRADER, cloid_to_subscription={}, windows=[win])
-        self.assertEqual([a.via for a in res.attributed], ["window"] * 8)
-        self.assertEqual(len(res.ours_unmatched), 2)  # SILVER fills: prefix but no row, no window → alert
+        self.assertEqual(res.attributed, [])
+        self.assertEqual(len(res.ours_unmatched), 10)  # all prefixed fills → unmatched → alert
+        self.assertEqual(sorted(set(res.window_hints.values())), ["sub-CL"])
+        self.assertEqual(len(res.window_hints), 8)
 
     def test_non_usdc_fee_rejected(self) -> None:
         raw = copy.deepcopy(self.raw)

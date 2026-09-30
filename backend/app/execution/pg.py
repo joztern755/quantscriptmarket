@@ -297,6 +297,7 @@ class PgSubscriptionRepo:
         self._now = (clock.now if clock is not None and hasattr(clock, "now")
                      else clock if callable(clock) else (lambda: datetime.now(timezone.utc)))
         self._gate: bool | None = None
+        self.billing_grace_hours = 72   # Economics.past_due_grace_hours (the settlement BillingPolicy default)
 
     def _cols(self) -> str:
         if self._gate is None:
@@ -307,6 +308,10 @@ class PgSubscriptionRepo:
                 log.error("entries_gate_missing", extra={"fields": {"note": "0007 not applied: entries blocked"}})
         gate = ("alert_contacts_entries_allowed(s.user_id, CAST(:now AS timestamptz))" if self._gate
                 else "(CAST(:now AS timestamptz) IS NULL AND false)")
+        # REVIEW_MONEY L7/H3: a past_due subscription opens nothing once its grace period is over, even before the
+        # next 00:30 settlement flips it to reduce_only (domain.billing.entries_allowed)
+        gate = (f"({gate} AND NOT (s.status = 'past_due' AND (s.past_due_since IS NULL OR s.past_due_since"
+                f" <= CAST(:now AS timestamptz) - make_interval(hours => {int(self.billing_grace_hours)}))))")
         return f"{_SUB_VIEW_COLS}, {gate} AS entries_allowed"
 
     def _now_ts(self) -> str | None:
@@ -764,6 +769,16 @@ class PgSettlementRepo:
         self.db.all("UPDATE subscriptions SET current_period_end = CAST(:e AS timestamptz) WHERE id = CAST(:s AS uuid)",
                     s=subscription_id, e=_ts(period_end))
 
+    def lock_for_billing(self, subscription_id: str) -> dict[str, Any] | None:
+        """REVIEW_MONEY M8: the CURRENT billing state, row-locked inside the renewal transaction (the settlement
+        loaded its list earlier; a cancel / pause / unpause-with-renewal may have landed since)."""
+        r = self.db.one("""SELECT status::text AS status, cancelled_at, current_period_end FROM subscriptions
+                            WHERE id = CAST(:s AS uuid) FOR UPDATE""", s=subscription_id)
+        if r is None:
+            return None
+        return {"status": r["status"], "cancelled_at": as_datetime(r.get("cancelled_at")),
+                "current_period_end": as_datetime(r.get("current_period_end"))}
+
     def _our_fill_fee_sql(self) -> str:
         """Builder fee we may recognise for fill ``f`` (REVIEW_MONEY H2): only a fill of an order WE recorded for that
         subscription whose exchange-assigned oid matches (``oid_verified``, set by fills-ingest), only when the fill
@@ -841,10 +856,20 @@ class PgReferralLookup:
         self.db = db
         self.economics = economics or Economics()
 
+    def _has_0011(self) -> bool:
+        if getattr(self, "_m11", None) is None:
+            row = self.db.one("SELECT to_regprocedure('user_has_paid_activity(uuid)') IS NOT NULL AS ok")
+            self._m11 = bool(row and row["ok"])
+        return bool(self._m11)
+
     def referrer_share(self, user_id: str) -> tuple[str, int] | None:
-        r = self.db.one("""SELECT r.id::text AS referrer_id, r.referral_tier::text AS tier
+        """None (no referral reward; the pool share stays with the platform) unless the referrer is ACTIVE (REVIEW_MONEY
+        L6: suspended/closed referrers earn nothing), the referee is not flagged as a suspected self-referral and has a
+        real paid activity (M2: free showcase-only usage never pays a referrer) — 0011."""
+        extra = ("AND u.referral_flagged_at IS NULL AND user_has_paid_activity(u.id)" if self._has_0011() else "")
+        r = self.db.one(f"""SELECT r.id::text AS referrer_id, r.referral_tier::text AS tier
                              FROM users u JOIN users r ON r.id = u.referred_by
-                            WHERE u.id = CAST(:u AS uuid)""", u=user_id)
+                            WHERE u.id = CAST(:u AS uuid) AND r.status = 'active' {extra}""", u=user_id)
         if not r:
             return None
         tiers = {t.name: t for t in self.economics.referral_tiers}
@@ -953,19 +978,21 @@ class PgReconcileRepo:
 
     def solvency_ledger(self) -> dict[str, int]:
         """REVIEW_MONEY M7(d): normal balances of every liability class and of the non-treasury assets."""
+        # (no ":word" inside SQL literals: SQLAlchemy text() would read it as a bind parameter)
         row = self.db.one("""
-            WITH b AS (SELECT a.code, a.kind::text AS kind, coalesce(sum(e.amount_micro), 0)::bigint AS raw
+            WITH b AS (SELECT a.code, split_part(a.code, ':', 1) AS p1, split_part(a.code, ':', 3) AS p3,
+                              coalesce(sum(e.amount_micro), 0)::bigint AS raw
                          FROM ledger_accounts a LEFT JOIN ledger_entries e ON e.account_id = a.id
                         GROUP BY a.id)
-            SELECT coalesce(sum(greatest(0, -raw)) FILTER (WHERE code LIKE 'user:%:fee_balance'), 0)::bigint AS user_pos,
-                   coalesce(sum(greatest(0, raw)) FILTER (WHERE code LIKE 'user:%:fee_balance'), 0)::bigint AS user_debt,
-                   coalesce(sum(-raw) FILTER (WHERE code LIKE 'creator:%:payable'), 0)::bigint AS creator_payables,
-                   coalesce(sum(-raw) FILTER (WHERE code LIKE 'referrer:%:payable'), 0)::bigint AS referrer_payables,
-                   coalesce(sum(-raw) FILTER (WHERE code LIKE 'ps_pending:%'), 0)::bigint AS ps_pending,
+            SELECT coalesce(sum(greatest(0, -raw)) FILTER (WHERE p1 = 'user' AND p3 = 'fee_balance'), 0)::bigint AS user_pos,
+                   coalesce(sum(greatest(0, raw)) FILTER (WHERE p1 = 'user' AND p3 = 'fee_balance'), 0)::bigint AS user_debt,
+                   coalesce(sum(-raw) FILTER (WHERE p1 = 'creator' AND p3 = 'payable'), 0)::bigint AS creator_payables,
+                   coalesce(sum(-raw) FILTER (WHERE p1 = 'referrer' AND p3 = 'payable'), 0)::bigint AS referrer_payables,
+                   coalesce(sum(-raw) FILTER (WHERE p1 = 'ps_pending'), 0)::bigint AS ps_pending,
                    coalesce(sum(-raw) FILTER (WHERE code = 'withdrawals:pending'), 0)::bigint AS withdrawals_pending,
                    coalesce(sum(-raw) FILTER (WHERE code = 'payouts:pending'), 0)::bigint AS payouts_pending,
                    coalesce(sum(-raw) FILTER (WHERE code = 'refunds:usdc_pending'), 0)::bigint AS refunds_pending,
-                   coalesce(sum(-raw) FILTER (WHERE code LIKE 'suspense:%'), 0)::bigint AS suspense,
+                   coalesce(sum(-raw) FILTER (WHERE p1 = 'suspense'), 0)::bigint AS suspense,
                    coalesce(sum(raw) FILTER (WHERE code = 'builder:hl_receivable'), 0)::bigint AS builder_receivable,
                    coalesce(sum(raw) FILTER (WHERE code = 'stripe:clearing'), 0)::bigint AS stripe_clearing,
                    coalesce(sum(raw) FILTER (WHERE code = 'treasury:hl_usdc'), 0)::bigint AS treasury_ledger
@@ -1042,21 +1069,25 @@ class PgReferralTierRepo:
     def referrer_stats(self, since: datetime, until: datetime) -> list[dict[str, Any]]:
         """Per referrer (anyone with referred users, or a non-starter tier to demote): trailing-window active
         referred users (a live subscription now, or one cancelled inside the window) and referred notional
-        (Σ |px × sz| of their attributed fills in the window, floored to the micro)."""
+        (Σ |px × sz| of their attributed fills in the window, floored to the micro). REVIEW_MONEY M2 (0011): only
+        referees with a real paid activity (user_has_paid_activity — not free showcase-only usage) and not flagged
+        as a suspected self-referral count towards a tier."""
         return self.db.all("""
             WITH refs AS (
                 SELECT r.id, r.referral_tier::text AS tier FROM users r
                  WHERE r.referral_tier <> 'starter' OR EXISTS (SELECT 1 FROM users u WHERE u.referred_by = r.id))
             SELECT refs.id::text AS referrer_id, refs.tier,
                    (SELECT count(DISTINCT u.id) FROM users u
-                     WHERE u.referred_by = refs.id AND EXISTS (
+                     WHERE u.referred_by = refs.id AND u.referral_flagged_at IS NULL
+                       AND user_has_paid_activity(u.id) AND EXISTS (
                            SELECT 1 FROM subscriptions s WHERE s.user_id = u.id
                               AND (s.status IN ('active', 'past_due', 'reduce_only', 'closing')
                                    OR (s.cancelled_at IS NOT NULL AND s.cancelled_at >= CAST(:since AS timestamptz)))))
                        AS active_users,
                    (SELECT coalesce(sum(floor(f.px * f.sz * 1000000)), 0)::bigint
                       FROM fills f JOIN subscriptions s ON s.id = f.subscription_id JOIN users u ON u.id = s.user_id
-                     WHERE u.referred_by = refs.id AND f.time >= CAST(:since AS timestamptz)
+                     WHERE u.referred_by = refs.id AND u.referral_flagged_at IS NULL
+                       AND user_has_paid_activity(u.id) AND f.time >= CAST(:since AS timestamptz)
                        AND f.time < CAST(:until AS timestamptz)) AS notional_micro
               FROM refs ORDER BY refs.id""", since=_ts(since), until=_ts(until))
 

@@ -22,6 +22,9 @@
 --                         from this referee until ops clears it.
 --   user_ip_nets                                                  (F7) peppered hash of the sign-in network (/24 IPv4,
 --                         /64 IPv6) per user — same-network heuristic for self-referral.
+--   user_devices.from_device_id                                   (F7) true when the hash comes from the web's random
+--                         X-Device-Id (not the user-agent fallback) — only those identify a device for self-referral;
+--                         users.device_fp_hash (the sign-up device) is written only from X-Device-Id.
 --   users role guard                                              (F17) only app_migrator (members) or a superuser may
 --                         grant or remove `admin`; the promote script calls promote_admin() (SECURITY DEFINER).
 --   admin_changes                                                 (F6/F12) status 'cancelled' (auto-cancel of pending
@@ -110,6 +113,9 @@ CREATE TABLE user_ip_nets (
 );
 CREATE INDEX user_ip_nets_net_idx ON user_ip_nets (net_hash, last_seen DESC);
 CREATE INDEX user_devices_hash_idx ON user_devices (device_hash);
+-- Only hashes of the web's random X-Device-Id identify a device; a user-agent fallback hash ("Chrome on macOS") is
+-- shared by strangers and must never be used for self-referral decisions.
+ALTER TABLE user_devices ADD COLUMN from_device_id boolean NOT NULL DEFAULT false;
 
 -- ---------------------------------------------------------------- F17: role guard (admin only via app_migrator)
 CREATE FUNCTION users_role_guard() RETURNS trigger

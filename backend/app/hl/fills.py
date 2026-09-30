@@ -184,12 +184,15 @@ def attribute_fills(raw_fills: Iterable[Mapping[str, Any]], *, trading_address: 
     cmap = {k.lower(): v for k, v in cloid_to_subscription.items()}
     omap = {k.lower(): v for k, v in (cloid_to_oid or {}).items()}
     addr = trading_address.lower()
+    parsed: list[Fill] = []
     for raw in raw_fills:
         try:
-            f = parse_fill(raw)
+            parsed.append(parse_fill(raw))
         except ValidationFailed as e:
             out.rejected.append((raw, f"unparseable: {e.details.get('error', '')}"))
-            continue
+    # time order: for an order without a recorded oid, its FIRST fill fixes the oid the others must carry
+    for f in sorted(parsed, key=lambda x: (x.time_ms, x.tid)):
+        raw = f.raw
         if f.tid in seen:
             continue
         seen.add(f.tid)
@@ -215,6 +218,7 @@ def attribute_fills(raw_fills: Iterable[Mapping[str, Any]], *, trading_address: 
             if recorded is not None and int(recorded) != f.oid:
                 out.oid_mismatch.append(f)
                 continue
+            omap[f.cloid or ""] = f.oid
             verified = True
         out.attributed.append(AttributedFill(sub, addr, f, "cloid", verified))
     out.attributed.sort(key=lambda a: (a.fill.time_ms, a.fill.tid))

@@ -237,9 +237,10 @@ class JobsDataDbTest(unittest.TestCase):
         sid = self.admin.fetchall("""INSERT INTO strategies (slug, name, in_house, markets, status)
                                      VALUES (:s, 'T', true, :m, 'draft') RETURNING id::text AS id""",
                                   {"s": f"t-{self.tag}-{uuid.uuid4().hex[:6]}", "m": markets})[0]["id"]
-        vid = self.admin.fetchall("""INSERT INTO strategy_versions (strategy_id, version, code_hash, markets)
-                                     VALUES (CAST(:s AS uuid), 1, 'h', :m) RETURNING id::text AS id""",
-                                  {"s": sid, "m": markets})[0]["id"]
+        # in-house versions must pin params.script_sha256 (migration 0012, REVIEW_TRADING_KEYS F4)
+        vid = self.admin.fetchall("""INSERT INTO strategy_versions (strategy_id, version, code_hash, markets, params)
+                                     VALUES (CAST(:s AS uuid), 1, 'h', :m, CAST(:p AS jsonb)) RETURNING id::text AS id""",
+                                  {"s": sid, "m": markets, "p": {"script_sha256": "d" * 64}})[0]["id"]
         return sid, vid
 
     def subscription(self, uid: str, sid: str, vid: str, addr: str, created: datetime, status: str = "active") -> str:
@@ -303,7 +304,7 @@ class JobsDataDbTest(unittest.TestCase):
         self.assertEqual(self.admin.fetchall("SELECT 'expired'::agent_key_status::text AS s"), [{"s": "expired"}])
         self.assertEqual(self.admin.fetchall("""SELECT kind::text AS k, non_negative FROM ledger_accounts
                                                 WHERE code = 'suspense:usdc_unattributed'"""),
-                         [{"k": "liability", "non_negative": False}])
+                         [{"k": "liability", "non_negative": True}])   # REVIEW_MONEY M5 (0010): never overdrawn
 
     # ------------------------------------------------------------------------------------------ candles
     def test_candles_sync_backfill_incremental_mismatch(self) -> None:
@@ -543,8 +544,9 @@ class JobsDataDbTest(unittest.TestCase):
         treasury = _addr(self.seed + 10)
         uid = self.user(3)
         w = _addr(self.seed + 11)
-        self.admin.fetchall("INSERT INTO wallets (user_id, master_address, verified_at) VALUES (CAST(:u AS uuid), :a, now())",
-                            {"u": uid, "a": w})
+        # verified BEFORE its transfers (REVIEW_AUTH_API F8: older transfers are held, never credited)
+        self.admin.fetchall("INSERT INTO wallets (user_id, master_address, verified_at) VALUES (CAST(:u AS uuid), :a, :t)",
+                            {"u": uid, "a": w, "t": (T0 - timedelta(days=1)).isoformat()})
         stranger = _addr(self.seed + 12)
 
         def send(sender: str, amount: str, t: int, n: int) -> dict:

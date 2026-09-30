@@ -163,6 +163,7 @@ class SettlementReport:
     renewals_charged: int = 0
     renewals_charged_micro: int = 0
     renewals_failed: int = 0
+    renewals_skipped_stale: int = 0            # M8: cancelled / paused after the list was loaded
     status_changes: list[tuple[str, str, str]] = field(default_factory=list)   # (subscription_id, from, to)
     plans_renewed: int = 0
     plans_past_due: int = 0
@@ -412,6 +413,15 @@ class Settlement:
             key = renewal_key(sub.id, sub.current_period_end)
             new_end = self.billing.next_period_end(sub.created_at, max(now, sub.current_period_end))
             with self.uow.atomic():
+                # REVIEW_MONEY M8: re-read the subscription under a row lock — a cancel / pause landed since the
+                # list was loaded must never be charged a renewal (repos without the method: legacy fakes)
+                lock = getattr(self.repo, "lock_for_billing", None)
+                cur = lock(sub.id) if lock is not None else None
+                if lock is not None and (cur is None or cur["status"] not in BILLABLE or cur["cancelled_at"] is not None
+                                         or cur["current_period_end"] != sub.current_period_end):
+                    report.renewals_skipped_stale += 1
+                    log.info("renewal_skipped_stale", extra={"fields": {"subscription_id": sub.id}})
+                    return
                 if due > 0:
                     creator_amt, platform_amt = self.fees.split_subscription(due)
                     if creator_amt + platform_amt != due:

@@ -138,6 +138,8 @@ def _build(services: Optional[Services], role: str) -> FastAPI:
         app.include_router(internal.router, prefix="/v1")
         from app.api.routers import alerts_settings as _alerts_jobs  # /internal/deliver-alerts, /internal/daily-pnl-summary
         app.include_router(_alerts_jobs.internal_router, prefix="/v1")
+        from app.api.routers import internal_trust  # attest-agents, agent-substitution-scan, selftest (REVIEW_WEB_INFRA)
+        app.include_router(internal_trust.router, prefix="/v1")
     else:
         from app.api.routers import (
             admin,
@@ -163,6 +165,9 @@ def _build(services: Optional[Services], role: str) -> FastAPI:
             app.include_router(r.router, prefix="/v1")
         from app.api.routers import kyc_webhook; app.include_router(kyc_webhook.router, prefix="/v1")
         from app.api.routers import hl_relay; app.include_router(hl_relay.router, prefix="/v1")  # /exchange fallback
+        from app.api.routers import csp_report, trust  # REVIEW_WEB_INFRA M2 (CSP reports) + H1 (attestation, proofs)
+        app.include_router(trust.router, prefix="/v1")
+        app.include_router(csp_report.router, prefix="/v1")
         from app.api.routers import alerts_settings, telegram  # SPEC §12 user alerts (contacts, prefs, bot webhook)
         app.include_router(alerts_settings.router, prefix="/v1")
         app.include_router(telegram.router, prefix="/v1")

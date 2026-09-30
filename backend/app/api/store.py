@@ -610,8 +610,9 @@ class SqlStore(SecurityStoreMixin):
         row = self._one(conn, """
             SELECT (SELECT -coalesce(sum(e.amount_micro), 0) FROM ledger_entries e
                       JOIN ledger_accounts a ON a.id = e.account_id
-                     WHERE a.code = 'user:' || CAST(:u AS text) || ':fee_balance') AS spendable,
-                   fee_funding_card_unspent(CAST(:u2 AS uuid)) AS card_unspent""", u=user_id, u2=user_id)
+                     WHERE a.code = CAST(:code AS text)) AS spendable,
+                   fee_funding_card_unspent(CAST(:u2 AS uuid)) AS card_unspent""",
+                        code=f"user:{user_id}:fee_balance", u2=user_id)
         if not row:
             return 0
         lot = max(0, int(row["spendable"] or 0) - int(row["card_unspent"] or 0))

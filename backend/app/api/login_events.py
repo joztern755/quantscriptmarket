@@ -27,8 +27,8 @@ from typing import Any, Mapping, Optional
 
 from app.api import validation as v
 
-__all__ = ["device_key", "device_label", "mfa_factor_hash", "network_hash", "record_sign_in", "DEVICE_ID_RE",
-           "SECURITY_HOLD"]
+__all__ = ["device_key", "device_label", "has_device_id", "mfa_factor_hash", "network_hash", "record_sign_in",
+           "DEVICE_ID_RE", "SECURITY_HOLD"]
 
 SECURITY_HOLD = timedelta(hours=48)
 
@@ -79,6 +79,12 @@ def device_key(headers: Mapping[str, str], pepper: bytes | str) -> tuple[Optiona
     else:
         return None, None
     return v.hash_identifier(key, pepper, domain="device"), device_label(ua)
+
+
+def has_device_id(headers: Mapping[str, str]) -> bool:
+    """True when the device key comes from the web's random X-Device-Id (identifies ONE browser), not from the
+    user-agent fallback (shared by everyone on the same browser + OS) — only the former may drive self-referral."""
+    return bool(DEVICE_ID_RE.fullmatch((headers.get("x-device-id") or "").strip()))
 
 
 def network_hash(ip: Optional[str], pepper: bytes | str) -> Optional[str]:

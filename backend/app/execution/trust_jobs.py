@@ -1,0 +1,231 @@
+"""Executor-side jobs for the signing-trust fixes (docs/security/REVIEW_WEB_INFRA.md H1, M4).
+
+``attest_agents(db, now, decryptor=, signer=)`` — ``/v1/internal/attest-agents`` (every minute)
+    For each live agent key (``pending_approval`` / ``active``) without an attestation: open the SEALED key exactly as
+    the tick would (``open_agent_key`` re-derives the address and refuses a mismatch), zeroise it immediately, then sign
+    ``aijalon-agent-v1|{user_id}|{agent_address}`` with the KMS asymmetric attestation key (executor-only IAM) and store
+    it (``agent_keys.attestation_*``, migrations/0013). The browser verifies the signature with the pinned public key
+    before it asks the wallet to sign ApproveAgent (web/src/core/attest.ts). A key that does NOT open to its address is
+    marked ``attestation_failed_at`` (never retried automatically) and raises a CRITICAL ops alert.
+
+``agent_substitution_scan(db, now, info=)`` — ``/v1/internal/agent-substitution-scan`` (every 10 minutes)
+    For every master address with a live subscription or a live agent: ``extraAgents(master)``; any agent whose NAME is
+    ours (``AGENT_NAME``, prefix match — Hyperliquid may suffix the name) but whose ADDRESS is not one of our live agent
+    keys for that master means someone got the user to approve a different "aijalon" agent (phishing, or a compromised
+    api/edge). → CRITICAL ops alert ``agent_substituted`` + the user's mandatory ``agent_revoked`` alert, immediately
+    (the 6-hourly agent-expiry-scan only notices our agent missing after two scans). Payloads carry short addresses.
+
+``executor_selftest(db, now, runtime=)`` — ``/v1/internal/selftest`` (deploy, before traffic moves: M4)
+    A side-effect-free "dry-run tick": builds the executor composition, reads flags / latest signals / due
+    subscriptions (SELECT only), reaches Hyperliquid /info, opens ONE live agent key through KMS and zeroises it
+    (no order is built or sent), and loads the attestation key's public key. Never writes the database.
+"""
+from __future__ import annotations
+
+import base64
+import time
+from datetime import datetime
+from typing import Any, Callable, Optional
+
+from app.errors import AppError
+from app.logging import get_logger
+
+__all__ = ["attest_agents", "agent_substitution_scan", "executor_selftest", "LIVE_SUB_STATUSES"]
+
+log = get_logger("app.execution.trust_jobs")
+
+LIVE_SUB_STATUSES = ("pending", "active", "past_due", "reduce_only", "closing")
+_LIVE_SQL = "(" + ", ".join(f"'{s}'" for s in LIVE_SUB_STATUSES) + ")"
+
+
+def _short(addr: Any) -> str:
+    s = str(addr or "")
+    return s[:6] + "…" + s[-4:] if len(s) >= 12 else s
+
+
+# ============================================================================================ attest-agents
+def attest_agents(db: Any, now: datetime, *, decryptor: Any, signer: Any, limit: int = 100,
+                  max_seconds: float = 45.0) -> dict[str, Any]:
+    from app.execution.pg import as_bytes
+    from app.jobs_data import _db
+    from app.security.agent_keys import SealedKey, open_agent_key
+    from app.security.kms import DecryptionFailed, agent_attestation_message, zeroize
+
+    t0 = time.monotonic()
+    report: dict[str, Any] = {"todo": 0, "attested": 0, "failed": 0, "errors": [], "key_version": getattr(signer, "key_version", "")}
+    with _db.transaction(db) as conn:
+        todo = _db.rows(conn, """
+            SELECT id::text AS id, user_id::text AS user_id, agent_address, key_ciphertext, kms_key_version
+              FROM agent_keys
+             WHERE attestation_sig IS NULL AND attestation_failed_at IS NULL
+               AND status IN ('pending_approval', 'active')
+             ORDER BY created_at
+             LIMIT :n""", n=int(limit))
+    report["todo"] = len(todo)
+    for row in todo:
+        if time.monotonic() - t0 > max_seconds:
+            report["deferred"] = len(todo) - report["attested"] - report["failed"]
+            break
+        aid, uid, addr = row["id"], row["user_id"], str(row["agent_address"]).lower()
+        sealed = SealedKey(ciphertext=as_bytes(row["key_ciphertext"]) or b"", key_version=str(row["kms_key_version"]),
+                           address=addr)
+        try:
+            priv = open_agent_key(sealed, decryptor, user_id=uid)   # refuses unless it re-derives `addr`
+            zeroize(priv)
+        except DecryptionFailed as e:
+            report["failed"] += 1
+            with _db.transaction(db) as conn:
+                _db.rows(conn, """UPDATE agent_keys SET attestation_failed_at = CAST(:t AS timestamptz),
+                                         attestation_error = :e
+                                   WHERE id = CAST(:id AS uuid) AND attestation_sig IS NULL RETURNING id""",
+                         t=now, e=str(e.message if hasattr(e, "message") else e)[:200], id=aid)
+                _db.ops_alert(conn, "agent_attestation_failed",
+                              {"agent_id": aid, "user_id": uid, "agent": _short(addr),
+                               "reason": "sealed key does not open to its agent address (tampering?)"},
+                              severity="critical", dedup_key=f"agent_attestation_failed:{aid}")
+            log.error("agent_attestation_failed", extra={"fields": {"agent_id": aid}})
+            continue
+        except AppError as e:     # KMS / transient: retry next minute
+            report["errors"].append(f"{aid[:8]}:{type(e).__name__}")
+            continue
+        try:
+            sig = signer.sign(agent_attestation_message(uid, addr))
+        except AppError as e:
+            report["errors"].append(f"sign:{type(e).__name__}")
+            break                 # the signer is shared: do not hammer KMS when it is failing
+        with _db.transaction(db) as conn:
+            done = _db.rows(conn, """
+                UPDATE agent_keys SET attestation_sig = :s, attestation_key_version = :v,
+                                      attested_at = CAST(:t AS timestamptz)
+                 WHERE id = CAST(:id AS uuid) AND attestation_sig IS NULL AND agent_address = :a
+                RETURNING id""", s=base64.b64encode(sig).decode("ascii"), v=str(signer.key_version)[:300], t=now,
+                id=aid, a=addr)
+        if done:
+            report["attested"] += 1
+    report["errors"] = report["errors"][:20]
+    log.info("attest_agents_done", extra={"fields": {k: v for k, v in report.items() if k != "errors"}})
+    return report
+
+
+# ============================================================================= agent-substitution-scan
+def agent_substitution_scan(db: Any, now: datetime, *, info: Any = None, settings: Any = None,
+                            max_masters: int = 500, max_seconds: float = 240.0, weight_per_minute: int = 400,
+                            pacer: Any = None, rate_budget: Any = None) -> dict[str, Any]:
+    from app.jobs_data import _db
+    from app.jobs_data.hl import make_info_client, make_pacer
+
+    if settings is None:
+        from app.config import get_settings
+
+        settings = get_settings()
+    name = str(getattr(settings, "agent_name", "") or "aijalon").lower()
+    pacer = pacer or make_pacer(db, settings, info=info, weight_per_minute=weight_per_minute,
+                                max_seconds=max_seconds, rate_budget=rate_budget)
+    info = make_info_client(settings, info=info)
+    report: dict[str, Any] = {"masters": 0, "checked": 0, "substituted": 0, "errors": [], "remaining": 0}
+    with _db.transaction(db) as conn:
+        rows = _db.rows(conn, f"""
+            SELECT m.master_address, m.user_id,
+                   coalesce((SELECT array_agg(lower(k.agent_address)) FROM agent_keys k
+                              WHERE k.master_address = m.master_address
+                                AND k.status IN ('pending_approval', 'active')), ARRAY[]::text[]) AS ours
+              FROM (SELECT DISTINCT s.master_address, s.user_id::text AS user_id FROM subscriptions s
+                     WHERE s.status IN {_LIVE_SQL} AND s.master_address IS NOT NULL
+                    UNION
+                    SELECT DISTINCT k.master_address, k.user_id::text FROM agent_keys k
+                     WHERE k.status IN ('pending_approval', 'active')) m
+             ORDER BY m.master_address""")
+    report["masters"] = len(rows)
+    for i, r in enumerate(rows):
+        if report["checked"] >= max_masters or not pacer.can_start(20):
+            report["remaining"] = len(rows) - i
+            break
+        pacer.spend(20)
+        master, uid = str(r["master_address"]).lower(), str(r["user_id"])
+        ours = {str(a).lower() for a in (r.get("ours") or [])}
+        try:
+            listed = info.extra_agents(master)
+        except AppError as e:
+            report["errors"].append(f"{_short(master)}:{type(e).__name__}")
+            continue
+        report["checked"] += 1
+        for a in listed if isinstance(listed, list) else []:
+            if not isinstance(a, dict):
+                continue
+            agent_name = str(a.get("name") or "").strip().lower()
+            addr = str(a.get("address") or "").lower()
+            if not agent_name.startswith(name) or not addr or addr in ours:
+                continue
+            report["substituted"] += 1
+            with _db.transaction(db) as conn:
+                _db.ops_alert(conn, "agent_substituted",
+                              {"user_id": uid, "master": _short(master), "foreign_agent": _short(addr),
+                               "name": agent_name[:32], "action": "contact the user; pause their subscriptions; "
+                               "investigate api/edge compromise (RUNBOOK)"},
+                              severity="critical", dedup_key=f"agent_substituted:{master}:{addr}")
+                _db.emit_event(conn, kind="agent_revoked", user_id=uid, severity="critical",
+                               payload={"master": _short(master), "reason": "a DIFFERENT agent named "
+                                        f"'{agent_name[:32]}' was approved on your account — if you did not do this, "
+                                        "revoke it in Hyperliquid's API settings now", "reapprove_path": "#/agents"},
+                               dedup_key=f"agent_substituted_user:{master}:{addr}")
+            log.error("agent_substituted", extra={"fields": {"user_id": uid, "master": _short(master),
+                                                             "foreign_agent": _short(addr)}})
+    report["errors"] = report["errors"][:20]
+    log.info("agent_substitution_scan_done", extra={"fields": {k: v for k, v in report.items() if k != "errors"}})
+    return report
+
+
+# ============================================================================================ selftest
+def executor_selftest(db: Any, now: datetime, *, runtime: Any, signer_factory: Optional[Callable[[], Any]] = None,
+                      open_one_key: bool = True) -> dict[str, Any]:
+    """Side-effect-free readiness probe of a NEW executor revision (see module doc). Returns {ok, checks}."""
+    from app.execution.pg import PgDatabase, PgFlagRepo, PgSignalRepo, PgSubscriptionRepo
+
+    checks: dict[str, str] = {}
+
+    def run(name: str, fn: Callable[[], str]) -> None:
+        try:
+            checks[name] = "ok: " + str(fn())[:160]
+        except Exception as e:  # noqa: BLE001 - every failure is reported, none is raised
+            checks[name] = f"FAIL: {type(e).__name__}"
+            log.error("selftest_check_failed", extra={"fields": {"check": name, "error": type(e).__name__}})
+
+    pgdb = db if isinstance(db, PgDatabase) else PgDatabase(db)
+    run("db", lambda: str((pgdb.one("SELECT current_user AS u") or {}).get("u")))
+    run("flags", lambda: "kill_switch_global=" + str(PgFlagRepo(pgdb).flags().kill_switch_global))
+    sigs: list[Any] = []
+
+    def _signals() -> str:
+        sigs.extend(PgSignalRepo(pgdb).latest_signals())
+        return f"{len(sigs)} latest signal set(s)"
+    run("signals", _signals)
+
+    def _due() -> str:
+        repo = PgSubscriptionRepo(pgdb, clock=lambda: now)
+        n = sum(len(repo.due_subscriptions(s.strategy_version_id, s.bar_close, 50)) for s in sigs[:5])
+        return f"{n} due subscription(s) in the first {min(len(sigs), 5)} signal set(s) (not traded)"
+    run("due_subscriptions", _due)
+    run("hyperliquid_info", lambda: f"{len((runtime.info.meta() or {}).get('universe', []))} validator perps")
+    run("executor_composition", lambda: type(runtime.executor(pgdb, now=now)).__name__)
+
+    if open_one_key:
+        def _key() -> str:
+            row = pgdb.one("""SELECT user_id::text AS user_id, master_address FROM agent_keys
+                               WHERE status = 'active' ORDER BY approved_at DESC NULLS LAST LIMIT 1""")
+            if not row:
+                return "no active agent key yet (KMS decrypt not exercised)"
+            with runtime.key_provider(pgdb).agent_key(str(row["user_id"]), str(row["master_address"])) as priv:
+                n = len(priv)
+            return f"opened and zeroised one agent key ({n} bytes); no order built"
+        run("kms_agent_key", _key)
+
+    def _attest() -> str:
+        from app.security.kms import make_attestation_signer
+
+        signer = (signer_factory or (lambda: make_attestation_signer(runtime.settings)))()
+        return f"{len(signer.public_key_spki_der())}-byte public key, {signer.key_version[-40:]}"
+    run("attestation_key", _attest)
+
+    ok = all(v.startswith("ok") for v in checks.values())
+    log.info("executor_selftest", extra={"fields": {"ok": ok, **checks}})
+    return {"ok": ok, "checks": checks, "at": now.isoformat(), "no_orders": True}

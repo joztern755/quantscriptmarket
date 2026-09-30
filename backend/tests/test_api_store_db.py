@@ -389,7 +389,8 @@ class ApiStoreDbTest(unittest.TestCase):
         ledger_ops.hold_withdrawal(db, svc, user_id=uid, withdrawal_id=wid, amount=30_000_000, actor=f"user:{uid}")
         self.assertEqual(ledger_ops.spendable(db, svc, uid), 50_000_000)
         self.assertEqual(s.pending_withdrawals_total(db, uid), 30_000_000)
-        self.assertEqual(s.withdrawable_usdc(db, uid), 70_000_000)
+        # REVIEW_AUTH_API F4: the 20 spent on the subscription is no longer withdrawable (was 70: spending ignored)
+        self.assertEqual(s.withdrawable_usdc(db, uid), 50_000_000)
         admin1, admin2 = str(self.a["id"]), str(self.c["id"])
         self.assertEqual(s.payout_approve_1(db, "withdrawal", wid, admin1, self.now), 1)
         self.assertEqual(s.payout_approve_2(db, "withdrawal", wid, admin1, self.now), 0)   # same admin refused

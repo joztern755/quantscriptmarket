@@ -172,7 +172,16 @@ def _main():
     applied = {}
     # Determinism probe: a different heap layout per run (kept alive until exit), so object addresses — and with them
     # any identity-hash-dependent ordering (NaN dict/set keys) — differ between the two runs of a checked execution.
-    _pad = [bytearray((i * 7919) % 97 + 1) for i in range(int(req.get("perturb", 0)))]
+    _pert = int(req.get("perturb", 0))
+    _pad = [(bytearray((i * 7919) % 97 + 1), float(i) + 0.5, (i,)) for i in range(_pert)]
+    _lcg = [_pert]
+    def _jitter():
+        # probe runs only (perturb > 0): a different number of live small objects before EVERY call, so each bar's
+        # objects land at different addresses than in the reference run (perturb = 0, the live settings)
+        if not _pert:
+            return None
+        _lcg[0] = (_lcg[0] * 1103515245 + 12345) & 0x7FFFFFFF
+        return [(float(j) + 0.25, bytearray(1 + (j * 31) % 89)) for j in range(1 + _lcg[0] % 509)]
     # Not ptrace-able / not /proc/<pid>/mem-readable by other same-uid processes (concurrent scripts),
     # and no privilege gain through setuid binaries even after an escape.
     try:
@@ -246,6 +255,7 @@ def _main():
 
     def call(view):
         g = {"__builtins__": safe, "__name__": "strategy"}
+        _hold = _jitter()
         signal.setitimer(signal.ITIMER_PROF, per_call, 0.05)
         try:
             exec(code, g)
@@ -255,6 +265,7 @@ def _main():
             return fn(view)
         finally:
             signal.setitimer(signal.ITIMER_PROF, 0, 0)
+            del _hold
 
     class _ContractError(Exception):
         pass
