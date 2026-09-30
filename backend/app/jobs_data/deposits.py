@@ -8,9 +8,11 @@ transaction per transfer through ``app.ledger.service.post_transaction`` with id
   (method usdc_hl, external_ref = hash, credited, withdrawable). Identical to the API's POST /deposits/usdc/confirm
   path (same key, same entries, same deposits upsert), so whichever runs first wins and the other is a no-op.
 * held    → debit ``treasury:hl_usdc`` / credit ``suspense:usdc_unattributed`` (kind ``deposit_held``) under the SAME
-  key, so a transfer is booked exactly once: if its sender verifies the wallet later, the automatic credit is refused
-  (Conflict) and ops releases it from suspense by hand (e.g. key ``suspense_release:{hash}``). Ops event
-  ``topup_held`` (+ the user's ``topup_held`` event when the sender is a known user, e.g. below the minimum).
+  key, so a transfer is booked exactly once: if its sender verifies the wallet later, it is never credited
+  automatically (it predates the verification, and the key is taken) — a re-scan raises the ops event
+  ``topup_held_now_attributable`` once (only for transfers held because the sender was unknown) and ops release it from
+  suspense by maker-checker (key ``suspense_release:{hash}``, RUNBOOK §13.3). Ops event ``topup_held`` (+ the user's
+  ``topup_held`` event when the sender is a known user, e.g. below the minimum).
 * bridge deposits (no sender) and odd transfers into the treasury → ops events only (not booked).
 
 Scan requests first (``deposit_scan_requests``, upserted by POST /deposits/usdc/confirm — REVIEW_AUTH_API F1): before
@@ -180,7 +182,7 @@ def deposits_scan(db: Any, now: datetime, *, info: Any = None, settings: Any = N
                 if outcome.credit is not None:
                     _book_credit(conn, ledger, outcome.credit, report)
                 elif outcome.held is not None:
-                    _book_held(conn, ledger, det, outcome.held, report)
+                    _book_held(conn, ledger, det, outcome.held, report, user_for_address=lookup)
                 else:
                     report.ignored += 1
                 for alert in outcome.alerts:
@@ -307,9 +309,7 @@ def _book_credit(conn: Any, ledger: Any, instr: Any, report: DepositsReport) -> 
     if existing is not None and existing.kind != instr.kind:
         # booked to suspense earlier (e.g. the wallet was verified after the transfer): never book twice
         report.already_booked += 1
-        _db.ops_alert(conn, "topup_held_now_attributable", {
-            "hash": instr.external_ref[:18], "amount_micro": instr.amount_micro, "user_id": instr.user_id,
-            "booked_as": existing.kind}, severity="warn", dedup_key=f"topup_held_now_attributable:{instr.external_ref}")
+        _now_attributable(conn, instr.external_ref, instr.amount_micro, instr.user_id, existing.kind)
         return
     fee_account = f"user:{instr.user_id}:fee_balance"
     prev = -ledger.get_balance(conn, fee_account)
@@ -347,7 +347,16 @@ def _balance_changed(conn: Any, ledger: Any, user_id: str, prev: int) -> None:
                                                                          "error": type(e).__name__}})
 
 
-def _book_held(conn: Any, ledger: Any, det: Any, reason: str, report: DepositsReport) -> None:
+def _now_attributable(conn: Any, tx_hash: str, amount_micro: int, user_id: str, booked_as: str) -> None:
+    """Ops event: a transfer booked to suspense earlier now has a VERIFIED sender. Never credited automatically (the
+    key is taken; REVIEW_AUTH_API F8) — ops attribute it by the maker-checker release (RUNBOOK §13.3)."""
+    _db.ops_alert(conn, "topup_held_now_attributable", {
+        "hash": tx_hash[:18], "amount_micro": int(amount_micro), "user_id": user_id, "booked_as": booked_as},
+        severity="warn", dedup_key=f"topup_held_now_attributable:{tx_hash}")
+
+
+def _book_held(conn: Any, ledger: Any, det: Any, reason: str, report: DepositsReport, *,
+               user_for_address: Any = None) -> None:
     amount = int(det.amount_micro)
     if amount <= 0:
         report.ignored += 1
@@ -356,6 +365,10 @@ def _book_held(conn: Any, ledger: Any, det: Any, reason: str, report: DepositsRe
     if existing is not None and existing.kind != "deposit_held":
         report.already_booked += 1                    # already credited to a user (e.g. via the API confirm path)
         return
+    if existing is not None and user_for_address is not None:
+        # already held: if it was held because the sender was unknown and that sender has since verified the wallet
+        # (a later verification makes the transfer "predate the verification", so it stays held), tell ops once
+        _held_sender_verified(conn, ledger, det, amount, user_for_address)
     ledger.ensure_account(conn, SUSPENSE_ACCOUNT, "liability", None, non_negative=False)
     tx = ledger.post_transaction(conn, f"usdc_hl:{det.hash}", "deposit_held",
                                  f"USDC held for review {det.hash[:10]}… ({reason[:60]})",
@@ -366,6 +379,22 @@ def _book_held(conn: Any, ledger: Any, det: Any, reason: str, report: DepositsRe
         report.held_micro += amount
     else:
         report.already_booked += 1
+
+
+def _held_sender_verified(conn: Any, ledger: Any, det: Any, amount: int, user_for_address: Any) -> None:
+    sender = str(getattr(det, "user_address", "") or "").lower()
+    if not (len(sender) == 42 and sender.startswith("0x")):
+        return
+    user_id = user_for_address(sender)
+    if not user_id:
+        return
+    if ledger.get_transaction(conn, f"suspense_release:{str(det.hash).lower()}") is not None:
+        return                                        # already released (attributed or refunded)
+    if _db.one(conn, "SELECT to_regclass('public.usdc_held_deposits') IS NOT NULL AS ok")["ok"] is True:
+        rec = _db.one(conn, "SELECT reason FROM usdc_held_deposits WHERE tx_hash = :h", h=str(det.hash).lower())
+        if rec is not None and not str(rec["reason"]).startswith("sender is not a verified user wallet"):
+            return                                    # held for another reason (below minimum, …): not news
+    _now_attributable(conn, str(det.hash), amount, str(user_id), "deposit_held")
 
 
 def _record_held(conn: Any, det: Any, amount: int, reason: str, held_tx_id: str) -> None:

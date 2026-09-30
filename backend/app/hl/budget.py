@@ -77,7 +77,11 @@ def current_pool(default: str = POOL_TICK) -> str:
 
 
 class HlBudgetExhausted(ExternalServiceError):
-    """The shared Hyperliquid budget had no room for this caller before its deadline (a job stops and resumes)."""
+    """The shared Hyperliquid budget had no room for this caller before its deadline (a job stops and resumes).
+    Over HTTP it is 503 ``service_unavailable`` (temporarily unavailable, retry later; nothing was sent to Hyperliquid)
+    — not 502, which means Hyperliquid itself failed. Still an ``ExternalServiceError`` for callers that catch that."""
+
+    http_status, code = 503, "service_unavailable"
 
 
 @dataclass(frozen=True)

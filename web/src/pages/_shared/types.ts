@@ -336,6 +336,10 @@ export interface ReferralInfo {
   earnings_payable_micro: Micro;
   earnings_total_micro: Micro;
   next_tier: { name: string; min_active_users: number; min_notional_30d_micro: Micro; share_of_pool_bps: number } | null;
+  /** none | pending | provider_approved (passed the provider, awaiting our admin) | approved | rejected */
+  kyc_status?: string;
+  /** referral payouts need approved KYC (always true today) */
+  payout_kyc_required?: boolean;
 }
 
 // ------------------------------------------------------------------------------------------ creator

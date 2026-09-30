@@ -159,7 +159,7 @@ def upsert_uptime(display: str, host: str, path: str, content: str | None) -> st
 def main() -> None:
     ch = upsert_channel()
     existing = {p["displayName"]: p for p in list_all(f"{BASE}/projects/{P}/alertPolicies", "alertPolicies")}
-    api, ex, mig, dep = E["SA_API"], E["SA_EXECUTOR"], E["SA_MIGRATOR"], E["SA_DEPLOYER"]
+    api, ex, mig, _dep = E["SA_API"], E["SA_EXECUTOR"], E["SA_MIGRATOR"], E["SA_DEPLOYER"]  # all four required
     sbx = E.get("SA_SANDBOX", "sandbox-sa-not-set")
     builder, hosting = E.get("SA_BUILDER", "builder-sa-not-set"), E.get("SA_HOSTING", "hosting-sa-not-set")
     attest_key, binauthz_key = E.get("KMS_ATTEST_KEY", "agent-attest"), E.get("KMS_BINAUTHZ_KEY", "binauthz-attestor")

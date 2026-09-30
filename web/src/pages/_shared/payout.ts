@@ -1,19 +1,23 @@
 // "Request payout" form shared by Creator Studio earnings and Referrals: POST /v1/payouts
 // {amount_micro, source: "creator"|"referrer", to_address} (step-up + Idempotency-Key; maker-checker by two admins).
 import { h, mount, button, field, note, toast, confirmDialog, kv } from "../../core/ui.js";
-import { api, newIdempotencyKey, type PublicConfig } from "../../core/api.js";
+import { api, ApiError, newIdempotencyKey, type PublicConfig } from "../../core/api.js";
 import { fmtUsd } from "../../core/format.js";
 import type { PageContext } from "../../core/router.js";
 import { usdInput, isAddress, errCode, errMessage } from "./util.js";
 import { addressCheck } from "../../core/addr.js";
 import { proveDestination } from "./walletproof.js";
+import { payoutKycBlocked } from "./kyc.js";
 
-export function payoutForm(ctx: PageContext, cfg: PublicConfig, source: "creator" | "referrer", availableMicro: number, onDone: () => void): HTMLElement {
+/** `kycStatus` (when known): creator AND referrer payouts need approved KYC (POST /payouts → 403 reason kyc_required);
+ *  anything else shows why and disables the request button. */
+export function payoutForm(ctx: PageContext, cfg: PublicConfig, source: "creator" | "referrer", availableMicro: number, onDone: () => void, opts: { kycStatus?: string | null } = {}): HTMLElement {
   const box = h("div", { class: "stack" });
   if (!cfg.features.payouts) {
     mount(box, note("Payouts are not enabled yet during the internal launch phase. Your earnings stay payable.", "info"));
     return box;
   }
+  const kycBlocked = "kycStatus" in opts && opts.kycStatus !== "approved";
   const min = cfg.economics.min_topup_micro;
   const amount = usdInput({ id: `po-${source}-amt`, placeholder: `min ${fmtUsd(min)}` });
   const verified = (ctx.me?.wallets as { address: string; verified_at: string | null }[] | undefined)?.filter((w) => w.verified_at) ?? [];
@@ -22,6 +26,7 @@ export function payoutForm(ctx: PageContext, cfg: PublicConfig, source: "creator
   mount(
     box,
     h("p", { class: "small muted" }, `Available: ${fmtUsd(availableMicro)}. Payouts go only to one of your verified wallets, are approved by two administrators, then sent as USDC on Hyperliquid.`),
+    kycBlocked ? payoutKycBlocked(opts.kycStatus) : null,
     verified.length ? null : note("Verify a wallet first (Subscribe → connect & verify your wallet).", "warn"),
     field("Amount (USD)", amount.el),
     field("To (verified wallet)", to),
@@ -29,7 +34,7 @@ export function payoutForm(ctx: PageContext, cfg: PublicConfig, source: "creator
       "div",
       { class: "btns" },
       button("Request payout", {
-        disabled: !verified.length,
+        disabled: !verified.length || kycBlocked,
         onClick: async () => {
           const m = amount.micro();
           if (m === null || m < min) return toast(`Enter at least ${fmtUsd(min)}.`, "warn");
@@ -41,6 +46,9 @@ export function payoutForm(ctx: PageContext, cfg: PublicConfig, source: "creator
             await api.post("/payouts", { amount_micro: m, source, to_address: to.value.toLowerCase() }, { signal: ctx.signal, idempotencyKey: key });
           } catch (err) {
             const c = errCode(err);
+            if (err instanceof ApiError && err.details?.reason === "kyc_required") {
+              return toast("Payout blocked: your identity verification (KYC) must be approved first.", "warn");
+            }
             if (c === "insufficient_balance" || c === "forbidden") return toast(errMessage(err), "warn");
             throw err;
           }

@@ -599,13 +599,16 @@ class JobsDataDbTest(unittest.TestCase):
         # idempotent: a second scan (overlap) books nothing new
         rep = deposits_scan(self.db, T0 + timedelta(minutes=5), info=info, settings=settings, weight_per_minute=100_000)
         self.assertEqual((rep["credited"], rep["held"], rep["already_booked"]), (0, 0, 3))
-        # the stranger verifies later: the held transfer is NOT credited a second time
-        self.admin.fetchall("INSERT INTO wallets (user_id, master_address, verified_at) VALUES (CAST(:u AS uuid), :a, now())",
-                            {"u": self.user(4), "a": stranger})
+        # the stranger verifies later (after the transfer; a fixed time, never the wall clock): the held transfer is
+        # NOT credited (F8: it predates the verification, and its key is taken) — ops are told it is now attributable
+        self.admin.fetchall("INSERT INTO wallets (user_id, master_address, verified_at) VALUES (CAST(:u AS uuid), :a, :t)",
+                            {"u": self.user(4), "a": stranger, "t": (T0 + timedelta(minutes=7)).isoformat()})
         self.admin.fetchall("DELETE FROM job_cursors WHERE job = 'deposits' AND key = :k", {"k": treasury})
         rep = deposits_scan(self.db, T0 + timedelta(minutes=10), info=info, settings=settings, weight_per_minute=100_000)
         self.assertEqual((rep["credited"], rep["errors"]), (0, []))
         self.assertEqual(len(self.events(f"topup_held_now_attributable:%{hashlib.sha256(f'{self.tag}2'.encode()).hexdigest()}")), 1)
+        # held below the minimum from an already-verified wallet: not news (only the unknown-sender case is)
+        self.assertEqual(self.events(f"topup_held_now_attributable:%{hashlib.sha256(f'{self.tag}3'.encode()).hexdigest()}"), [])
 
     # ------------------------------------------------------------------------------------------ agents
     def test_agent_expiry_scan(self) -> None:

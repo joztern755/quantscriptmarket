@@ -287,7 +287,6 @@ def _apply_books(conn: Any, addr: str, subs: Sequence[Mapping[str, Any]], ours: 
                  not_ours: Sequence[Fill], reduce_only: Mapping[str, bool], report: FillsReport) -> dict[int, int]:
     """Apply this batch's NEW fills to the books in (time, tid) order. Returns {tid: book PnL micro} for our fills."""
     books = _Books(conn)
-    by_id = {s["id"]: s for s in subs}
     seen_foreign: set[str] = set()
     if not_ours:
         tids = sorted({str(f.tid) for f in not_ours})

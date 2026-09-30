@@ -128,11 +128,13 @@ answer). 422 `validation_failed` (nothing sent) unless ALL hold: `action.type` �
 EIP-712 signer is one of the caller's **verified wallets**; approveAgent: `agentAddress` = one of the caller's
 **pending** agents, `agentName` = its name, signer = its master; approveBuilderFee: `builder` = config builder,
 `maxFeeRate` ≤ config fee; usdSend: `destination` = config treasury, positive amount (≤ 6 dp). Orders, cancels,
-withdrawals and every other type are refused. 429 rate limit · 502 Hyperliquid unreachable (nothing known to be sent).
+withdrawals and every other type are refused. 429 rate limit · 502 Hyperliquid unreachable (nothing known to be sent) ·
+503 `service_unavailable` rate budget exhausted (nothing sent).
 The forwarded `/exchange` request counts against the same per-IP Hyperliquid weight limit as the API's `/info` reads,
 so it is charged to the shared budget (`hl_rate_budget`, API egress key, low-priority pool, `HlLimits.exchange_weight`
-= 1) BEFORE it is sent; when the budget has no room within 2 s the call fails with 502 `external_service_error`
-(message "hyperliquid rate budget exhausted") and nothing was sent — the web shows "busy, retry in a minute".
+= 1) BEFORE it is sent; when the budget has no room within 2 s the call fails with 503 `service_unavailable`
+(message "hyperliquid rate budget exhausted"; service temporarily unavailable) and nothing was sent — the web shows
+"busy, retry in a minute". The same 503 applies to every API route whose Hyperliquid `/info` read finds no budget.
 
 ## Subscriptions (SPEC §12 cancel flow)
 

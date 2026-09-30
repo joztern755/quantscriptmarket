@@ -32,8 +32,8 @@ def resolve_tag(repo: str, tag: str) -> str:
     base = "/".join(repo.split("/")[:2])  # owner/repo/path@ref -> owner/repo
     out = subprocess.run(["git", "ls-remote", "--tags", f"https://github.com/{base}", f"refs/tags/{tag}",
                           f"refs/tags/{tag}^{{}}"], capture_output=True, text=True, timeout=60, check=True).stdout
-    peeled = [l.split()[0] for l in out.splitlines() if l.endswith("^{}")]
-    plain = [l.split()[0] for l in out.splitlines() if l.endswith(f"refs/tags/{tag}")]
+    peeled = [ln.split()[0] for ln in out.splitlines() if ln.endswith("^{}")]
+    plain = [ln.split()[0] for ln in out.splitlines() if ln.endswith(f"refs/tags/{tag}")]
     sha = (peeled or plain or [""])[0]
     if not SHA.match(sha):
         raise SystemExit(f"cannot resolve {base}@{tag}")

@@ -4,7 +4,7 @@
 import type { PageContext } from "../core/router.js";
 import { h, mount, skeleton, errorState, emptyState, note, stat, kv, table, tabs, button, toast, confirmDialog, modal, field, badge, subStatusBadge, type Column } from "../core/ui.js";
 import { cancelButtons } from "../core/subscriptions.js";
-import { api, publicConfig, peekPublicConfig, newIdempotencyKey, type PublicConfig } from "../core/api.js";
+import { api, ApiError, publicConfig, peekPublicConfig, newIdempotencyKey, type PublicConfig } from "../core/api.js";
 import { appConfig, trustAnchors } from "../core/config.js";
 import { addressCheck } from "../core/addr.js";
 import { proveDestination } from "./_shared/walletproof.js";
@@ -177,7 +177,20 @@ function subActions(ctx: PageContext, s: Subscription, reload: () => void): HTML
           });
           if (!ok) return;
         }
-        await api.patch(path, { paused: !paused }, { signal: ctx.signal });
+        try {
+          await api.patch(path, { paused: !paused }, { signal: ctx.signal });
+        } catch (err) {
+          // API_CONTRACT PATCH /subscriptions/{id}: resume after the paid period ended → 402 renewal_due;
+          // strategy paused / not listed by the platform → 409 strategy_not_listed
+          const reason = err instanceof ApiError ? err.details?.reason : undefined;
+          if (reason === "renewal_due") {
+            toast("The renewal is due: top up your fee balance to resume.", "warn");
+            ctx.navigate("/dashboard/balance");
+            return;
+          }
+          if (reason === "strategy_not_listed") return toast("This strategy is paused by the platform. You can resume once it is active again.", "warn");
+          throw err;
+        }
         toast(paused ? "Resumed." : "Paused.", "good");
         reload();
       },
@@ -411,6 +424,30 @@ function kindLabel(k: string): string {
   return map[k] ?? k.replace(/_/g, " ");
 }
 
+/** Alert inbox titles (GET /v1/alerts kinds; API_CONTRACT "alerts"). Unknown kinds fall back to the ledger labels. */
+const ALERT_LABELS: Record<string, string> = {
+  strategy_paused: "Strategy paused",
+  strategy_resumed: "Strategy resumed",
+  kyc_status: "Identity verification",
+  balance_low: "Fee balance low",
+  balance_empty: "Fee balance empty",
+  topup_credited: "Deposit credited",
+  topup_held: "Deposit held for review",
+  withdrawal_requested: "Withdrawal requested",
+  withdrawal_sent: "Withdrawal sent",
+  withdrawal_rejected: "Withdrawal rejected",
+  profit_share_charged: "Profit share charged",
+  subscription_renewed: "Subscription renewed",
+  builder_approval_missing: "Builder-fee approval missing",
+  new_device_login: "Sign-in from a new device",
+  mfa_changed: "Two-factor authentication changed",
+  foreign_trade_detected: "Trade outside the strategy detected",
+};
+
+function alertLabel(k: string): string {
+  return ALERT_LABELS[k] ?? kindLabel(k);
+}
+
 interface StripeMin {
   elements(opts: Record<string, unknown>): { create(type: string, opts?: Record<string, unknown>): { mount(el: HTMLElement): void; destroy?(): void } };
   confirmPayment(opts: Record<string, unknown>): Promise<{ error?: { message?: string }; paymentIntent?: { status?: string } }>;
@@ -480,7 +517,7 @@ function depositPanel(ctx: PageContext, cfg: PublicConfig, onDone: () => void): 
       usdcStatus.className = "status ok";
       usdcStatus.textContent = c.credited.length
         ? `Deposit received. Your balance is ${fmtUsd(c.fee_balance_micro)}.`
-        : "Transfer sent. It will be credited automatically once Hyperliquid shows it (usually within a minute).";
+        : "Transfer sent. It will be credited automatically once detected (usually within 5 minutes).";
     } catch (err) {
       usdcStatus.className = "status";
       usdcStatus.textContent = `Transfer sent. It will be credited automatically once detected (${errMessage(err)}).`;
@@ -660,7 +697,7 @@ function alertItem(ctx: PageContext, a: Alert, reload: () => void): HTMLElement 
   return h(
     "div",
     { class: ["alert-item", !a.acked_at && "unread"] },
-    h("div", { class: "row between" }, h("span", { class: "row" }, badge(a.severity, tone), h("span", { class: "alert-title" }, kindLabel(a.kind))), h("span", { class: "small muted", title: fmtDateTime(a.created_at) }, fmtRelative(a.created_at))),
+    h("div", { class: "row between" }, h("span", { class: "row" }, badge(a.severity, tone), h("span", { class: "alert-title" }, alertLabel(a.kind))), h("span", { class: "small muted", title: fmtDateTime(a.created_at) }, fmtRelative(a.created_at))),
     detail ? h("p", { class: "small break" }, detail) : null,
     !a.acked_at
       ? h(

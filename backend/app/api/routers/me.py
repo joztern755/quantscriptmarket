@@ -19,7 +19,6 @@ from app.api import schemas as S
 from app.api.deps import (
     AuthCtx,
     Services,
-    consented_user,
     current_user,
     get_services,
     idempotency_key,

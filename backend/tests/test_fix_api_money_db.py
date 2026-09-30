@@ -242,7 +242,7 @@ class FixMoneyDbTest(unittest.TestCase):
     # ------------------------------------------------------------------------------------------------ F3 / H3
     def test_unpause_restores_billing_state_and_charges_a_due_renewal(self) -> None:
         from app.api import billing_ops
-        from app.errors import Conflict, InsufficientBalance
+        from app.errors import InsufficientBalance
         s, db, now = self.store, self.db, self.now
         owner, u = self.user("o"), self.user("p")
         sid, vid = self.strategy(owner, price=20 * USD)

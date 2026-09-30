@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import sys
 import unittest
-from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path

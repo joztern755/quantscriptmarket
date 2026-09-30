@@ -85,6 +85,7 @@ _SPECS: tuple[KindSpec, ...] = (
     KindSpec("mfa_changed", "Two-factor authentication changed", "security", mandatory=True, email=True),
     KindSpec("mfa_reset", "Two-factor authentication reset", "security", mandatory=True, email=True, listed=False),
     KindSpec("alert_email_changed", "Alert email address changed", "security", mandatory=True, email=True),
+    KindSpec("kyc_status", "Identity verification (KYC) decision", "security", email=True),
     KindSpec("telegram_unreachable", "Telegram alerts stopped reaching you", "security", mandatory=True, email=True,
              telegram=False),
     # markets / strategies

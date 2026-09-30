@@ -27,6 +27,7 @@ payments, API). Keys match what app/jobs_data emits; alternatives in brackets ar
   market_paused        scope (coin or "all markets"), optional cause ; strategy_paused: strategy
   strategy_resumed     strategy, period_end (ISO) — admin unpause (app/api/billing_ops)
   signal_stale         optional strategy ; telegram_unreachable: reason, pause_at ; alert_email_changed: email
+  kyc_status           status (approved | rejected | provider_approved | pending) — KYC webhook / admin decision
 Missing fields render as "—"; unknown kinds fall back to app.alerts.notifier.render (its TEMPLATES, then a
 generic "key: value" body). Every value is sanitised (secrets redacted, 0x addresses shortened, emails masked),
 so messages never contain full addresses, keys or tokens.
@@ -242,6 +243,22 @@ def _simple(title: str, body: str) -> Tmpl:
     return lambda p, origin: (title, body.format(origin=origin.rstrip("/"), dash=_dash(origin)))
 
 
+def _kyc_status(p: P, origin: str) -> tuple[str, str]:
+    st = p.s("status", "")
+    if st == "approved":
+        return ("Identity verified",
+                "Your identity verification (KYC) was approved. Creator and referral payouts can now be requested.")
+    if st == "rejected":
+        return ("Identity verification not approved",
+                "Your identity verification (KYC) was not approved. Payouts stay blocked; you can start a new "
+                "verification from the Referrals or Creator page.")
+    if st == "provider_approved":
+        return ("Identity verification passed",
+                "Your identity check passed. An admin will confirm it shortly; payouts unlock after that.")
+    return ("Identity verification update",
+            "The status of your identity verification (KYC) changed. Check the Referrals or Creator page.")
+
+
 def _login_country(p: P, origin: str) -> tuple[str, str]:
     return ("New sign-in location",
             f"Your account was signed into from a new country ({p.s('country')}). If this was not you, secure your "
@@ -355,6 +372,7 @@ USER_TEMPLATES: dict[str, Tmpl] = {
                                   f"The latest signal for {p.s('strategy', 'your strategy')} is late or was rejected, "
                                   "so no new entries are placed until a fresh, verified signal arrives. Exits still "
                                   "run."),
+    "kyc_status": _kyc_status,
     "telegram_unreachable": _unreachable,
     "test_alert": _simple("Test alert",
                           "This is a test alert from aijalon.trade. If you can read it, this channel works."),

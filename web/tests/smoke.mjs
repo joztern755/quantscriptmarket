@@ -594,6 +594,7 @@ for (const vp of VIEWPORTS) {
     const tag = `signed-in ${vp.name}/${scheme}`;
     const st = { linked: false, plan: "free", fee: 25000000 };
     const planPosts = [];
+    const kycPosts = [];
     const unknown = [];
     const PLAN_PRICE = { free: 0, pro: 20000000, max: 50000000 };
     const SUB2 = { ...SUB, id: "7b6a5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d", strategy_id: MOMO.id, strategy_slug: "btc-momo", strategy_name: "BTC Momentum 4h", strategy_markets: ["BTC"], trading_address: "0x4444444444444444444444444444444444444444", max_leverage_x100: 300 };
@@ -617,6 +618,16 @@ for (const vp of VIEWPORTS) {
         st.plan = body.plan;
         st.fee -= PLAN_PRICE[body.plan];
         return { body: { plan: body.plan, charged_micro: PLAN_PRICE[body.plan], period_end: "2026-10-30T00:00:00Z", fee_balance_micro: st.fee } };
+      }
+      if (m === "GET" && p === "/v1/referrals") return { body: {
+        code: "abcd2345", link: "https://aijalon.trade/?ref=abcd2345", tier: "bronze", share_of_pool_bps: 1000,
+        active_referred_users_30d: 2, referred_notional_30d_micro: 1000000000, referred_users_total: 3,
+        earnings_payable_micro: 12000000, earnings_total_micro: 15000000, next_tier: null,
+        kyc_status: "none", payout_kyc_required: true,
+      } };
+      if (m === "POST" && p === "/v1/referrals/kyc/session") {
+        kycPosts.push(p);
+        return { body: { url: "", provider: "manual", status: "pending", manual: true } };
       }
       if (m === "GET" && p === "/v1/creator/strategies") return { body: [CREATOR_STRAT] };
       if (m === "GET" && p === "/v1/creator/posts") return { body: page([
@@ -767,6 +778,17 @@ for (const vp of VIEWPORTS) {
     check(`${tag}: earnings ${vp.name === "mobile" ? "cards on mobile" : "table on desktop"}`, vp.name === "mobile" ? rowDisplay === "block" : rowDisplay === "table-row", rowDisplay);
     await hsOk("creator earnings");
     if (SHOTS) await pg.screenshot({ path: join(SHOTS, `${vp.name}-${scheme}-earnings.png`), fullPage: true });
+
+    // Referrals: KYC status + "Verify identity" (manual provider → an admin reviews); payouts blocked until approved
+    await pg.goto(BASE + "#/referrals", { waitUntil: "networkidle" });
+    await pg.waitForSelector("button:has-text('Verify identity')", { timeout: 8000 }).catch(() => undefined);
+    t = await text();
+    check(`${tag}: referrals shows KYC status and the verify prompt`, /Identity verification/i.test(t) && /Not started/i.test(t) && /Verify identity to withdraw referral earnings/i.test(t) && /Payouts are not enabled yet|Payout requests are blocked/.test(t), t.slice(-400));
+    await pg.click("button:has-text('Verify identity')");
+    await pg.waitForSelector("text=reviewed by an admin", { timeout: 5000 }).catch(() => undefined);
+    t = await text();
+    check(`${tag}: manual KYC → "reviewed by an admin" notice`, kycPosts.length === 1 && /reviewed by an admin/.test(t) && (await pg.locator("button:has-text('Verify identity')").count()) === 0, t.slice(0, 200));
+    await hsOk("referrals");
 
     const bg = await pg.evaluate(() => getComputedStyle(document.body).backgroundColor);
     check(`${tag}: ${scheme} theme applied`, scheme === "dark" ? bg === "rgb(20, 17, 14)" : bg === "rgb(246, 244, 240)", bg);

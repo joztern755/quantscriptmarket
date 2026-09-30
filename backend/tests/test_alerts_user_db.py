@@ -629,7 +629,8 @@ class UserAlertsDbTest(unittest.TestCase):
             estimate_monthly_need=billing.estimate_monthly_need, plan_price=plan_price,
             subscription_split=subscription_split))
         fb = ledger_ops.fee_balance(uid)
-        ledger_ops.post(self.api, svc, key=f"t:{self.tag}:top", kind="deposit", memo="t", created_by="test",
+        # a Stripe top-up is keyed stripe:{payment_intent} (stripe_pay.py; 0015 rule 111 pins that key shape)
+        ledger_ops.post(self.api, svc, key=f"stripe:pi_t{self.tag}top", kind="deposit", memo="t", created_by="test",
                         entries=[("stripe:clearing", 30_000_000), (fb, -30_000_000)])
         ledger_ops.post(self.api, svc, key=f"t:{self.tag}:d1", kind="plan_purchase", memo="t", created_by="test",
                         entries=[(fb, 12_000_000), ("platform:revenue:plans", -12_000_000)])      # 18 > 10: none

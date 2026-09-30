@@ -142,6 +142,13 @@ class InfoClientHookTest(unittest.TestCase):
             c.meta()
         self.assertEqual(sess.posts, 0)
 
+    def test_budget_refusal_is_503_service_unavailable(self):
+        from app.errors import ExternalServiceError
+
+        e = HlBudgetExhausted("hyperliquid rate budget exhausted")
+        self.assertEqual((e.http_status, e.code), (503, "service_unavailable"))   # API_CONTRACT: busy, retry later
+        self.assertIsInstance(e, ExternalServiceError)
+
 
 class BudgetHookTest(unittest.TestCase):
     def setUp(self):

@@ -321,6 +321,10 @@ export async function relayExchange(payload: ExchangeBody): Promise<HlResult> {
     if (err instanceof ApiError && (err.status === 0 || err.code === "network_error")) {
       throw new ApiError(0, "network_error", "Couldn't reach Hyperliquid or the aijalon relay. Your signature was not submitted.");
     }
+    if (err instanceof ApiError && err.status === 503 && err.code === "service_unavailable") {
+      // relay rate budget exhausted (API_CONTRACT): nothing was forwarded
+      throw new ApiError(503, "service_unavailable", "Hyperliquid is busy — retry in a minute. Your signature was not submitted.");
+    }
     throw err;
   }
   const status = typeof out.upstream_status === "number" ? out.upstream_status : 502;

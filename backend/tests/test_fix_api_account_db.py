@@ -19,8 +19,6 @@ import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))

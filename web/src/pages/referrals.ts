@@ -1,11 +1,13 @@
 // #/referrals — GET /v1/referrals (ReferralsOut): code, share link, tier progress (tiers from public config),
-// earnings; payout request (POST /v1/payouts source "referrer").
+// earnings; identity verification (kyc_status; "Verify identity" → POST /v1/referrals/kyc/session) and payout request
+// (POST /v1/payouts source "referrer" — blocked until KYC is approved, payout_kyc_required).
 import type { PageContext } from "../core/router.js";
-import { h, mount, skeleton, errorState, note, stat, copyButton } from "../core/ui.js";
+import { h, mount, skeleton, errorState, note, stat, copyButton, button } from "../core/ui.js";
 import { api, publicConfig, type PublicConfig } from "../core/api.js";
 import { fmtUsd, fmtBps, fmtNum } from "../core/format.js";
 import type { ReferralInfo } from "./_shared/types.js";
 import { payoutForm } from "./_shared/payout.js";
+import { kycBadge, kycInProgress, startKycSession, KYC_AWAITING_TEXT } from "./_shared/kyc.js";
 import { ensurePageCss, isAbortError, pageHead, panel, progressBar } from "./_shared/util.js";
 
 export const title = "Referrals";
@@ -87,7 +89,40 @@ function draw(body: HTMLElement, ctx: PageContext, r: ReferralInfo, cfg: PublicC
           );
         }),
     ),
-    panel("Request a payout", payoutForm(ctx, cfg, "referrer", r.earnings_payable_micro, reload)),
+    kycPanel(ctx, r),
+    panel("Request a payout", payoutForm(ctx, cfg, "referrer", r.earnings_payable_micro, reload, r.payout_kyc_required === false ? {} : { kycStatus: kycStatusOf(r) })),
     note("Referral rewards are paid from the platform's builder-fee revenue. Do not promise returns when sharing your link; strategies can lose money.", "info"),
+  );
+}
+
+function kycStatusOf(r: ReferralInfo): string {
+  return typeof r.kyc_status === "string" && r.kyc_status ? r.kyc_status : "none";
+}
+
+/** ReferralsOut.kyc_status: none | pending | provider_approved | approved | rejected. */
+function kycPanel(ctx: PageContext, r: ReferralInfo): HTMLElement {
+  const status = kycStatusOf(r);
+  const head = h("div", { class: "row between w-full" }, h("h2", null, "Identity verification"), kycBadge(status));
+  if (status === "approved") return panel(head, h("p", { class: "small" }, "Your identity is verified. You can request referral payouts."));
+  const msg = h("div");
+  const needed = r.payout_kyc_required === false ? null : h("p", { class: "small" }, h("b", null, "Verify identity to withdraw referral earnings."));
+  const intro = h("p", { class: "small muted" }, "Documents are handled by our verification provider and are not stored by aijalon.trade. One check covers referral and creator payouts.");
+  if (kycInProgress(status)) {
+    return panel(head, needed, intro, note(status === "provider_approved" ? KYC_AWAITING_TEXT : "Your verification is being reviewed. This usually takes less than a day.", "info"));
+  }
+  const start = button(status === "rejected" ? "Retry verification" : "Verify identity", {
+    kind: "primary",
+    onClick: async () => {
+      // manual provider / awaiting admin: the notice stays on screen (a reload would replace it with the status)
+      if (await startKycSession("/referrals/kyc/session", ctx, msg)) start.remove();
+    },
+  });
+  return panel(
+    head,
+    needed,
+    intro,
+    status === "rejected" ? note("Your last verification was not approved. You can try again.", "bad") : null,
+    h("div", { class: "btns" }, start),
+    msg,
   );
 }

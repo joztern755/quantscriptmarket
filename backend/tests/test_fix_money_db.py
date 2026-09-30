@@ -296,7 +296,6 @@ class MoneyFixesDbTest(unittest.TestCase):
         u, c = self.user("c1u"), self.user("c1c")
         sid, vid = self.strategy(c, ["BTC"], bps=1200)
         a = addr("c1-" + u)
-        day = date(2026, 10, 1)
         sub = self.subscribe(u, sid, vid, a, datetime(2026, 9, 20, tzinfo=UTC))
         self.deposit(self.api, u, usd(10))
         # B1 realised +$2,000 on day D (our book)

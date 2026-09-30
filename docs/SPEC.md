@@ -253,3 +253,39 @@ Walk-forward backtest on every upload (`sandbox/backtest.py`): Hyperliquid candl
 - **Trusted builder dexes (owner, 30 Sep 2026):** strategies may trade validator perps and builder-deployed (HIP-3) perps only on dexes in an admin-managed allowlist. Launch allowlist = the 10 dexes live on 30 Sep 2026: xyz, flx, vntl, hyna, km, abcd, cash, para, mkts, io. A new dex needs ONE admin approval (audit-logged, step-up) before any strategy can list or trade it; removing a dex immediately pauses new entries on its markets. Reason: a dex deployer controls its oracle/mark/volume/OI, so thin-market guards alone cannot protect subscribers on an attacker-owned dex.
 - **Held-deposit refunds gated (owner):** refunds of held (unattributed) USDC deposits are blocked until PAYOUTS_ENABLED is on, like every other outflow. Attribution to a verified user (no USDC leaves the treasury) remains available.
 - **Hosting cost, internal phase (owner, 30 Sep 2026):** stay on Google Cloud (Cloudflare Workers + Neon rejected: no HSM key custody, no private DB networking, free tier too small for a per-minute scheduler). Cloud SQL runs **zonal, `db-custom-1-3840`, 20 GB** during the internal phase; switch to REGIONAL HA `db-custom-2-8192` before public launch (DEPLOY §4, G2).
+
+## 13. Security fix rounds (30 Sep 2026)
+
+Invariants added by the money, API/account, trading, ledger-lockdown, clean-up and executor-keygen rounds (migrations
+0010–0016; details in SECURITY.md, RUNBOOK §13.4a/§13.9 and API_CONTRACT). Each is enforced in code AND, where noted,
+by the database.
+
+- **Collected-only creator credit:** profit share reaches a creator payable / platform revenue only for the part
+  actually collected from the user's fee balance; the rest waits in `ps_pending:{user}:{creator|platform}` (never
+  payable; the DB refuses a payout hold from it) and is released only when the user tops up.
+- **Own position book:** profit share is computed from our own per-subscription book of our fills; a foreign fill on a
+  strategy coin marks the book to market (`foreign_fill` event) instead of hiding profit.
+- **oid attribution:** a fill is attributed only when its cloid (secret HMAC, `CLOID_SECRET`) AND exchange oid match an
+  order we recorded before sending; mismatches are dropped (`fill_oid_mismatch`), nothing is attributed by time window;
+  late fills are claimed by the next settlement, never lost.
+- **Ledger posting rules:** every posting goes through `ledger_post_as(role, kind, …)` and must match a row of the
+  append-only `ledger_posting_rules` table (role, kind, key pattern, debit/credit account patterns); overdrafts only on
+  the DB allowlist; hash chain verified daily with anchors; reconcile runs a solvency check.
+- **Executor-only agent keygen:** the api can only request an agent (`requested` row); the executor generates, seals
+  (KMS), re-opens and signs the `aijalon-agent-v2|{user}|{agent}` attestation, which the web verifies against the
+  pinned public key before asking the user to approve; the api has no KMS role on agent keys.
+- **Trusted dexes:** strategies trade builder-dex (HIP-3) perps only on the admin-managed `trusted_dexes` allowlist;
+  creator signals for other dexes are dropped (`creator_signal_untrusted_dex`), positions/treasury reads are dex-aware.
+- **Card-funded holds:** card top-ups are spend-only and spent first; only USDC-funded balance is withdrawable; creator /
+  referrer earnings paid from card-funded spending are held for the 120-day dispute window.
+- **48 h security hold:** withdrawals and payouts are held for 48 h after a new payout wallet, an MFA change or a
+  new-device sign-in; the second admin approval is refused while a hold applies.
+- **Payouts and refunds gated:** every outflow (withdrawal, creator/referrer payout, held-deposit refund) is blocked
+  while `PAYOUTS_ENABLED` is off, needs two different admins and a hardware-wallet signature; creator AND referrer
+  payouts need approved KYC (one admin decides; provider-passed KYC is never auto-approved).
+- **Deposits never double-book:** a USDC transfer is booked once under `usdc_hl:{hash}` (credit or suspense); transfers
+  older than the sender wallet's verification are held, never credited; held funds leave suspense only by maker-checker.
+- **Hyperliquid budget:** API reads and the `/exchange` relay are charged to the shared per-IP budget before any call;
+  no room → 503 `service_unavailable`, nothing sent; the executor has its own egress IP.
+- **Admin-paused strategies:** no new entries, subscriptions or renewals while paused; unpause (second-admin listing
+  approval) credits the paused time back to each live period and renews at the pinned price.

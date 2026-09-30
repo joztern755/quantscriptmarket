@@ -640,6 +640,7 @@ async function strategiesTab(body: HTMLElement, ctx: PageContext): Promise<void>
           box,
           ...rows.map((s) => {
             const unpublished = s.versions.filter((v) => !v.published_at);
+            const current = s.versions.filter((v) => v.published_at).sort((a, b) => Date.parse(b.published_at ?? "") - Date.parse(a.published_at ?? ""))[0];
             const price = usdInput({ value: String((s.price_monthly_micro ?? 0) / 1_000_000) });
             return panel(
               h("div", { class: "row between w-full" }, h("h2", null, s.name), h("span", { class: "row" }, badge(s.status, s.status === "listed" ? "good" : "muted"), s.in_house ? badge("in-house", "info") : badge(`KYC ${s.owner_kyc_status ?? "not started"}`, s.owner_kyc_status === "approved" ? "good" : "bad"))),
@@ -705,6 +706,19 @@ async function strategiesTab(body: HTMLElement, ctx: PageContext): Promise<void>
                 { class: "btns" },
                 s.status === "review" ? button("Reject to draft", { kind: "ghost", onClick: () => act(s, "reject", "Reject") }) : null,
                 s.status === "listed" ? button("Pause", { kind: "ghost", onClick: () => act(s, "pause", "Pause") }) : null,
+                s.status === "paused" && current
+                  ? button(`Propose unpause (v${current.version})`, {
+                      kind: "primary",
+                      onClick: async () => {
+                        // unpause = listing approval from paused by a second admin (API_CONTRACT admin strategies)
+                        const reason = await askReason(`Unpause ${s.name} (v${current.version})`);
+                        if (!reason) return;
+                        await api.post(`/admin/strategies/${encodeURIComponent(s.id)}/list`, { version_id: current.id, reason }, { signal: ctx.signal });
+                        toast("Proposed — a second admin approves it under Approvals. Subscribers get the paused time back.", "good");
+                        reload();
+                      },
+                    })
+                  : null,
                 s.status !== "delisted" ? button("Delist", { kind: "danger", onClick: () => act(s, "delist", "Delist", true) }) : null,
                 !s.in_house && s.owner_user_id && s.owner_kyc_status && s.owner_kyc_status !== "approved"
                   ? button("KYC decision…", { kind: "ghost", onClick: () => kycDecision(ctx, s.owner_user_id as string, reload) })
@@ -733,6 +747,17 @@ async function kycDecision(ctx: PageContext, userId: string, reload: () => void)
 }
 
 // ------------------------------------------------------------------------------------------ alerts
+/** Ops alert kinds added by the security rounds (RUNBOOK names the action for each). */
+const OPS_ALERT_LABELS: Record<string, string> = {
+  creator_signal_untrusted_dex: "Creator signal on an untrusted dex (RUNBOOK §13.9)",
+  kyc_awaiting_admin: "KYC passed the provider — one admin must confirm",
+  kyc_approval_revoked: "KYC approval revoked by the provider",
+  agent_keygen_failed: "Agent key generation failed (executor KMS)",
+  topup_held_now_attributable: "Held deposit now attributable (RUNBOOK §13.3)",
+  strategy_paused: "Strategy paused",
+  strategy_resumed: "Strategy resumed",
+};
+
 async function alertsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
   let sev = ctx.query.get("severity") ?? "";
   let unacked = true;
@@ -752,7 +777,7 @@ async function alertsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
             columns: [
               { key: "t", label: "When", value: (a) => h("span", { title: fmtDateTime(a.created_at) }, fmtRelative(a.created_at)), primary: true },
               { key: "s", label: "Severity", value: (a) => badge(a.severity, a.severity === "critical" ? "bad" : a.severity === "warn" ? "warn" : "info") },
-              { key: "k", label: "Kind", value: (a) => h("span", { class: "mono" }, a.kind) },
+              { key: "k", label: "Kind", value: (a) => (OPS_ALERT_LABELS[a.kind] ? h("span", { class: "stack tight" }, h("b", { class: "small" }, OPS_ALERT_LABELS[a.kind]), h("span", { class: "mono small muted" }, a.kind)) : h("span", { class: "mono" }, a.kind)) },
               { key: "m", label: "Details", value: (a) => h("span", { class: "small break" }, JSON.stringify(a.payload).slice(0, 300)) },
               {
                 key: "a",

@@ -314,6 +314,12 @@ TEMPLATES: dict[str, tuple[str, str]] = {
     "reconciliation_mismatch": ("Reconciliation mismatch: {scope}", "{scope}: difference {diff_micro} between ledger and on-chain."),
     "stale_signal": ("Stale strategy signal", "Signals are stale; new entries are not being placed."),
     "kill_switch": ("Kill switch engaged", "{scope} paused: {reason}."),
+    # ops (RUNBOOK §7, §13.3, §13.9)
+    "creator_signal_untrusted_dex": ("Creator signal on an untrusted dex", "Strategy version {strategy_version_id} produced weights for {markets} (dex {dexes}) outside the active trusted-dex allowlist (allowlist loaded: {allowlist_loaded}); those markets got no signal. RUNBOOK §13.9."),
+    "kyc_awaiting_admin": ("KYC awaiting admin confirmation", "User {user_id} passed the {provider} identity check; one admin must confirm it (Admin -> KYC decision)."),
+    "kyc_approval_revoked": ("KYC approval revoked by provider", "User {user_id}: an approved KYC changed to {status} ({event}). Payouts are blocked; review the user."),
+    "agent_keygen_failed": ("Agent key generation failed", "Agent {agent_id}: {reason}. No key was stored; requests are retried once fixed. RUNBOOK agent keys."),
+    "topup_held_now_attributable": ("Held deposit now attributable", "Held transfer {hash} ({amount_micro}) was sent from a wallet now verified by user {user_id}. Not credited automatically: release it by maker-checker (RUNBOOK §13.3)."),
 }
 
 

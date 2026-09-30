@@ -8,12 +8,12 @@ import { LEGAL_SLUGS, legalDocHash } from "../core/gate.js";
 import { fmtUsd, fmtBps, fmtDate, fmtDateTime, fmtTenthsBp } from "../core/format.js";
 import type { CreatorStrategy, CreatorVersion, CreatorPost, Earnings, NoCodeSpec } from "./_shared/types.js";
 import { payoutForm } from "./_shared/payout.js";
+import { kycBadge, kycInProgress, startKycSession, KYC_AWAITING_TEXT } from "./_shared/kyc.js";
 import { profitShare, subscriptionSplit, builderSplit, postSplit } from "./_shared/fees.js";
 import { backtestPanel } from "./_shared/backtest.js";
 import { noCodeBuilder } from "./_shared/nocode-ui.js";
 import { precheckPython, PYTHON_TEMPLATE, defaultSpec } from "./_shared/nocode.js";
 import { renderMarkdown } from "./_shared/markdown.js";
-import { trustAnchors } from "../core/config.js";
 import { ensurePageCss, listOf, isAbortError, errCode, errMessage, pageHead, panel, usdInput, pctToBps, bpsToPctInput, isRec, kvWide, BACKTEST_WARNING } from "./_shared/util.js";
 
 export const title = "Creator Studio";
@@ -55,7 +55,7 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
 }
 
 // ------------------------------------------------------------------------------------------ KYC
-/** MeOut.kyc_status: pending | approved | rejected | null (not started). */
+/** MeOut.kyc_status: pending | provider_approved (awaiting our admin) | approved | rejected | null (not started). */
 function kycStatus(ctx: PageContext): string {
   const v = (ctx.me as Record<string, unknown> | null)?.kyc_status;
   return typeof v === "string" ? v : "none";
@@ -69,10 +69,10 @@ function kycBanner(ctx: PageContext, cfg: PublicConfig): HTMLElement {
   return h(
     "div",
     { class: "panel stack" },
-    h("div", { class: "row between" }, h("h2", null, "Identity verification (KYC)"), badge(status === "pending" ? "Pending review" : status === "rejected" ? "Rejected" : "Not started", status === "rejected" ? "bad" : "warn")),
+    h("div", { class: "row between" }, h("h2", null, "Identity verification (KYC)"), kycBadge(status)),
     h("p", { class: "small muted" }, "Required before any strategy can be listed or any payout is made. Documents are handled by our verification provider and are not stored by aijalon.trade. You can draft strategies and run backtests meanwhile."),
-    status === "pending"
-      ? h("p", { class: "small" }, "Your verification is being reviewed. This usually takes less than a day.")
+    kycInProgress(status)
+      ? h("p", { class: "small" }, status === "provider_approved" ? KYC_AWAITING_TEXT : "Your verification is being reviewed. This usually takes less than a day.")
       : h(
           "div",
           { class: "stack tight" },
@@ -89,24 +89,7 @@ function kycBanner(ctx: PageContext, cfg: PublicConfig): HTMLElement {
                 await api.post("/consents", {
                   consents: [{ doc: "creator_agreement", doc_version: version, context: "creator", strategy_id: null, accepted_at: new Date().toISOString(), doc_text_sha256: await legalDocHash("creator_agreement", version) }],
                 });
-                const res = await api.post<{ url: string; provider: string; status: string; manual: boolean }>("/creator/kyc/session", {}, { signal: ctx.signal });
-                if (res.manual) {
-                  mount(manualBox, note("Your identity check will be reviewed by our team. We'll contact you by email; no documents are uploaded here.", "info"));
-                  return;
-                }
-                const url = typeof res.url === "string" ? res.url : "";
-                // SECURITY L2: only the KYC provider's own host (pinned in app-config.json), exact match, https.
-                let target: URL | null = null;
-                try {
-                  target = new URL(url);
-                } catch {
-                  target = null;
-                }
-                const allowed = trustAnchors().kycRedirectHosts;
-                if (!target || target.protocol !== "https:" || target.username || target.password || target.port || !allowed.includes(target.host.toLowerCase())) {
-                  throw new Error("Verification could not be started (unexpected verification address). Please contact support.");
-                }
-                window.location.assign(target.href);
+                await startKycSession("/creator/kyc/session", ctx, manualBox);
               },
             }),
           ),
@@ -634,7 +617,7 @@ async function earningsTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfi
         stat("Payouts pending", fmtUsd(e.payouts_pending_micro)),
       ),
       panel("By strategy", earningsByStrategy(e, strategies)),
-      panel("Request a payout", note("Payouts require verified identity (KYC) and are approved by two administrators, then sent as USDC on Hyperliquid.", "info"), payoutForm(ctx, cfg, "creator", e.payable_micro, () => void earningsTab(body, ctx, cfg))),
+      panel("Request a payout", note("Payouts require verified identity (KYC) and are approved by two administrators, then sent as USDC on Hyperliquid.", "info"), payoutForm(ctx, cfg, "creator", e.payable_micro, () => void earningsTab(body, ctx, cfg), { kycStatus: kycStatus(ctx) })),
       panel(
         "Recent earnings",
         table({
