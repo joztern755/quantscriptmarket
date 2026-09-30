@@ -6,7 +6,8 @@ privilege on them — so `SELECT *` / `RETURNING *` is never used on those table
 
 Keyset pagination: list methods take `limit` and an optional decoded cursor `(created_at, id)` and return
 `limit + 1` rows so the caller can tell whether a next page exists (see deps.next_cursor).
-Tables beyond SPEC §4 (api_idempotency, admin_changes, user_login_countries) are in migrations/0100_api_extras.sql.
+Tables beyond SPEC §4: api_idempotency, admin_changes, user_login_countries (migrations/0004_api_extras.sql),
+user_devices + users.mfa_factor_hash (0008_security_kyc.sql).
 
 f-strings below ONLY splice module-level constant column lists (_USER_COLS …); every value is a bound parameter.
 Each bound parameter is used with ONE type context per statement (Postgres rejects inconsistent deductions).
@@ -26,7 +27,7 @@ PUBLIC_STRATEGY_STATUSES = ("listed", "paused")
 
 _USER_COLS = ("id, created_at, firebase_uid, email, display_name, role::text AS role, plan::text AS plan, "
               "plan_period_end, country_attested, referral_code, referred_by, referral_tier::text AS referral_tier, "
-              "status::text AS status, mfa_enrolled, device_fp_hash")
+              "status::text AS status, mfa_enrolled, device_fp_hash, mfa_factor_hash")
 _AGENT_COLS = ("id, created_at, user_id, master_address, agent_address, agent_name, status::text AS status, "
                "approved_at, revoked_at")
 _SUB_COLS = ("s.id, s.created_at, s.user_id, s.strategy_id, s.strategy_version_id, s.trading_address, "
@@ -166,6 +167,21 @@ class SqlStore:
         prior = self._one(conn, """SELECT count(*) AS n FROM user_login_countries
                                    WHERE user_id = CAST(:u AS uuid) AND country <> :c""", u=user_id, c=country)
         return bool(prior and prior["n"] > 0)
+
+    def record_device(self, conn: Any, user_id: str, device_hash: str, label: Optional[str]) -> bool:
+        """True when this device is new for the user AND the user had signed in from another device before (0008)."""
+        inserted = self._one(conn, """
+            INSERT INTO user_devices (user_id, device_hash, label) VALUES (CAST(:u AS uuid), :h, :l)
+            ON CONFLICT (user_id, device_hash) DO UPDATE SET last_seen = now()
+            RETURNING (xmax = 0) AS inserted""", u=user_id, h=device_hash, l=(label or None) and label[:64])
+        if not inserted or not inserted["inserted"]:
+            return False
+        prior = self._one(conn, """SELECT count(*) AS n FROM user_devices
+                                   WHERE user_id = CAST(:u AS uuid) AND device_hash <> :h""", u=user_id, h=device_hash)
+        return bool(prior and prior["n"] > 0)
+
+    def set_mfa_factor_hash(self, conn: Any, user_id: str, factor_hash: str) -> None:
+        self._exec(conn, "UPDATE users SET mfa_factor_hash = :h WHERE id = CAST(:u AS uuid)", h=factor_hash, u=user_id)
 
     def search_users(self, conn: Any, q: Optional[str], limit: int, cursor: Cursor) -> list[dict]:
         return self._all(conn, f"""
@@ -685,7 +701,14 @@ class SqlStore:
         return bool(row and row["used"])
 
     # ------------------------------------------------------------------------------------------ alerts
-    def insert_alert(self, conn: Any, *, user_id: Optional[str], severity: str, kind: str, payload: dict) -> None:
+    def insert_alert(self, conn: Any, *, user_id: Optional[str], severity: str, kind: str, payload: dict,
+                     dedup_key: Optional[str] = None) -> None:
+        if dedup_key:
+            self._exec(conn, """INSERT INTO alerts (user_id, severity, kind, payload, dedup_key)
+                                VALUES (CAST(:u AS uuid), CAST(:s AS alert_severity), :k, CAST(:p AS jsonb), :d)
+                                ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING""",
+                       u=user_id, s=severity, k=kind, p=_j(payload), d=dedup_key[:200])
+            return
         self._exec(conn, """INSERT INTO alerts (user_id, severity, kind, payload)
                             VALUES (CAST(:u AS uuid), :s, :k, CAST(:p AS jsonb))""",
                    u=user_id, s=severity, k=kind, p=_j(payload))

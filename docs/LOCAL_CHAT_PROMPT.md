@@ -22,7 +22,7 @@ gh repo clone joztern755/quantscriptmarket && cd quantscriptmarket && git checko
 4. **Never skip, disable or weaken a test, a security check, or a CI gate** to get green. Fix the cause.
 5. **Ask before every irreversible or outward step:** creating billing, deploying to production, changing DNS, enabling the scheduler (`make go-live` = trading starts), sending anything to users.
 6. Commit to branch `claude/gifted-ptolemy-mvxlgx` with clear messages; merge to `main` only when I say so (pushing `main` triggers the production deploy workflow, which also needs my approval in GitHub).
-7. Launch phase is **internal** (`LAUNCH_PHASE=internal`): only allow-listed emails (`ALLOWLIST_EMAILS` secret), payouts off (`PAYOUTS_ENABLED=false`) — until I say "public". There are **no** allocation or leverage caps (my decision, SPEC §12 "No caps": `MAX_*` = 0); the liquidity and other pre-trade guards still apply.
+7. Launch phase is **internal** (`LAUNCH_PHASE=internal`): only allow-listed emails (`ALLOWLIST_EMAILS` secret), payouts off (`PAYOUTS_ENABLED=false`) — until I say "public". There are **no** allocation or leverage caps (my decision, SPEC §12 "No caps": the `MAX_*` variables are not set); the liquidity and other pre-trade guards still apply.
 
 ## Phase A — make it build and pass locally
 1. Install tools from `docs/DEPLOY.md` §1 (gcloud, firebase-tools, node 22, TypeScript, Python 3.12, psql 16, cloud-sql-proxy, gh, docker).
@@ -53,7 +53,7 @@ gh repo clone joztern755/quantscriptmarket && cd quantscriptmarket && git checko
 - **Stripe** (§11): I must get Stripe's approval for this business first (describe it honestly: software subscriptions and platform fees; no custody of trading funds). Then restricted key, webhook `https://api.aijalon.trade/v1/webhooks/stripe`, payment-method domain + Apple Pay file. Stripe fees are passed to users (credit = paid − actual fee). Cards, Apple Pay, Google Pay in USD; FPX/GrabPay stay off until an FX rate source is chosen (ask me).
 - **Wallets** (§12): builder + treasury addresses from my hardware wallet (read them back to me for confirmation, second person checks). I fund the builder with ≥100 USDC perps account value on Hyperliquid.
 - **SILVER signal feed:** run `integrations/terminal/install.sh` against my terminal repo (`joztern755/terminal.aijalon`) only after showing me the diff; generate the Ed25519 keypair with `node signals/keygen.js` (private key → that repo's GitHub secret, public key → `SIGNALS_PUBKEY_B64`). SILVER is a **free showcase** ($0, 0% profit share); its live state is CASH since 1980 — confirm the published feed shows that.
-- **KYC for creators:** start with the `manual` provider (`KYC_PROVIDER=manual`, no KYC secrets) — ONE admin approves each creator (note: the code currently makes a KYC approval maker-checker — a second admin confirms it; tell me so I can decide); ask me before signing up for a KYC provider (Sumsub approvals still need one admin to confirm; switching is `docs/DEPLOY.md` §5.4).
+- **KYC for creators:** start with the `manual` provider (`KYC_PROVIDER=manual`, no KYC secrets) — ONE admin approves each creator; ask me before signing up for a KYC provider (Sumsub approvals still need one admin to confirm; switching is `docs/DEPLOY.md` §5.4).
 
 ## Phase E — first deploy, internal testing with real USDC
 1. Deploy (§10) — I approve in GitHub. Smoke tests must pass. Then §10.1: Telegram webhook, and resume only `candles-sync` + `ingest-signals` so the candle backfill (~40 calls, ~7 h) runs while everything else stays paused.

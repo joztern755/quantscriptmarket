@@ -4,7 +4,7 @@ Version: 2026-09-30 · Owner: [●] · Every box needs **evidence** (a link, scr
 Related: `docs/SECURITY.md`, `docs/RUNBOOK.md`, `docs/INCIDENT_RESPONSE.md`, `docs/DATA_PROTECTION.md`, `legal/README.md`
 
 > **Status note.** Nothing below is ticked yet. Two gates matter:
-> - **Gate B** (internal real-USDC testing) allows real money from **allowlisted team members only**, with small caps.
+> - **Gate B** (internal real-USDC testing) allows real money from **allowlisted team members only** (no allocation or leverage caps — owner decision; payouts off).
 > - **Gate C** (public launch) requires the legal and licensing position, a pentest, and a clean internal phase.
 >
 > **The owner's instruction to rely on user waivers does not remove the Gate C legal items. Waivers do not replace licences.**
@@ -19,9 +19,6 @@ These keys exist in `backend/app/config.py` and are set per deploy (full table: 
 |---|---|---|---|---|
 | `LAUNCH_PHASE` | `internal` | `public` | GitHub variable | api + executor (the app refuses to start in `internal` without an allowlist) |
 | `ALLOWLIST_EMAILS` | team e-mails only; everyone else sees "coming soon" after the site gate | not used | **Secret Manager** (personal data) | api: signup and subscribe |
-| `MAX_ALLOCATION_PER_USER_USD` | `0` = no cap (owner, 30 Sep 2026, SPEC §12 "No caps") | `0` | GitHub variable | api (subscribe/patch) when > 0 |
-| `MAX_TOTAL_PLATFORM_ALLOCATION_USD` | `0` = no cap (owner) | `0` | GitHub variable | api when > 0 |
-| `MAX_USER_LEVERAGE` | `0` = no launch cap (owner); bounded by the user's setting, the strategy's `MAX_LEVERAGE` and each market's Hyperliquid max | `0` | GitHub variable | api when > 0 |
 | `IN_HOUSE_LISTED` | `silver` | `silver` (others only when they pass the walk-forward) | template | existing |
 | `FEATURE_CREATOR_UPLOADS` | on (listing needs admin review + creator KYC) | on (KYC required) | template | existing |
 | `STRIPE_MAX_TOPUP_USD` | `10000` default [CONFIRM a lower internal value] | [CONFIRM] | GitHub variable | api |
@@ -29,7 +26,7 @@ These keys exist in `backend/app/config.py` and are set per deploy (full table: 
 | `PAYOUTS_ENABLED` | `false` (manual only, maker-checker) | `true` | GitHub variable | api |
 | `KYC_PROVIDER` | `manual` | provider [CONFIRM] | GitHub variable (+ `KYC_*` secrets for sumsub) | api |
 
-The owner removed the allocation and leverage caps; the liquidity guards (0.5% of 24h volume and 2% of OI per order) and every other pre-trade guard still apply. Setting a `MAX_*` variable to a positive value and redeploying restores a cap without a code change — keep that as the fast brake (Gate C3 rollback plan).
+**No caps (owner, 30 Sep 2026, SPEC §12):** no per-user allocation cap, no platform total cap, no launch leverage cap — `MAX_ALLOCATION_PER_USER_USD`, `MAX_TOTAL_PLATFORM_ALLOCATION_USD` and `MAX_USER_LEVERAGE` are not set in any environment. Leverage is bounded by the subscriber's own setting, the strategy's `MAX_LEVERAGE` and each market's Hyperliquid max (`RiskLimits.platform_max_leverage=50` is only an input-sanity ceiling). The liquidity guards (0.5% of 24h volume and 2% of OI per order) and every other pre-trade guard still apply. The internal phase keeps only the e-mail allowlist and payouts off.
 
 **The per-market exposure cap** is already partly covered by the risk guards (0.5% of 24h volume and 2% of OI per order). Consider an **aggregate** per-market cap across all subscribers for thin HIP-3 markets such as `xyz:SILVER` [CONFIRM].
 
@@ -109,8 +106,8 @@ The owner removed the allocation and leverage caps; the liquidity guards (0.5% o
 - [ ] **`candle_mismatch` events** are routed to ops and the on-call knows RUNBOOK §13.5; the first candle backfill (~40 calls) has finished.
 
 ### B5. Phase limits set
-- [ ] `LAUNCH_PHASE=internal`; allowlist = team emails; per-user allocation cap **$1,000**; total platform allocation cap [$●]; leverage cap [●]x; only `xyz:SILVER` listed.
-- [ ] Limits verified by trying to exceed each one (the API rejects; the executor clamps).
+- [ ] `LAUNCH_PHASE=internal`; `ALLOWLIST_EMAILS` secret = team e-mails; `PAYOUTS_ENABLED=false`; no `MAX_*` cap variables set (owner: no caps); only `xyz:SILVER` listed in-house.
+- [ ] Verified: a non-allow-listed account cannot sign up or subscribe; a payout request is refused while payouts are off; leverage above a market's Hyperliquid max or the strategy's `MAX_LEVERAGE` is refused.
 
 ## Gate B exit criteria (before moving to Gate C)
 - [ ] ≥ [30] days of internal live trading, including ≥ [N] real signal changes on SILVER (entries and exits).
@@ -138,7 +135,7 @@ The owner removed the allocation and leverage caps; the liquidity guards (0.5% o
 - [ ] `security.txt` published; vulnerability disclosure policy live (bug bounty later).
 
 ### C3. Product and operations
-- [ ] Phase limits changed to their public values via maker-checker config change; allowlist removed.
+- [ ] `LAUNCH_PHASE=public` and `PAYOUTS_ENABLED=true` via a reviewed config change (GitHub variables + redeploy); the allowlist is no longer consulted.
 - [ ] Support inbox and response targets set; status banner mechanism tested; comms templates (INCIDENT_RESPONSE §5) pre-approved.
 - [ ] Creator programme: KYC provider live; Creator Agreement final; review checklist for scripts (including a manipulation-intent review of scripts trading thin HIP-3 markets).
 - [ ] Referral programme terms final (Direct Sales and Anti-Pyramid Scheme Act check).

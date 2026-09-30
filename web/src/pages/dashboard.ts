@@ -12,8 +12,9 @@ import { usdSend } from "../core/hl.js";
 import { getMe } from "../core/state.js";
 import { stepUp } from "../core/auth.js";
 import { fmtUsd, fmtLeverage, fmtDate, fmtDateTime, fmtRelative, fmtNum, shortAddr } from "../core/format.js";
-import type { Subscription, Position, Balance, LedgerRow, Alert, UsdcTypedDataOut, UsdcConfirmOut, StripeDepositOut, PayoutOut, PlanChangeOut, PlanKey } from "./_shared/types.js";
+import type { StrategyDetail, Subscription, Position, Balance, LedgerRow, Alert, UsdcTypedDataOut, UsdcConfirmOut, StripeDepositOut, PayoutOut, PlanChangeOut, PlanKey } from "./_shared/types.js";
 import { parseContacts } from "./_shared/contacts.js";
+import { marketMaxLeverage, leverageBound, leverageHint, highLeverageWarning } from "./_shared/leverage.js";
 import { ensurePageCss, listOf, isAbortError, errCode, errMessage, isAddress, hlNum, usdInput, pageHead, panel, every, isRec, LOSS_WARNING } from "./_shared/util.js";
 
 export const title = "Dashboard";
@@ -202,16 +203,25 @@ function cancelChooser(s: Subscription, reload: () => void): void {
   });
 }
 
-function editSubscription(ctx: PageContext, s: Subscription, reload: () => void): void {
-  // Upper bound from platform / launch caps; the server also applies the strategy's MAX_LEVERAGE (422 details.max_x100).
-  const cfg = peekPublicConfig();
-  let maxLev = cfg?.platform_max_leverage ?? 5;
-  if (cfg?.max_user_leverage_x100) maxLev = Math.min(maxLev, Math.floor(cfg.max_user_leverage_x100 / 100));
-  maxLev = Math.max(1, maxLev);
-  const minAlloc = cfg?.min_allocation_micro ?? 100_000_000;
+async function editSubscription(ctx: PageContext, s: Subscription, reload: () => void): Promise<void> {
+  // Bound = min(strategy MAX_LEVERAGE, Hyperliquid market max leverage) — no platform / launch cap (owner decision);
+  // the server re-checks (422 details.max_x100).
+  const cfg = peekPublicConfig() ?? (await publicConfig());
+  const [detail, marketMax] = await Promise.all([
+    s.strategy_slug ? api.get<StrategyDetail>(`/public/strategies/${encodeURIComponent(s.strategy_slug)}`, { signal: ctx.signal }).catch(() => null) : Promise.resolve(null),
+    marketMaxLeverage(s.strategy_markets ?? []),
+  ]);
+  if (!ctx.isCurrent()) return;
+  const stratMax = detail?.max_leverage ?? null;
+  const maxLev = leverageBound(stratMax, marketMax, cfg.platform_max_leverage);
+  const minAlloc = cfg.min_allocation_micro;
   const alloc = usdInput({ value: String(s.allocation_micro / 1_000_000), id: "e-alloc" });
   const lev = h("select", { id: "e-lev" }, ...Array.from({ length: maxLev }, (_, i) => h("option", { value: String(i + 1) }, `${i + 1}×`)));
   lev.value = String(Math.min(maxLev, Math.max(1, Math.round(s.max_leverage_x100 / 100))));
+  const levWarn = h("div", { "aria-live": "polite" });
+  const drawLevWarn = (): void => void mount(levWarn, highLeverageWarning(Number(lev.value)));
+  lev.addEventListener("change", drawLevWarn);
+  drawLevWarn();
   const key = newIdempotencyKey();
   const m = modal({
     title: `Edit ${s.strategy_name ?? "subscription"}`,
@@ -219,8 +229,9 @@ function editSubscription(ctx: PageContext, s: Subscription, reload: () => void)
       "div",
       { class: "stack" },
       field("Allocation (USD)", alloc.el, "Sizing limit — funds stay in your Hyperliquid account."),
-      field("Max leverage", lev, `Strategy maximum ${maxLev}×.`),
-      note(LOSS_WARNING, "warn"),
+      field("Max leverage", lev, leverageHint(stratMax, marketMax, maxLev)),
+      note(h("span", null, h("b", null, "You can lose all allocated funds. "), LOSS_WARNING), "bad"),
+      levWarn,
       h(
         "div",
         { class: "btns" },

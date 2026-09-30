@@ -288,7 +288,7 @@ def reject_payout(kind: PayoutKind, payout_id: UUID, body: S.DecisionIn, ctx: Au
         if not svc.store.payout_reject(conn, kind, str(payout_id), ctx.user_id, body.reason):
             raise Conflict("state changed; reload")
         svc.notifier.notify(conn, user_id=str(row["beneficiary"]), severity="info", kind=f"{kind}_rejected",
-                            payload={"amount_micro": int(row["amount_micro"])})
+                            payload={"amount_micro": int(row["amount_micro"]), "request_id": str(payout_id)[:8]})
         svc.audit.write(conn, actor=ctx.actor, action=f"{kind}.reject", target=f"{kind}:{payout_id}",
                         payload={"reason": body.reason, "release_tx": tx}, ip_hash=ctx.ip_hash)
         row = svc.store.get_payout(conn, kind, str(payout_id), for_update=False)
@@ -338,7 +338,8 @@ def payout_sent(kind: PayoutKind, payout_id: UUID, body: S.PayoutSentIn, ctx: Au
         if not svc.store.payout_mark_sent(conn, kind, str(payout_id), tx_hash, tx):
             raise Conflict("state changed; reload")
         svc.notifier.notify(conn, user_id=str(row["beneficiary"]), severity="info", kind=f"{kind}_sent",
-                            payload={"amount_micro": int(row["amount_micro"]), "tx_hash": tx_hash})
+                            payload={"amount_micro": int(row["amount_micro"]), "request_id": str(payout_id)[:8],
+                                     "tx_hash": tx_hash})
         svc.audit.write(conn, actor=ctx.actor, action=f"{kind}.sent", target=f"{kind}:{payout_id}",
                         payload={"tx_hash": tx_hash, "ledger_tx": tx, "time_ms": body.time_ms}, ip_hash=ctx.ip_hash)
         row = svc.store.get_payout(conn, kind, str(payout_id), for_update=False)

@@ -56,6 +56,7 @@ class FakeWorld:
     flags: dict[str, dict] = field(default_factory=dict)
     changes: dict[str, dict] = field(default_factory=dict)
     login_countries: set[tuple[str, str]] = field(default_factory=set)
+    devices: set[tuple[str, str]] = field(default_factory=set)        # (user_id, device_hash) — 0008 user_devices
     kyc: dict[str, dict] = field(default_factory=dict)
     jobs_run: list[tuple[str, dict]] = field(default_factory=list)
     alert_contacts_missing: set[str] = field(default_factory=set)   # user ids WITHOUT Telegram+email (0007)
@@ -216,6 +217,15 @@ class FakeStore:
         new = country not in seen
         self.w.login_countries.add((user_id, country))
         return new and bool(seen)
+
+    def record_device(self, conn, user_id, device_hash, label):
+        seen = {d for (u, d) in self.w.devices if u == user_id}
+        new = device_hash not in seen
+        self.w.devices.add((user_id, device_hash))
+        return new and bool(seen)
+
+    def set_mfa_factor_hash(self, conn, user_id, factor_hash):
+        self.w.users[user_id]["mfa_factor_hash"] = factor_hash
 
     def bind_referrer(self, conn, *, user_id, referrer_id):
         u = self.w.users[user_id]
@@ -467,8 +477,11 @@ class FakeStore:
         """app.alerts.user_sinks.require_alert_contacts uses this in tests (default: contacts set up)."""
         return str(user_id) not in self.w.alert_contacts_missing
 
-    def insert_alert(self, conn, *, user_id, severity, kind, payload):
-        self.w.alerts.append({"user_id": user_id, "severity": severity, "kind": kind, "payload": payload})
+    def insert_alert(self, conn, *, user_id, severity, kind, payload, dedup_key=None):
+        if dedup_key and any(a.get("dedup_key") == dedup_key for a in self.w.alerts):
+            return
+        self.w.alerts.append({"user_id": user_id, "severity": severity, "kind": kind, "payload": payload,
+                              "dedup_key": dedup_key})
 
     # flags
     def get_flag(self, conn, key, *, for_update=False):
@@ -654,8 +667,11 @@ class FakeNotifier:
     def __init__(self, world: FakeWorld) -> None:
         self.w = world
 
-    def notify(self, conn, *, user_id, severity, kind, payload):
-        self.w.alerts.append({"user_id": user_id, "severity": severity, "kind": kind, "payload": payload})
+    def notify(self, conn, *, user_id, severity, kind, payload, dedup_key=None):
+        if dedup_key and any(a.get("dedup_key") == dedup_key for a in self.w.alerts):
+            return
+        self.w.alerts.append({"user_id": user_id, "severity": severity, "kind": kind, "payload": payload,
+                              "dedup_key": dedup_key})
 
     def notify_alert(self, conn, alert):
         self.notify(conn, user_id=alert.user_id, severity=str(alert.severity), kind=alert.kind,

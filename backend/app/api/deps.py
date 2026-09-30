@@ -271,7 +271,7 @@ class UsdcPort(Protocol):
 
 class NotifierPort(Protocol):
     def notify(self, conn: Any, *, user_id: Optional[str], severity: str, kind: str,
-               payload: dict[str, Any]) -> None: ...
+               payload: dict[str, Any], dedup_key: Optional[str] = None) -> None: ...   # dedup: alerts.dedup_key
     def notify_alert(self, conn: Any, alert: Any) -> None: ...   # app.alerts.notifier.Alert from other modules
 
 
@@ -453,6 +453,7 @@ class _SeenCache:
 
 
 _seen_countries = _SeenCache()
+_seen_devices = _SeenCache()
 
 
 def _referral_code_from(request: Request, claims: dict[str, Any], svc: Services) -> Optional[str]:
@@ -535,12 +536,16 @@ def current_user(request: Request, svc: Services = Depends(get_services)) -> Aut
             user = _create_user(conn, svc, request, claims, ip_hash)
         if user.get("status") != "active":
             raise Forbidden("account is not active", status=user.get("status"))
-        if country and _seen_countries.add(f"{user['id']}:{country}"):
-            if svc.store.record_login_country(conn, str(user["id"]), country):
-                svc.notifier.notify(conn, user_id=str(user["id"]), severity="warn", kind="login_new_country",
-                                    payload={"country": country})
-                svc.audit.write(conn, actor=f"user:{user['id']}", action="auth.new_country",
-                                target=f"user:{user['id']}", payload={"country": country}, ip_hash=ip_hash)
+        # SPEC §12 mandatory security alerts: new_device_login (new country / new device) and mfa_changed
+        # (app.api.login_events). The LRU caches keep the DB writes to once per (user, country|device) per instance.
+        from app.api import login_events
+
+        dev_hash, dev_label = login_events.device_key({k.lower(): val for k, val in request.headers.items()
+                                                       if k.lower() in ("user-agent", "x-device-id")}, cfg.pepper)
+        login_events.record_sign_in(
+            conn, svc, user=user, claims=claims, country=country, device_hash=dev_hash, device_label_=dev_label,
+            ip_hash=ip_hash, check_country=bool(country) and _seen_countries.add(f"{user['id']}:{country}"),
+            check_device=bool(dev_hash) and _seen_devices.add(f"{user['id']}:{dev_hash}"))
     ctx = AuthCtx(user=user, claims=claims, ip_hash=ip_hash, ua_hash=ua_hash, request_id=request_id(request),
                   country=country)
     request.state.user_id = ctx.user_id

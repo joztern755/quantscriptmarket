@@ -73,6 +73,9 @@ def request_withdrawal(body: S.WithdrawalIn, ctx: AuthCtx = Depends(step_up_user
                                         actor=ctx.actor)
         svc.notifier.notify(conn, user_id=None, severity="warn", kind="withdrawal_requested",
                             payload={"withdrawal_id": str(row["id"]), "amount_micro": amount})
+        # SPEC §12 mandatory user alert (Telegram + email via the delivery worker): "if this was not you…"
+        svc.notifier.notify(conn, user_id=ctx.user_id, severity="warn", kind="withdrawal_requested",
+                            payload={"amount_micro": amount, "request_id": str(row["id"])[:8]})
         svc.audit.write(conn, actor=ctx.actor, action="withdrawal.request", target=f"withdrawal:{row['id']}",
                         payload={"amount_micro": amount, "to": body.to_address, "hold_tx": tx}, ip_hash=ctx.ip_hash)
         return payout_out(row)

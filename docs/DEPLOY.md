@@ -204,7 +204,7 @@ Plain values are rendered into `infra/gcp/run/*.yaml` at deploy time (`infra/gcp
 | `STRIPE_MAX_TOPUP_USD` | api | plain | `10000` | owner → GitHub var |
 | `FEATURE_STRIPE_MYR` / `STRIPE_MYR_FX_SPREAD_BPS` | api | plain | `false` (template) / config default `150` | template (FX source not chosen) |
 | `LAUNCH_PHASE` | api, executor | plain | `internal` | owner → GitHub var (`public` only at Gate C) |
-| `MAX_ALLOCATION_PER_USER_USD`, `MAX_TOTAL_PLATFORM_ALLOCATION_USD`, `MAX_USER_LEVERAGE` | api | plain | `0`, `0`, `0` = **no cap** (owner 30 Sep 2026, SPEC §12 "No caps"; leverage is bounded by the subscriber's setting, the strategy's `MAX_LEVERAGE` and each market's Hyperliquid max). A positive value re-introduces a cap without a code change | owner → GitHub var |
+| `MAX_ALLOCATION_PER_USER_USD`, `MAX_TOTAL_PLATFORM_ALLOCATION_USD`, `MAX_USER_LEVERAGE` | — | — | **not set anywhere** = no cap (owner 30 Sep 2026, SPEC §12 "No caps"; leverage is bounded by the subscriber's setting, the strategy's `MAX_LEVERAGE` and each market's Hyperliquid max; liquidity guards still apply). Re-introducing a cap = a reviewed change adding the variable to `api.service.yaml` | — |
 | `PAYOUTS_ENABLED` | api, executor | plain | `false` | owner → GitHub var |
 | `KYC_PROVIDER`, `KYC_LEVEL_NAME`, `KYC_API_BASE` | api | plain | `manual`, empty, `https://api.sumsub.com` | owner → GitHub var (§5.4) |
 | `RESTRICTED_COUNTRIES` | api | plain | not set → config DRAFT list `US,CU,IR,KP,SY,RU,BY,MM`; must equal `infra/cloudflare/dns.sh` `RESTRICTED_COUNTRIES` [COUNSEL] | config default |
@@ -224,7 +224,7 @@ The api no longer carries `SCHEDULER_SA_EMAIL` / `INTERNAL_AUDIENCE`: every `/v1
 
 ### 5.4 Creator KYC — manual phase
 
-`KYC_PROVIDER=manual` (default): a creator's `POST /v1/creator/kyc/session` records a pending request; an admin reviews the creator's documents off-platform and records the verdict in the admin console (`POST /v1/admin/users/{id}/kyc`). A rejection applies at once; an **approval is a maker-checker change in the code today** (a second admin confirms it under Admin → Changes) although the owner's note says one admin — confirm with the owner which rule is wanted. Listing a creator script and paying a creator both require `approved`. No KYC secrets are needed. Ask the owner before signing up for a provider. To switch to Sumsub later: add the three `KYC_*` secret values, `gh variable set KYC_PROVIDER --body sumsub` and `KYC_LEVEL_NAME --body <level>`, redeploy; configure the Sumsub webhook to `https://api.aijalon.trade/v1/webhooks/kyc` (signature checked with `KYC_WEBHOOK_SECRET`; the verdict is re-read from the Sumsub API) — approvals still need one admin's confirmation.
+`KYC_PROVIDER=manual` (default): a creator's `POST /v1/creator/kyc/session` records a pending request; **one admin** reviews the creator's documents off-platform and records the verdict in the admin console (`POST /v1/admin/users/{id}/kyc`; owner decision: one admin, audited; an admin cannot approve their own KYC). Approval unlocks listing, paid posts and payouts — which keep their own two-admin rules. Listing a creator script and paying a creator both require `approved`. No KYC secrets are needed. Ask the owner before signing up for a provider. To switch to Sumsub later: add the three `KYC_*` secret values, `gh variable set KYC_PROVIDER --body sumsub` and `KYC_LEVEL_NAME --body <level>`, redeploy; configure the Sumsub webhook to `https://api.aijalon.trade/v1/webhooks/kyc` (signature checked with `KYC_WEBHOOK_SECRET`; the verdict is re-read from the Sumsub API) — approvals still need one admin's confirmation.
 
 ## 6. GitHub: environment, variables, branch protection
 
@@ -247,8 +247,8 @@ gh variable set LAUNCH_PHASE --env production -R "$R" --body internal
 gh variable set PAYOUTS_ENABLED --env production -R "$R" --body false
 gh variable set KYC_PROVIDER --env production -R "$R" --body manual
 # optional (defaults in infra/gcp/deploy.sh; full list §5.3): STRIPE_API_VERSION, STRIPE_FEE_ESTIMATE_BPS,
-# STRIPE_FEE_ESTIMATE_FIXED_USD, STRIPE_MAX_TOPUP_USD, MAX_ALLOCATION_PER_USER_USD, MAX_TOTAL_PLATFORM_ALLOCATION_USD,
-# MAX_USER_LEVERAGE (0 = no cap), KYC_LEVEL_NAME. ALLOWLIST_EMAILS / OPS_EMAILS are secrets (§5), not variables.
+# STRIPE_FEE_ESTIMATE_FIXED_USD, STRIPE_MAX_TOPUP_USD, KYC_LEVEL_NAME. No MAX_* caps (owner: no caps).
+# ALLOWLIST_EMAILS / OPS_EMAILS are secrets (§5), not variables.
 gh variable set SMOKE_SKIP_PUBLIC --env production -R "$R" --body true   # until DNS + certs work (step 8); then delete
 # 3) branch protection on main: PR required, CI checks required, no force-push/deletion, linear history
 gh api -X PUT repos/$R/branches/main/protection --input - <<'EOF'

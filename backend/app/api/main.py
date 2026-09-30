@@ -175,7 +175,8 @@ def _build(services: Optional[Services], role: str) -> FastAPI:
             allow_origins=[services.settings.web_origin],
             allow_credentials=False,               # Bearer tokens, never cookies
             allow_methods=["GET", "POST", "PATCH", "DELETE"],
-            allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Ref-Code", "X-Request-ID"],
+            allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Ref-Code", "X-Request-ID",
+                           "X-Device-Id"],
             expose_headers=["X-Request-ID", "Idempotent-Replayed", "Retry-After"],
             max_age=600,
         )

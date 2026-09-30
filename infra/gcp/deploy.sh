@@ -31,10 +31,9 @@ export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 # ALLOWLIST_EMAILS / OPS_EMAILS are Secret Manager secrets (personal data), not variables. Table: DEPLOY.md §5.3.
 : "${LAUNCH_PHASE:=internal}"
 : "${PAYOUTS_ENABLED:=false}"
-# caps: 0 = no cap (owner 30 Sep 2026, SPEC §12 "No caps"); a positive value re-introduces a cap without a code change
-: "${MAX_ALLOCATION_PER_USER_USD:=0}"
-: "${MAX_TOTAL_PLATFORM_ALLOCATION_USD:=0}"
-: "${MAX_USER_LEVERAGE:=0}"
+# No allocation / leverage caps (owner 30 Sep 2026, SPEC §12 "No caps"): MAX_ALLOCATION_PER_USER_USD,
+# MAX_TOTAL_PLATFORM_ALLOCATION_USD and MAX_USER_LEVERAGE are deliberately NOT rendered into any template
+# (unset = no cap in app/config.py). Re-introducing a cap = add the variable to api.service.yaml + here.
 : "${STRIPE_MAX_TOPUP_USD:=10000}"
 : "${STRIPE_FEE_ESTIMATE_BPS:=0}"            # 0 = no pre-payment fee estimate shown [CONFIRM from Stripe MY pricing]
 : "${STRIPE_FEE_ESTIMATE_FIXED_USD:=0}"
@@ -56,8 +55,7 @@ export_render_env() {
   export PROJECT_ID REGION GIT_SHA_SHORT VPC RUN_SUBNET RUN_NET_TAG SANDBOX_VPC SANDBOX_SUBNET SANDBOX_NET_TAG \
     SANDBOX_EXEC_ENV SANDBOX_CONNECTOR SA_API SA_EXECUTOR SA_SANDBOX SA_SCHEDULER SA_MIGRATOR KMS_KEY_NAME DB_NAME \
     WEB_DOMAIN API_DOMAIN SQL_CONNECTION_NAME CLOUDSQL_PROXY_IMAGE DB_MIGRATOR_USER MIGRATE_CMD \
-    LAUNCH_PHASE PAYOUTS_ENABLED STRIPE_PUBLISHABLE_KEY MAX_ALLOCATION_PER_USER_USD \
-    MAX_TOTAL_PLATFORM_ALLOCATION_USD MAX_USER_LEVERAGE STRIPE_MAX_TOPUP_USD STRIPE_FEE_ESTIMATE_BPS \
+    LAUNCH_PHASE PAYOUTS_ENABLED STRIPE_PUBLISHABLE_KEY STRIPE_MAX_TOPUP_USD STRIPE_FEE_ESTIMATE_BPS \
     STRIPE_FEE_ESTIMATE_FIXED_USD STRIPE_API_VERSION KYC_PROVIDER KYC_LEVEL_NAME TELEGRAM_BOT_USERNAME
   DB_IAM_USER_API_URLENC="$(urlenc_at "${DB_IAM_USER_API}")"
   DB_IAM_USER_EXECUTOR_URLENC="$(urlenc_at "${DB_IAM_USER_EXECUTOR}")"
@@ -89,12 +87,9 @@ cmd_preflight() {
   [[ "${KYC_PROVIDER}" == "manual" || "${KYC_PROVIDER}" == "sumsub" ]] || { warn "KYC_PROVIDER must be manual|sumsub"; bad=1; }
   if [[ "${KYC_PROVIDER}" == "sumsub" && -z "${KYC_LEVEL_NAME}" ]]; then warn "KYC_PROVIDER=sumsub needs KYC_LEVEL_NAME"; bad=1; fi
   local n
-  for n in MAX_ALLOCATION_PER_USER_USD MAX_TOTAL_PLATFORM_ALLOCATION_USD MAX_USER_LEVERAGE STRIPE_MAX_TOPUP_USD \
-           STRIPE_FEE_ESTIMATE_BPS STRIPE_FEE_ESTIMATE_FIXED_USD; do
+  for n in STRIPE_MAX_TOPUP_USD STRIPE_FEE_ESTIMATE_BPS STRIPE_FEE_ESTIMATE_FIXED_USD; do
     [[ "${!n}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { warn "${n}='${!n}' is not a non-negative number"; bad=1; }
   done
-  [[ "${MAX_USER_LEVERAGE}" =~ ^[0-9]+$ ]] && (( MAX_USER_LEVERAGE <= 50 )) \
-    || { warn "MAX_USER_LEVERAGE must be an integer 0 (no cap) .. 50 (RiskLimits.platform_max_leverage)"; bad=1; }
   [[ -n "${STRIPE_API_VERSION}" ]] || warn "STRIPE_API_VERSION empty: Stripe uses the account default (pin it to the webhook endpoint's version)"
   python3 "${REPO_ROOT}/infra/csp_sync.py" check >/dev/null || { warn "firebase.json CSP != infra/csp.txt"; bad=1; }
   ((bad == 0)) || die "preflight failed"

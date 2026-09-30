@@ -21,6 +21,7 @@ from fastapi import APIRouter, Depends
 
 from app.api import schemas as S
 from app.api.deps import AuthCtx, Services, consented_user, get_services, step_up_user, user_limit
+from app.api.user_alerts import builder_approval_missing
 from app.errors import Conflict, ExternalServiceError, Forbidden, NotFound, ValidationFailed
 
 router = APIRouter(tags=["agents"])
@@ -114,7 +115,25 @@ def confirm_agent(agent_id: UUID, ctx: AuthCtx = Depends(step_up_user),
                         payload={"master": agent["master_address"], "agent_address": agent["agent_address"]},
                         ip_hash=ctx.ip_hash)
         agent = svc.store.get_agent(conn, str(agent_id), ctx.user_id)
+    _check_builder_after_confirm(svc, ctx, agent["master_address"])
     return _agent_out(agent)
+
+
+def _check_builder_after_confirm(svc: Services, ctx: AuthCtx, master: str) -> None:
+    """Best effort (the agent is already active): an agent without a sufficient builder-fee approval cannot trade
+    (every order carries our builder code) → mandatory ``builder_approval_missing`` alert. A Hyperliquid outage here
+    never fails the confirmation; the daily agent-expiry scan re-checks."""
+    s = svc.settings
+    if not s.builder_address:
+        return
+    try:
+        rate = svc.hl.max_builder_fee(master, s.builder_address)
+    except ExternalServiceError:
+        return
+    with svc.db.begin() as conn:
+        builder_approval_missing(conn, svc, user_id=ctx.user_id, master=master, approved_tenths_bp=rate,
+                                 required_tenths_bp=s.economics.builder_fee_tenths_bp, where="agent_confirm",
+                                 now=svc.now())
 
 
 @router.post("/builder-approval/confirm", response_model=S.BuilderApprovalOut,
@@ -132,6 +151,8 @@ def confirm_builder(body: S.BuilderApprovalConfirmIn, ctx: AuthCtx = Depends(con
     with svc.db.begin() as conn:
         row = svc.store.insert_builder_approval(conn, user_id=ctx.user_id, master=body.master_address, rate=rate,
                                                 now=svc.now())
+        builder_approval_missing(conn, svc, user_id=ctx.user_id, master=body.master_address, approved_tenths_bp=rate,
+                                 required_tenths_bp=required, where="builder_confirm", now=svc.now())
         svc.audit.write(conn, actor=ctx.actor, action="builder_fee.confirm", target=f"wallet:{body.master_address}",
                         payload={"max_fee_rate_tenths_bp": rate, "required": required}, ip_hash=ctx.ip_hash)
     return S.BuilderApprovalOut(master_address=row["master_address"], max_fee_rate_tenths_bp=rate,

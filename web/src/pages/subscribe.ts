@@ -16,6 +16,7 @@ import { fmtUsd, fmtBps, fmtTenthsBp, shortAddr, microToDecimal } from "../core/
 import type { StrategyDetail, Subscription, Balance, AgentOut, AgentCreateOut } from "./_shared/types.js";
 import { ApiError } from "../core/api.js";
 import { ensurePageCss, isAbortError, errCode, errMessage, listOf, isAddress, hlNum, usdInput, LOSS_WARNING, isRec, feesList } from "./_shared/util.js";
+import { marketMaxLeverage, leverageBound, leverageHint, highLeverageWarning } from "./_shared/leverage.js";
 import { requireAlertContacts } from "./_shared/contacts.js";
 
 /** `details.reason` of an API error (backend Conflict/Forbidden reasons, docs/API_CONTRACT.md). */
@@ -93,6 +94,8 @@ class Wizard {
   private balanceErr: unknown = null;
   private balanceOk = false;
   private tradingAccounts: { address: string; label: string; value: number }[] | null = null;
+  /** Lowest Hyperliquid max leverage across the strategy's markets (undefined = loading, null = unknown). */
+  private marketMaxLev: number | null | undefined = undefined;
   private box = h("div", { class: "wizard" });
   private status = h("p", { class: "status", "aria-live": "polite" });
 
@@ -146,6 +149,10 @@ class Wizard {
       this.ctx.onCleanup(off1);
     }
     this.draw();
+    void marketMaxLeverage(s.markets).then((v) => {
+      this.marketMaxLev = v;
+      if (this.ctx.isCurrent() && this.current() === 6) this.draw();
+    });
   }
 
   private save(): void {
@@ -231,12 +238,10 @@ class Wizard {
     return m > 0 && Number.isSafeInteger(m) ? m : null;
   }
 
-  /** min(strategy MAX_LEVERAGE, platform cap, launch-phase cap) — the backend enforces the same (422 max_x100). */
+  /** min(strategy MAX_LEVERAGE, Hyperliquid market max leverage) — no platform or launch cap (owner decision). The
+   *  backend re-checks (422 details.max_x100). */
   private maxLeverage(): number {
-    let m = typeof this.s.max_leverage === "number" && this.s.max_leverage >= 1 ? Math.floor(this.s.max_leverage) : this.cfg.platform_max_leverage;
-    m = Math.min(m, this.cfg.platform_max_leverage);
-    if (this.cfg.max_user_leverage_x100) m = Math.min(m, Math.floor(this.cfg.max_user_leverage_x100 / 100));
-    return Math.max(1, m);
+    return leverageBound(this.s.max_leverage, this.marketMaxLev, this.cfg.platform_max_leverage);
   }
 
   private price(): number {
@@ -671,10 +676,12 @@ class Wizard {
     lev.value = String(Math.min(st.leverage ?? 1, maxLev));
     const acctVal = (this.tradingAccounts ?? []).find((a) => a.address === st.trading)?.value ?? NaN;
     const warn = h("div");
+    const levWarn = h("div", { "aria-live": "polite" });
     const ack = checkbox("I understand I can lose all allocated funds, and that leverage magnifies losses.", { checked: !!st.riskAck, required: true });
     const check = (): void => {
       const m = alloc.micro();
       const lv = Number(lev.value);
+      mount(levWarn, highLeverageWarning(lv));
       mount(
         warn,
         m !== null && Number.isFinite(acctVal) && m / 1e6 > acctVal
@@ -692,10 +699,11 @@ class Wizard {
         "div",
         { class: "form-grid two-col" },
         field("Allocation (USD)", alloc.el, "Funds stay in your Hyperliquid account; this is a sizing limit, not a transfer."),
-        field("Max leverage", lev, `Strategy maximum: ${maxLev}×.`),
+        field("Max leverage", lev, this.marketMaxLev === undefined ? `${leverageHint(this.s.max_leverage, null, maxLev)} Checking Hyperliquid's market limit…` : leverageHint(this.s.max_leverage, this.marketMaxLev, maxLev)),
       ),
       warn,
       note(h("span", null, h("b", null, "You can lose all allocated funds. "), LOSS_WARNING), "bad"),
+      levWarn,
       ack.el,
       h(
         "div",
@@ -799,6 +807,7 @@ class Wizard {
         ["Profit share", `${fmtBps(psTotal)} of new profit above high-water mark`],
         ["Builder fee", `${fmtTenthsBp(e.builder_fee_tenths_bp)} of each order's notional`],
       ]),
+      highLeverageWarning(st.leverage ?? 1),
       missing.length ? note(`Finish step${missing.length > 1 ? "s" : ""} ${missing.map((i) => i + 1).join(", ")} first.`, "warn") : null,
       h("p", { class: "small muted" }, "Confirming requires a fresh sign-in with two-factor (step-up). Trading starts at the next signal; execution is delayed by a random 0–10 minutes per subscriber for privacy."),
       h(
@@ -848,6 +857,11 @@ class Wizard {
               if (reason === "terms_changed") return restart({ gateAccepted: false }, "The strategy's price or profit share changed. Please review the new terms.");
               if (reason === "agent_not_active") return restart({ agentDone: false, agentId: undefined, agentAddress: undefined }, "Approve the trading agent in your wallet first.");
               if (reason === "builder_fee_not_approved") return restart({ builderDone: false }, "Approve the builder fee in your wallet first.");
+              const maxX100 = isRec(err) && isRec((err as { details?: unknown }).details) ? Number((err as { details: Record<string, unknown> }).details.max_x100) : NaN;
+              if (c === "validation_failed" && Number.isFinite(maxX100) && maxX100 >= 100) {
+                const cap = Math.floor(maxX100 / 100);
+                return restart({ leverage: Math.min(st.leverage ?? 1, cap), riskAck: false }, `This strategy and market allow at most ${cap}× leverage right now. Check the leverage step and continue.`);
+              }
               if (c === "validation_failed" || c === "guard_rejected" || c === "conflict" || c === "forbidden") {
                 this.st.subKey = undefined;
                 this.save();

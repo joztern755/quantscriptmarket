@@ -421,8 +421,14 @@ class NotifierAdapter:
         self._store = store
         self._notifier: Any = None
 
-    def notify(self, conn: Any, *, user_id: Optional[str], severity: str, kind: str, payload: dict[str, Any]) -> None:
-        self._store.insert_alert(conn, user_id=user_id, severity=severity, kind=kind, payload=payload)
+    def notify(self, conn: Any, *, user_id: Optional[str], severity: str, kind: str, payload: dict[str, Any],
+               dedup_key: Optional[str] = None) -> None:
+        """``dedup_key``: at most one alert row per key (alerts.dedup_key unique) — repeats are silently dropped."""
+        if dedup_key:
+            self._store.insert_alert(conn, user_id=user_id, severity=severity, kind=kind, payload=payload,
+                                     dedup_key=dedup_key)
+        else:
+            self._store.insert_alert(conn, user_id=user_id, severity=severity, kind=kind, payload=payload)
         if user_id is None and severity in ("warn", "critical"):
             self._pool.submit(self._deliver, kind, severity, dict(payload))
 

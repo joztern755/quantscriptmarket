@@ -71,12 +71,10 @@ spec:
             - {name: STRIPE_FEE_ESTIMATE_FIXED_USD, value: "${STRIPE_FEE_ESTIMATE_FIXED_USD}"}
             - {name: STRIPE_MAX_TOPUP_USD, value: "${STRIPE_MAX_TOPUP_USD}"}
             - {name: FEATURE_STRIPE_MYR, value: "false"}                              # FPX/GrabPay off until an FX source is chosen
-            # launch guard rails (app/api/deps.py LaunchConfig): internal phase = allow-listed users only.
-            # MAX_*: "0" = no cap (owner 30 Sep 2026, SPEC §12 "No caps"); a positive value re-introduces one
+            # launch guard rails (app/api/deps.py LaunchConfig): internal phase = allow-listed users only, payouts off.
+            # No MAX_ALLOCATION_PER_USER_USD / MAX_TOTAL_PLATFORM_ALLOCATION_USD / MAX_USER_LEVERAGE on purpose:
+            # unset = no cap (owner 30 Sep 2026, SPEC §12 "No caps")
             - {name: LAUNCH_PHASE, value: "${LAUNCH_PHASE}"}
-            - {name: MAX_ALLOCATION_PER_USER_USD, value: "${MAX_ALLOCATION_PER_USER_USD}"}
-            - {name: MAX_TOTAL_PLATFORM_ALLOCATION_USD, value: "${MAX_TOTAL_PLATFORM_ALLOCATION_USD}"}
-            - {name: MAX_USER_LEVERAGE, value: "${MAX_USER_LEVERAGE}"}
             - {name: PAYOUTS_ENABLED, value: "${PAYOUTS_ENABLED}"}
             # creator KYC: manual (one admin approves) until a provider is signed; secrets below only for sumsub
             - {name: KYC_PROVIDER, value: "${KYC_PROVIDER}"}

@@ -123,6 +123,11 @@ def create_subscription(body: S.SubscriptionCreateIn, ctx: AuthCtx = Depends(ste
         raise ValidationFailed("builder address not configured")
     approved = svc.hl.max_builder_fee(master, s.builder_address)
     if approved < econ.builder_fee_tenths_bp:
+        from app.api.user_alerts import builder_approval_missing
+
+        with svc.db.begin() as conn:     # committed on its own: the 409 below must not roll the alert back
+            builder_approval_missing(conn, svc, user_id=ctx.user_id, master=master, approved_tenths_bp=approved,
+                                     required_tenths_bp=econ.builder_fee_tenths_bp, where="subscribe", now=svc.now())
         raise Conflict("approve the builder fee in your wallet first", reason="builder_fee_not_approved",
                        approved_tenths_bp=approved, required_tenths_bp=econ.builder_fee_tenths_bp)
 
