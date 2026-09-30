@@ -51,7 +51,6 @@ jobs:
       ALLOWLIST_EMAILS: ${{ vars.ALLOWLIST_EMAILS || 'app.aijalon@gmail.com' }}
       PAYOUTS_ENABLED: ${{ vars.PAYOUTS_ENABLED || 'false' }}
       GIT_SHA: ${{ github.sha }}
-      DEPLOY_STATE: ${{ runner.temp }}/aijalon-deploy.state
       TYPESCRIPT_VERSION: "6.0.2"
       FIREBASE_TOOLS_VERSION: "15.32.0"
     steps:
@@ -105,7 +104,7 @@ jobs:
         run: ./infra/gcp/deploy.sh smoke-api
 
       - name: Roll back api/executor on failed smoke test
-        if: failure() && steps.services.outcome == 'success'
+        if: failure() && (steps.services.outcome == 'failure' || steps.smoke_api.outcome == 'failure')
         run: ./infra/gcp/deploy.sh rollback
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -155,6 +154,6 @@ jobs:
           {
             echo "### Deploy ${GITHUB_SHA::12}"
             echo '```'
-            cat "${DEPLOY_STATE}" 2>/dev/null || true
+            cat "${RUNNER_TEMP}/aijalon-deploy.state" 2>/dev/null || true   # digests + previous revisions
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

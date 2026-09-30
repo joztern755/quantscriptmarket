@@ -1,7 +1,7 @@
 """Concrete implementations of the API ports (app/api/deps.py). The ONLY place the API imports other teams'
 modules — always lazily, inside methods, so `app.api` imports even when a module is missing. A missing module
 fails CLOSED at call time (503 service_unavailable), except where a local fallback is equivalent and
-side-effect free (rate limiter, EIP-712 builders from SPEC §6, Hyperliquid read-only /info, EIP-191 recovery).
+side-effect free (rate limiter, EIP-191 recovery).
 
 External contract each adapter expects (the lead reconciles names):
   auth        app.security.auth.build_verifier(settings).verify(token) -> AuthContext; require_mfa(ctx);
@@ -13,20 +13,20 @@ External contract each adapter expects (the lead reconciles names):
   database    app.db.engine.{create_db_engine(settings, application_name=, statement_timeout_ms=), sqlstate_of}
   agent keys  app.security.kms.make_encryptor(settings) (encrypt-only);
               app.security.agent_keys.generate_sealed_agent_key(encryptor, user_id=) -> SealedKey
-  typed data  app.hl.typed_data.approve_agent_typed_data(agent_address=, agent_name=, nonce=,
-              signature_chain_id=, is_mainnet=), approve_builder_fee_typed_data(builder=, max_fee_rate=, nonce=,
-              signature_chain_id=, is_mainnet=) (fallback: SPEC §6 builders below);
-              app.payments.usdc.usd_send_typed_data(...)
-  hl info     app.hl.info.{extra_agents, max_builder_fee, clearinghouse_state, sub_accounts, known_coins,
-              user_non_funding_ledger_updates} (fallback: POST {hl_api_url}/info)
+  typed data  app.hl.typed_data.{approve_agent_request, approve_builder_fee_request, usd_send_request}
+              -> UserSignedRequest.public_view() {typed_data, action, nonce}
+  hl info     app.hl.info.InfoClient(url).{extra_agents, max_builder_fee, clearinghouse_state(user, dex),
+              user_role, user_non_funding_ledger_updates}; app.hl.markets.MarketCatalog.from_info(client, dexes)
   stripe      app.payments.stripe_pay.{create_topup_intent, verify_webhook, handle_event, StripeTopupConfig,
               default_gateway}; optional make_fee_lookup(gateway) when the Stripe fee is passed to the user
   usdc        app.payments.usdc.{build_topup_request, credit_from_detection};
-              app.hl.deposits.detect_transfers(sender=, since_ms=) (fallback: /info userNonFundingLedgerUpdates)
+              app.hl.deposits.detect_deposits(treasury ledger updates, treasury_address=, verified_wallets=,
+              since_ms=) -> DepositScan
   notifier    alerts table (in-app, same tx) + app.alerts.notifier.{Notifier, TelegramSink, Alert, Severity}
   sandbox     app.sandbox.validate.validate_source, app.sandbox.nocode.{validate_spec, compile_spec},
               app.sandbox.backtest.{fetch_market_data, HyperliquidInfoFetcher, backtest_on_data (dev only)};
-              sandbox service POST {sandbox_url}/v1/backtest {source, data, params} with a Cloud Run ID token
+              sandbox service POST {sandbox_url}/backtest {source, data, params} with a Cloud Run ID token and
+              X-Sandbox-Secret (settings.sandbox_shared_secret)
   kyc         app.kyc.create_session(user_id=, return_url=) -> {url, provider, provider_ref, status}
   jobs        see JOB_ENTRYPOINTS
   domain      app.domain.{fees, referrals, billing, track_record}
@@ -253,190 +253,91 @@ class CodeVaultAdapter:
 
 
 # =============================================================================================================
-# Hyperliquid: EIP-712 typed data (SPEC §6) and read-only /info
+# Hyperliquid: EIP-712 user-signed actions (app.hl.typed_data) and read-only /info (app.hl.info.InfoClient)
 # =============================================================================================================
-_EIP712_DOMAIN = [
-    {"name": "name", "type": "string"}, {"name": "version", "type": "string"},
-    {"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"},
-]
-_APPROVE_AGENT = [
-    {"name": "hyperliquidChain", "type": "string"}, {"name": "agentAddress", "type": "address"},
-    {"name": "agentName", "type": "string"}, {"name": "nonce", "type": "uint64"},
-]
-_APPROVE_BUILDER = [
-    {"name": "hyperliquidChain", "type": "string"}, {"name": "maxFeeRate", "type": "string"},
-    {"name": "builder", "type": "address"}, {"name": "nonce", "type": "uint64"},
-]
-
-
-def _typed(primary: str, fields: list[dict[str, str]], message: dict[str, Any], chain_hex: str) -> dict[str, Any]:
-    return {
-        "domain": {"name": "HyperliquidSignTransaction", "version": "1", "chainId": int(chain_hex, 16),
-                   "verifyingContract": ZERO_ADDRESS},
-        "types": {"EIP712Domain": _EIP712_DOMAIN, primary: fields},
-        "primaryType": primary,
-        "message": message,
-    }
-
-
 class TypedDataAdapter:
     def __init__(self, settings: Settings) -> None:
         self._mainnet = settings.hl_is_mainnet
 
-    @property
-    def _chain(self) -> str:
-        return "Mainnet" if self._mainnet else "Testnet"
-
     def approve_agent(self, *, agent_address: str, agent_name: str, nonce: int, signature_chain_id: str) -> dict:
-        chain = signature_chain_id.lower()
-        fn = _fn("app.hl.typed_data", "approve_agent_typed_data")
-        if fn is not None:
-            td = fn(agent_address=agent_address, agent_name=agent_name, nonce=nonce, signature_chain_id=chain,
-                    is_mainnet=self._mainnet)
-        else:
-            td = _typed("HyperliquidTransaction:ApproveAgent", _APPROVE_AGENT,
-                        {"hyperliquidChain": self._chain, "agentAddress": agent_address, "agentName": agent_name,
-                         "nonce": nonce}, chain)
-        action = {"type": "approveAgent", "signatureChainId": chain, "hyperliquidChain": self._chain,
-                  "agentAddress": agent_address, "agentName": agent_name, "nonce": nonce}
-        return {"typed_data": td, "action": action, "nonce": nonce}
+        req = _require("app.hl.typed_data").approve_agent_request(
+            agent_address, nonce_ms=nonce, signature_chain_id=signature_chain_id, is_mainnet=self._mainnet,
+            agent_name=agent_name)
+        return req.public_view()
 
-    def approve_builder_fee(self, *, builder: str, max_fee_rate: str, nonce: int, signature_chain_id: str) -> dict:
-        chain = signature_chain_id.lower()
-        fn = _fn("app.hl.typed_data", "approve_builder_fee_typed_data")
-        if fn is not None:
-            td = fn(builder=builder, max_fee_rate=max_fee_rate, nonce=nonce, signature_chain_id=chain,
-                    is_mainnet=self._mainnet)
-        else:
-            td = _typed("HyperliquidTransaction:ApproveBuilderFee", _APPROVE_BUILDER,
-                        {"hyperliquidChain": self._chain, "maxFeeRate": max_fee_rate, "builder": builder,
-                         "nonce": nonce}, chain)
-        action = {"type": "approveBuilderFee", "signatureChainId": chain, "hyperliquidChain": self._chain,
-                  "maxFeeRate": max_fee_rate, "builder": builder, "nonce": nonce}
-        return {"typed_data": td, "action": action, "nonce": nonce}
+    def approve_builder_fee(self, *, builder: str, max_fee_tenths_bp: int, nonce: int,
+                            signature_chain_id: str) -> dict:
+        req = _require("app.hl.typed_data").approve_builder_fee_request(
+            builder, nonce_ms=nonce, signature_chain_id=signature_chain_id, is_mainnet=self._mainnet,
+            max_fee_tenths_bp=max_fee_tenths_bp)
+        return req.public_view()
 
     def usd_send(self, *, destination: str, amount: str, time_ms: int, signature_chain_id: str) -> dict:
-        chain = signature_chain_id.lower()
-        usdc = _require("app.payments.usdc")
-        td = usdc.usd_send_typed_data(destination=destination, amount=amount, time_ms=time_ms,
-                                      signature_chain_id=chain, is_mainnet=self._mainnet)
-        action = {"type": "usdSend", "signatureChainId": chain, "hyperliquidChain": self._chain,
-                  "destination": destination, "amount": amount, "time": time_ms}
-        return {"typed_data": td, "action": action, "nonce": time_ms}
+        req = _require("app.hl.typed_data").usd_send_request(
+            destination, amount, time_ms=time_ms, signature_chain_id=signature_chain_id, is_mainnet=self._mainnet)
+        return req.public_view()
 
 
 class HlInfoAdapter:
-    """Read-only Hyperliquid /info. Uses app.hl.info functions when present; else a minimal urllib client."""
+    """Read-only Hyperliquid /info via app.hl.info.InfoClient (retries, size caps, shape checks live there)."""
 
-    MAX_RESPONSE_BYTES = 8 * 1024 * 1024
-
-    def __init__(self, settings: Settings, *, timeout: float = 8.0) -> None:
-        self._url = settings.hl_api_url.rstrip("/") + "/info"
-        self._timeout = timeout
-        self._coins: tuple[float, set[str]] = (0.0, set())
+    def __init__(self, settings: Settings) -> None:
+        self._url = settings.hl_api_url
+        self._client: Any = None
         self._lock = threading.Lock()
 
-    def _post(self, body: dict[str, Any]) -> Any:
-        req = urllib.request.Request(self._url, data=json.dumps(body).encode(), method="POST",
-                                     headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as r:  # noqa: S310 - fixed https URL from config
-                raw = r.read(self.MAX_RESPONSE_BYTES + 1)
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            raise ExternalServiceError("hyperliquid info unavailable", error=type(e).__name__) from None
-        if len(raw) > self.MAX_RESPONSE_BYTES:
-            raise ExternalServiceError("hyperliquid info response too large")
-        try:
-            return json.loads(raw)
-        except ValueError:
-            raise ExternalServiceError("hyperliquid info returned invalid JSON") from None
+    def client(self) -> Any:
+        if self._client is None:
+            with self._lock:
+                if self._client is None:
+                    self._client = _require("app.hl.info").InfoClient(self._url, timeout=8.0, max_retries=2)
+        return self._client
 
     def extra_agents(self, user: str) -> list[dict[str, Any]]:
-        fn = _fn("app.hl.info", "extra_agents")
-        rows = fn(user) if fn else self._post({"type": "extraAgents", "user": user})
-        out = []
-        for r in rows or []:
-            if isinstance(r, dict) and isinstance(r.get("address"), str):
-                out.append({"address": r["address"].lower(), "name": r.get("name") or "",
-                            "validUntil": r.get("validUntil")})
-        return out
+        return [{"address": str(a.get("address", "")).lower(), "name": a.get("name") or "",
+                 "validUntil": a.get("validUntil")} for a in self.client().extra_agents(user)]
 
     def max_builder_fee(self, user: str, builder: str) -> int:
-        fn = _fn("app.hl.info", "max_builder_fee")
-        val = fn(user, builder) if fn else self._post({"type": "maxBuilderFee", "user": user, "builder": builder})
-        if isinstance(val, bool) or not isinstance(val, int):
-            raise ExternalServiceError("unexpected maxBuilderFee response")
-        return val
+        return int(self.client().max_builder_fee(user, builder))
 
-    def clearinghouse_state(self, user: str) -> dict[str, Any]:
-        fn = _fn("app.hl.info", "clearinghouse_state")
-        res = fn(user) if fn else self._post({"type": "clearinghouseState", "user": user})
-        if not isinstance(res, dict):
-            raise ExternalServiceError("unexpected clearinghouseState response")
-        return res
+    def clearinghouse_state(self, user: str, dex: str = "") -> dict[str, Any]:
+        return self.client().clearinghouse_state(user, dex)
 
-    def sub_accounts(self, user: str) -> list[str]:
-        fn = _fn("app.hl.info", "sub_accounts")
-        if fn:
-            return [a.lower() for a in fn(user)]
-        rows = self._post({"type": "subAccounts", "user": user}) or []
-        return [str(r["subAccountUser"]).lower() for r in rows if isinstance(r, dict) and r.get("subAccountUser")]
+    def master_of(self, address: str) -> Optional[str]:
+        """Master wallet of a sub-account (None when `address` is not a sub-account)."""
+        role = self.client().user_role(address)
+        if role.get("role") == "subAccount":
+            master = (role.get("data") or {}).get("master")
+            return str(master).lower() if master else None
+        return None
 
     def ledger_updates(self, user: str, start_ms: int) -> list[dict[str, Any]]:
-        fn = _fn("app.hl.info", "user_non_funding_ledger_updates")
-        rows = fn(user, start_ms) if fn else self._post(
-            {"type": "userNonFundingLedgerUpdates", "user": user, "startTime": int(start_ms)})
-        return [r for r in (rows or []) if isinstance(r, dict)]
-
-    @staticmethod
-    def parse_usd_transfer(entry: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """A USDC send between perp accounts. VERIFY field names against live data before go-live
-        (newer API: delta.type "send" {user, destination, token, amount}; older: "internalTransfer" {usdc})."""
-        d = entry.get("delta") or {}
-        t = d.get("type")
-        if t == "send" and str(d.get("token", "USDC")).upper() in ("USDC", ""):
-            amount = d.get("amount") or d.get("usdcValue")
-        elif t == "internalTransfer":
-            amount = d.get("usdc")
-        else:
-            return None
-        try:
-            micro = to_micro(str(amount), rounding=ROUND_FLOOR)
-        except (TypeError, ValueError):
-            return None
-        return {"tx_hash": str(entry.get("hash", "")).lower(), "from_address": str(d.get("user", "")).lower(),
-                "to_address": str(d.get("destination", "")).lower(), "amount_micro": micro,
-                "time_ms": int(entry.get("time") or 0), "token": "USDC"}
+        return list(self.client().user_non_funding_ledger_updates(user, start_ms))
 
     def find_usd_send(self, *, sender: str, destination: str, amount_micro: int, tx_hash: str) -> bool:
+        """True iff `sender`'s ledger shows a USDC transfer with this hash to `destination` for exactly this amount."""
+        types = getattr(_mod("app.hl.deposits"), "TRANSFER_TYPES", ("send", "usdSend", "internalTransfer"))
         start = int((time.time() - 14 * 86400) * 1000)
         for e in self.ledger_updates(sender, start):
-            t = self.parse_usd_transfer(e)
-            if t and t["tx_hash"] == tx_hash.lower() and t["to_address"] == destination.lower() \
-                    and t["amount_micro"] == amount_micro:
-                return True
+            d = e.get("delta") or {}
+            if str(e.get("hash", "")).lower() != tx_hash.lower() or d.get("type") not in types:
+                continue
+            if str(d.get("destination", "")).lower() != destination.lower():
+                continue
+            if str(d.get("user", sender)).lower() != sender.lower() or str(d.get("token") or "USDC") != "USDC":
+                continue
+            raw = d.get("amount", d.get("usdc"))
+            try:
+                if to_micro(str(raw), rounding=ROUND_FLOOR) == amount_micro:
+                    return True
+            except (TypeError, ValueError):
+                continue
         return False
 
-    def known_coins(self) -> set[str]:
-        fn = _fn("app.hl.markets", "known_coins")
-        if fn:
-            return set(fn())
-        ts, coins = self._coins
-        if coins and time.time() - ts < 300:
-            return coins
-        out: set[str] = set()
-        meta = self._post({"type": "meta"}) or {}
-        out |= {u["name"] for u in meta.get("universe", []) if isinstance(u, dict) and u.get("name")}
-        for dex in self._post({"type": "perpDexs"}) or []:
-            if isinstance(dex, dict) and dex.get("name"):
-                dm = self._post({"type": "meta", "dex": dex["name"]}) or {}
-                for u in dm.get("universe", []):
-                    if isinstance(u, dict) and u.get("name"):
-                        n = u["name"]
-                        out.add(n if ":" in n else f"{dex['name']}:{n}")
-        with self._lock:
-            self._coins = (time.time(), out)
-        return out
+    def unknown_coins(self, coins: list[str]) -> list[str]:
+        mk = _require("app.hl.markets")
+        catalog = mk.MarketCatalog.from_info(self.client(), dexes=mk.MarketCatalog.dexes_for(coins))
+        return [c for c in coins if c not in catalog]
 
 
 # =============================================================================================================
@@ -491,18 +392,14 @@ class UsdcAdapter:
         out.update({"source": req.source, "destination": req.destination})
         return out
 
-    def detect(self, *, sender: str, since_ms: Optional[int]) -> list[Any]:
-        fn = _fn("app.hl.deposits", "detect_transfers")
+    def detect(self, *, senders: list[str], since_ms: Optional[int]) -> list[Any]:
+        """USDC transfers from `senders` (the user's verified wallets) into the treasury, from the TREASURY's
+        on-chain ledger (app.hl.deposits.detect_deposits) — never from anything the client says."""
         start = since_ms if since_ms else int((time.time() - 2 * 86400) * 1000)
-        if fn is not None:
-            return list(fn(sender=sender, since_ms=start))
-        treasury = self._s.treasury_address.lower()
-        out = []
-        for e in self._hl.ledger_updates(sender, start):
-            t = HlInfoAdapter.parse_usd_transfer(e)
-            if t and t["to_address"] == treasury and t["from_address"] == sender.lower():
-                out.append(t)
-        return out
+        updates = self._hl.ledger_updates(self._s.treasury_address, start)
+        scan = _require("app.hl.deposits").detect_deposits(
+            updates, treasury_address=self._s.treasury_address, verified_wallets=senders, since_ms=start)
+        return list(scan.deposits)
 
     def credit_from_detection(self, detection: Any, user_for_address: Callable[[str], Optional[str]]) -> Any:
         return _require("app.payments.usdc").credit_from_detection(
@@ -576,7 +473,7 @@ class SandboxAdapter:
         bt, vm = _require("app.sandbox.backtest"), _require("app.sandbox.validate")
         smeta = vm.StrategyMeta(markets=tuple(meta["markets"]), timeframe=meta["timeframe"],
                                 lookback=int(meta["lookback"]), max_leverage=float(meta["max_leverage"]))
-        data = bt.fetch_market_data(smeta, bt.HyperliquidInfoFetcher(self._s.hl_api_url))
+        data = bt.fetch_market_data(smeta, bt.HyperliquidInfoFetcher(self._s.hl_api_url))  # trusted side has egress
         if self._cfg.sandbox_url:
             return self._remote(code, data.to_json())
         if self._s.env in ("dev", "test"):
@@ -592,18 +489,22 @@ class SandboxAdapter:
         except Exception as e:  # noqa: BLE001
             raise ServiceUnavailable("cannot obtain sandbox identity token", error=type(e).__name__) from None
         body = json.dumps({"source": code, "data": data, "params": {}}).encode()
-        req = urllib.request.Request(url + "/v1/backtest", data=body, method="POST",
-                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+        secret = getattr(self._s, "sandbox_shared_secret", "") or ""
+        if secret:
+            headers["X-Sandbox-Secret"] = secret   # defence in depth (app/sandbox/service.py layer 2)
+        req = urllib.request.Request(url + "/backtest", data=body, method="POST", headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=300) as r:  # noqa: S310 - URL from config
                 raw = r.read(16 * 1024 * 1024)
         except urllib.error.HTTPError as e:
-            if e.code == 422:
+            if e.code in (400, 422):
                 try:
                     detail = json.loads(e.read(65536) or b"{}")
                 except ValueError:
                     detail = {}
-                raise ValidationFailed("backtest rejected the strategy", sandbox=detail.get("error")) from None
+                raise ValidationFailed(str(detail.get("message") or "backtest rejected the strategy")[:300],
+                                       sandbox_error=str(detail.get("error") or "")[:64]) from None
             raise ExternalServiceError("sandbox backtest failed", status=e.code) from None
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise ExternalServiceError("sandbox unavailable", error=type(e).__name__) from None

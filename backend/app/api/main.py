@@ -1,10 +1,12 @@
 """FastAPI app factory for aijalon.trade.
 
     uvicorn --factory app.api.main:create_app            # public API service (Cloud Run "api")
-    uvicorn --factory app.api.main:create_executor_app   # executor service: /healthz + /v1/internal/* incl. tick
+    uvicorn --factory app.api.main:create_executor_app   # executor service: /healthz + /v1/internal/* only
 
-The API service account can only ENCRYPT agent keys (KMS); /v1/internal/tick (which needs decrypt) is mounted
-only on the executor service. OpenAPI/docs are disabled in prod. Errors never include stack traces.
+The API service (DB role app_api, KMS encrypt-only) serves the public/user/admin API and the Stripe webhook.
+Every /v1/internal/* job (tick needs KMS decrypt; the others write orders/fills/signals/targets, which app_api
+cannot) is mounted ONLY on the executor service (DB role app_executor, ingress internal, Cloud Scheduler OIDC).
+OpenAPI/docs are disabled in prod. Errors never include stack traces.
 """
 from __future__ import annotations
 
@@ -90,18 +92,18 @@ def _install_error_handlers(app: FastAPI) -> None:
         return _error(500, "internal_error", "internal error", request)
 
 
-def _check_prod_config(svc: Services) -> None:
+def _check_prod_config(svc: Services, role: str) -> None:
     """Fail closed at startup rather than serve prod traffic with a missing security control."""
     s = svc.settings
     if not s.is_prod:
         return
     cfg = svc.config
     missing = [name for name, ok in (
-        ("EDGE_AUTH_SECRET (edge_auth_secret)", len(cfg.edge_auth_secret) >= 32),
-        ("SCHEDULER_SA_EMAIL (scheduler_sa_email)", bool(cfg.scheduler_sa_email)),
+        ("EDGE_AUTH_SECRET (edge_auth_secret)", role != "api" or len(cfg.edge_auth_secret) >= 32),
+        ("SCHEDULER_SA_EMAIL (scheduler_sa_email)", role != "executor" or bool(cfg.scheduler_sa_email)),
         ("AUDIT_PEPPER_B64 (audit_pepper_b64)", len(cfg.pepper) >= 32),
-        ("STRIPE_WEBHOOK_SECRET", bool(s.stripe_webhook_secret)),
-        ("SANDBOX_URL (sandbox_url)", bool(cfg.sandbox_url) or not s.feature_creator_uploads),
+        ("STRIPE_WEBHOOK_SECRET", role != "api" or bool(s.stripe_webhook_secret)),
+        ("SANDBOX_URL (sandbox_url)", role != "api" or bool(cfg.sandbox_url) or not s.feature_creator_uploads),
     ) if not ok]
     if missing:
         raise RuntimeError(f"prod API config missing: {missing}")
@@ -113,7 +115,7 @@ def _build(services: Optional[Services], role: str) -> FastAPI:
     if services is None:
         from app.api.adapters import build_services
         services = build_services(get_settings())
-    _check_prod_config(services)
+    _check_prod_config(services, role)
     prod = services.settings.is_prod
     app = FastAPI(
         title="aijalon.trade API",
@@ -130,10 +132,9 @@ def _build(services: Optional[Services], role: str) -> FastAPI:
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
-    from app.api.routers import internal
     if role == "executor":
+        from app.api.routers import internal
         app.include_router(internal.router, prefix="/v1")
-        app.include_router(internal.executor_router, prefix="/v1")
     else:
         from app.api.routers import (
             admin,
@@ -155,7 +156,7 @@ def _build(services: Optional[Services], role: str) -> FastAPI:
             withdrawals,
         )
         for r in (public, me, consents, wallets, agents, subscriptions, balance, deposits, withdrawals, positions,
-                  alerts, reviews, posts, referrals, creator, admin, internal, webhooks):
+                  alerts, reviews, posts, referrals, creator, admin, webhooks):
             app.include_router(r.router, prefix="/v1")
 
     cfg = services.config

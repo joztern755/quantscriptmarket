@@ -152,16 +152,22 @@ def apply_credit(conn: Any, svc: Any, instr: Any, *, actor: str) -> dict:
     """payments.CreditInstruction → ONE ledger tx + deposits row (idempotent on instr.idempotency_key)."""
     tx = post(conn, svc, key=instr.idempotency_key, kind=instr.kind, memo=instr.memo or "deposit", created_by=actor,
               entries=[(instr.debit_account, instr.amount_micro), (instr.credit_account, -instr.amount_micro)])
-    return svc.store.mark_deposit_credited(conn, user_id=instr.user_id, method=instr.method,
-                                           external_ref=instr.external_ref, amount_micro=instr.amount_micro, tx_id=tx)
+    meta = {k: val for k, val in dict(getattr(instr, "meta", {}) or {}).items() if val is not None}
+    minor = meta.get("amount_minor")
+    return svc.store.mark_deposit_credited(
+        conn, user_id=instr.user_id, method=instr.method, external_ref=instr.external_ref,
+        amount_micro=instr.amount_micro, tx_id=tx, withdrawable=bool(instr.withdrawable),
+        fee_micro=int(meta.get("fee_micro") or 0), currency=meta.get("currency"),
+        amount_minor=int(minor) if isinstance(minor, int) and minor > 0 else None,
+        meta={k: (val if isinstance(val, (str, int, bool)) else str(val)) for k, val in meta.items()})
 
 
 def apply_debit(conn: Any, svc: Any, instr: Any, *, actor: str) -> Optional[str]:
-    """payments.DebitInstruction (refund / dispute). The fee-balance account is non-negative in the DB; if the
-    user has already spent the money the posting is refused (AJ402) — we then raise a critical ops alert for
-    manual recovery instead of failing the webhook forever. A SAVEPOINT isolates the failed attempt."""
+    """payments.DebitInstruction (refund / dispute). These ledger kinds may overdraft the fee balance (the money
+    already left us); if the DB still refuses (AJ402), raise a critical ops alert for manual recovery instead of
+    failing the webhook forever. A SAVEPOINT isolates the failed attempt from the rest of the transaction."""
     try:
-        with conn.begin_nested():
+        with svc.store.savepoint(conn):
             tx = post(conn, svc, key=instr.idempotency_key, kind=instr.kind, memo=instr.memo or instr.kind,
                       created_by=actor,
                       entries=[(instr.debit_account, instr.amount_micro), (instr.credit_account, -instr.amount_micro)])
@@ -169,7 +175,7 @@ def apply_debit(conn: Any, svc: Any, instr: Any, *, actor: str) -> Optional[str]
         svc.notifier.notify(conn, user_id=None, severity="critical", kind="payment_reversal_unrecovered",
                             payload={"user_id": instr.user_id, "amount_micro": instr.amount_micro,
                                      "external_ref": instr.external_ref, "kind": instr.kind})
-        log.error("payment reversal exceeds fee balance", extra={"fields": {
+        log.error("payment reversal refused by ledger", extra={"fields": {
             "user_id": instr.user_id, "external_ref": instr.external_ref, "amount_micro": instr.amount_micro}})
         return None
     return tx

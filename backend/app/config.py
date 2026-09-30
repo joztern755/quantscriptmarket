@@ -45,7 +45,7 @@ class Economics:
         ReferralTier("elite", 100, usd(25_000_000), 10000),
     )
     plans: tuple[Plan, ...] = (
-        Plan("free", 0, 1, ("marketplace", "leaderboard", "free_posts")),
+        Plan("free", 0, 1, ("marketplace", "leaderboard", "free_posts", "email_telegram_alerts")),
         Plan("pro", usd(20), 3, ("marketplace", "leaderboard", "free_posts", "paid_posts", "email_telegram_alerts")),
         Plan("max", usd(50), None, ("marketplace", "leaderboard", "free_posts", "paid_posts", "email_telegram_alerts", "csv_export", "read_api")),
     )
