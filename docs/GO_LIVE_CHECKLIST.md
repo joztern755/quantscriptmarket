@@ -13,20 +13,23 @@ Related: `docs/SECURITY.md`, `docs/RUNBOOK.md`, `docs/INCIDENT_RESPONSE.md`, `do
 
 ## Phase limits (all configurable; never hard-coded)
 
-The launch-phase controls below are **proposed config keys. They do not exist in `backend/app/config.py` yet** (as of this version). The config owner must add them, and the API and executor must enforce them server-side, fail-closed. Suggested names:
+These keys exist in `backend/app/config.py` and are set per deploy (full table: DEPLOY §5.3). The API enforces them server-side, fail-closed.
 
-| Key (env) | Gate B internal | Gate C public (initial) | Enforced where |
-|---|---|---|---|
-| `LAUNCH_PHASE` | `internal` | `public` | api + executor |
-| `ALLOWLIST_EMAILS` (or an allowlist table) | Team emails only; everyone else sees a "coming soon" page after the site gate | empty (off) | api: signup and subscribe |
-| `MAX_ALLOCATION_PER_USER_USD` | **1,000** | [CONFIRM, e.g. 10,000] | api (subscribe/patch) + executor (clamp) |
-| `MAX_TOTAL_PLATFORM_ALLOCATION_USD` | **[CONFIRM, e.g. 5,000]** | [CONFIRM, e.g. 250,000] | api (reject new or increased allocations over the cap) |
-| `MAX_USER_LEVERAGE` (cap under `platform_max_leverage`) | **1–2x** [CONFIRM] | ≤ 5x | api + risk guards |
-| `IN_HOUSE_LISTED` | `silver` | `silver` (others only when they pass the walk-forward) | existing |
-| `FEATURE_CREATOR_UPLOADS` | on for team creators only (listing needs admin review) | on (KYC required) | existing |
-| `MAX_FEE_BALANCE_TOPUP_USD` per user | [CONFIRM, e.g. 200] | [CONFIRM] | api |
-| `STRIPE_MODE` | live with low Radar limits, or test [CONFIRM] | live | api |
-| `PAYOUTS_ENABLED` | false (manual only, maker-checker) | true | api |
+| Key (env) | Gate B internal | Gate C public (initial) | Where it is set | Enforced where |
+|---|---|---|---|---|
+| `LAUNCH_PHASE` | `internal` | `public` | GitHub variable | api + executor (the app refuses to start in `internal` without an allowlist) |
+| `ALLOWLIST_EMAILS` | team e-mails only; everyone else sees "coming soon" after the site gate | not used | **Secret Manager** (personal data) | api: signup and subscribe |
+| `MAX_ALLOCATION_PER_USER_USD` | `0` = no cap (owner, 30 Sep 2026, SPEC §12 "No caps") | `0` | GitHub variable | api (subscribe/patch) when > 0 |
+| `MAX_TOTAL_PLATFORM_ALLOCATION_USD` | `0` = no cap (owner) | `0` | GitHub variable | api when > 0 |
+| `MAX_USER_LEVERAGE` | `0` = no launch cap (owner); bounded by the user's setting, the strategy's `MAX_LEVERAGE` and each market's Hyperliquid max | `0` | GitHub variable | api when > 0 |
+| `IN_HOUSE_LISTED` | `silver` | `silver` (others only when they pass the walk-forward) | template | existing |
+| `FEATURE_CREATOR_UPLOADS` | on (listing needs admin review + creator KYC) | on (KYC required) | template | existing |
+| `STRIPE_MAX_TOPUP_USD` | `10000` default [CONFIRM a lower internal value] | [CONFIRM] | GitHub variable | api |
+| Stripe mode | live keys with low Radar limits, or test keys [CONFIRM] | live | secret + `STRIPE_PUBLISHABLE_KEY` variable | Stripe |
+| `PAYOUTS_ENABLED` | `false` (manual only, maker-checker) | `true` | GitHub variable | api |
+| `KYC_PROVIDER` | `manual` | provider [CONFIRM] | GitHub variable (+ `KYC_*` secrets for sumsub) | api |
+
+The owner removed the allocation and leverage caps; the liquidity guards (0.5% of 24h volume and 2% of OI per order) and every other pre-trade guard still apply. Setting a `MAX_*` variable to a positive value and redeploying restores a cap without a code change — keep that as the fast brake (Gate C3 rollback plan).
 
 **The per-market exposure cap** is already partly covered by the risk guards (0.5% of 24h volume and 2% of OI per order). Consider an **aggregate** per-market cap across all subscribers for thin HIP-3 markets such as `xyz:SILVER` [CONFIRM].
 
@@ -70,6 +73,13 @@ The launch-phase controls below are **proposed config keys. They do not exist in
 - [ ] Evaluate Hyperliquid native multi-sig for the treasury [VERIFY]; record the decision.
 - [ ] Ceremony minutes stored (without secrets).
 
+### B2b. Mainnet verification (tiny amounts, before any tester funds)
+- [ ] **Hyperliquid `/exchange` from the browser (CORS):** approveAgent, approveBuilderFee and the USDC `usdSend` deposit are posted by the browser straight to `https://api.hyperliquid.xyz/exchange` (CSP `connect-src` allows it). Confirm on Safari, Chrome and a mobile wallet browser that no CORS error occurs. **Fallback if it fails:** a server relay endpoint that forwards the user-signed payload unchanged (backend change; the API still never signs user actions).
+- [ ] **Builder-dex asset id:** one tiny order on `xyz:SILVER` (expected asset id 110026 = 100000 + 10000 × dex index 1 + index 26, `backend/app/hl/markets.py`) fills on that market with our builder code and `0xa17a1000…` cloid. Re-check the ids after any Hyperliquid builder-dex change.
+- [ ] **Reduce-only close below $10:** open a small position, shrink it, then close a remainder worth < $10 reduce-only. If Hyperliquid refuses, record it; the executor's $10 minimum and the "close positions" cancel flow must be adjusted before public launch.
+- [ ] **Reconcile readers:** the builder-fee reader (`builderRewards` from info `referral` + `rewardsClaim` ledger updates) is UNVERIFIED — compare its figure for the builder address with the Hyperliquid UI after the first builder fees accrue and after a claim. Until verified, a builder-fee reconciliation mismatch may be the reader, not the ledger.
+- [ ] **Agent `validUntil`:** `agent-expiry-scan` reads the approved agent's expiry from `extraAgents`; confirm it matches the wallet's approval and that the first reminder (14 days) is scheduled correctly.
+
 ### B3. Cloud security baseline
 - [ ] KMS keyring `aijalon` / key `agent-keys` with **HSM** protection, in `asia-southeast1`. Rotation schedule set. IAM: encrypt = api SA, decrypt = executor SA, **no human decrypt**.
 - [ ] Cloud SQL: private IP, CMEK, PITR on, backups kept 30 days, IAM DB auth. DB role grants verified (`\dp`): api has no SELECT on key and code ciphertext, and no UPDATE/DELETE on the ledger, audit or consents.
@@ -92,6 +102,11 @@ The launch-phase controls below are **proposed config keys. They do not exist in
 - [ ] Reconciliation job runs daily. The mismatch alert (> $1) has been tested.
 - [ ] Incident response tabletop exercise done (one market-manipulation scenario and one key-compromise scenario).
 - [ ] On-call rota and contacts sheet exist. At least 2 admins are available for maker-checker.
+- [ ] **Scheduler:** all 13 jobs exist (DEPLOY §14.1) and are paused until `make go-live`; `fills-ingest` / `fills-ingest-presettle` / `funding-scan` run before `settle-daily` (00:30). The on-call knows the `fill_after_settlement` procedure (RUNBOOK §13.4).
+- [ ] **Agent expiry reminders:** a test agent approved with a short validity produces `agent_expiring` / `agent_expired` on Telegram + e-mail; the executor stops trading that subscription (RUNBOOK §13.1).
+- [ ] **Telegram unreachable drill:** block the bot from a test account → the link shows lapsed, the `telegram_unreachable` e-mail arrives, new entries pause after 24 h, re-linking lifts it (RUNBOOK §13.2). Ops alerts reach the ops group and `OPS_EMAILS`.
+- [ ] **Held USDC deposit:** a transfer from an unverified wallet lands in `suspense:usdc_unattributed` with a `topup_held` ops event and is not credited. The release procedure (RUNBOOK §13.3, maker-checker) is agreed — **[GAP] no admin-console action exists yet**; until it does, held funds stay in suspense.
+- [ ] **`candle_mismatch` events** are routed to ops and the on-call knows RUNBOOK §13.5; the first candle backfill (~40 calls) has finished.
 
 ### B5. Phase limits set
 - [ ] `LAUNCH_PHASE=internal`; allowlist = team emails; per-user allocation cap **$1,000**; total platform allocation cap [$●]; leverage cap [●]x; only `xyz:SILVER` listed.

@@ -855,7 +855,7 @@ class SqlStore:
             INSERT INTO kyc_creators (user_id, provider, provider_ref, status)
             VALUES (CAST(:u AS uuid), :p, :r, 'pending')
             ON CONFLICT (user_id) DO UPDATE SET provider = EXCLUDED.provider, provider_ref = EXCLUDED.provider_ref
-             WHERE kyc_creators.status <> 'approved'""", u=user_id, p=provider, r=provider_ref)
+             WHERE kyc_creators.status NOT IN ('approved', 'provider_approved')""", u=user_id, p=provider, r=provider_ref)
 
     # ------------------------------------------------------------------------------------------ admin
     def list_flags(self, conn: Any) -> list[dict]:

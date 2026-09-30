@@ -242,6 +242,8 @@ def kyc_session(ctx: AuthCtx = Depends(creator_user), svc: Services = Depends(ge
         kyc = svc.store.get_kyc(conn, ctx.user_id)
     if kyc and kyc["status"] == "approved":
         raise Conflict("KYC already approved")
+    if kyc and kyc["status"] == "provider_approved":
+        raise Conflict("verification passed; awaiting confirmation by our team", reason="awaiting_admin")
     session = svc.kyc.create_session(user_id=ctx.user_id, return_url=f"{svc.settings.web_origin}/#/creator/kyc")
     with svc.db.begin() as conn:
         svc.store.upsert_kyc_pending(conn, user_id=ctx.user_id, provider=str(session["provider"]),

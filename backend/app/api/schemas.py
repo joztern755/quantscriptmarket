@@ -285,7 +285,8 @@ class MeOut(Out):
     created_at: datetime
     consents_complete: bool
     wallets: list[WalletOut]
-    kyc_status: Optional[str] = None            # creator KYC: pending | approved | rejected (None = not started)
+    kyc_status: Optional[str] = None            # creator KYC: pending | provider_approved (awaiting our admin) |
+                                                # approved | rejected (None = not started)
 
 
 class MePatchIn(In):

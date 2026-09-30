@@ -7,6 +7,9 @@ Maker-checker policy (SPEC §5.6 "all admin actions maker-checker"):
   * PERMISSIVE actions need a second, different admin: lifting a switch (system_flags.pending_*), listing a
     strategy version, setting an in-house price, un-suspending a user (admin_changes table), approving payouts
     (withdrawals/payouts maker_admin ≠ checker_admin, enforced by DB CHECKs too; neither may be the beneficiary).
+  * Creator KYC (owner decision 30 Sep 2026): ONE admin decides, step-up + audit-logged, never via admin_changes.
+    Manual provider: pending/rejected → approved. Sumsub: only a provider GREEN (``provider_approved``) can be
+    confirmed → approved. Rejection is immediate. An admin cannot approve their own KYC.
 Payout execution: after approved_2 an admin requests the usdSend typed data, signs it in the browser with the
 hardware treasury wallet, posts it to Hyperliquid, then records the tx hash here; we verify it on-chain before
 settling the ledger hold against treasury:hl_usdc.
@@ -171,9 +174,8 @@ def _apply_change(conn: Any, svc: Services, ctx: AuthCtx, ch: dict) -> None:
         svc.store.set_strategy_price(conn, sid, int(payload["price_monthly_micro"]))
     elif kind == "user_unsuspend":
         svc.store.set_user_status(conn, ch["target"].split(":", 1)[1], "active")
-    elif kind == "kyc_approve":
-        if not svc.store.set_kyc_status(conn, ch["target"].split(":", 1)[1], "approved"):
-            raise Conflict("no KYC session for this user")
+    elif kind == "kyc_approve":   # legacy queue entries: KYC is a single-admin decision now (POST /users/{id}/kyc)
+        raise Conflict("KYC approval no longer uses the change queue; reject this entry and use the KYC decision")
     else:
         raise Conflict("unknown change kind")
 
@@ -468,21 +470,37 @@ def unsuspend_user(user_id: UUID, body: S.DecisionIn, ctx: AuthCtx = Depends(adm
 @router.post("/users/{user_id}/kyc", response_model=S.AdminActionOut)
 def kyc_decision(user_id: UUID, body: S.KycDecisionIn, ctx: AuthCtx = Depends(admin_step_up),
                  svc: Services = Depends(get_services)) -> S.AdminActionOut:
-    """Record the KYC provider's verdict (documents stay at the provider). Approval unlocks listing, paid posts
-    and payouts → maker-checker; rejection is protective → immediate."""
+    """Creator KYC verdict by ONE admin (owner decision; documents stay at the provider). Approval unlocks listing,
+    paid posts and payouts (those keep their own two-admin rules). Manual provider: pending/rejected → approved.
+    Sumsub: only a provider GREEN (``provider_approved``) can be confirmed. Rejection: immediate."""
+    uid = str(user_id)
     with svc.db.begin() as conn:
-        kyc = svc.store.get_kyc(conn, str(user_id))
+        kyc = svc.store.get_kyc(conn, uid)
         if kyc is None:
             raise NotFound("no KYC session for this user")
         if body.decision == "rejected":
-            svc.store.set_kyc_status(conn, str(user_id), "rejected")
-            svc.audit.write(conn, actor=ctx.actor, action="kyc.reject", target=f"user:{user_id}",
-                            payload={"reason": body.reason, "provider_ref": kyc["provider_ref"]}, ip_hash=ctx.ip_hash)
+            if kyc["status"] == "rejected":
+                raise Conflict("KYC already rejected")
+            svc.store.set_kyc_status(conn, uid, "rejected")
+            svc.notifier.notify(conn, user_id=uid, severity="info", kind="kyc_status", payload={"status": "rejected"})
+            svc.audit.write(conn, actor=ctx.actor, action="kyc.reject", target=f"user:{uid}",
+                            payload={"reason": body.reason, "provider": kyc["provider"],
+                                     "provider_ref": kyc["provider_ref"], "from": kyc["status"]}, ip_hash=ctx.ip_hash)
             return S.AdminActionOut(status="applied")
+        if uid == ctx.user_id:
+            raise Forbidden("an admin cannot approve their own KYC")
         if kyc["status"] == "approved":
             raise Conflict("KYC already approved")
-        return _propose(conn, svc, ctx, kind="kyc_approve", target=f"user:{user_id}",
-                        payload={"provider": kyc["provider"], "provider_ref": kyc["provider_ref"]}, reason=body.reason)
+        if kyc["provider"] != "manual" and kyc["status"] != "provider_approved":
+            raise Conflict("the KYC provider has not approved this applicant yet", reason="provider_not_approved",
+                           status=kyc["status"])
+        if not svc.store.set_kyc_status(conn, uid, "approved"):
+            raise Conflict("KYC state changed; reload")
+        svc.notifier.notify(conn, user_id=uid, severity="info", kind="kyc_status", payload={"status": "approved"})
+        svc.audit.write(conn, actor=ctx.actor, action="kyc.approve", target=f"user:{uid}",
+                        payload={"reason": body.reason, "provider": kyc["provider"],
+                                 "provider_ref": kyc["provider_ref"], "from": kyc["status"]}, ip_hash=ctx.ip_hash)
+    return S.AdminActionOut(status="applied")
 
 
 # ============================================================================================ alerts / reconciliation
