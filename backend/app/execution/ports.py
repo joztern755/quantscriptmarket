@@ -234,13 +234,14 @@ class DataCoverage:
 
 @dataclass(frozen=True)
 class PnlDelta:
-    realized_micro: int             # Σ (closedPnl − fee) of attributed fills in (since, until]
+    realized_micro: int             # Σ book PnL (our average entry, − fee) of the claimed fills (H1)
     funding_micro: int              # Σ funding while holding strategy coins
     until: datetime
+    adjustments_micro: int = 0      # Σ book adjustments: foreign-fill / pause / leave mark-to-market (H1)
 
     @property
     def total_micro(self) -> int:
-        return self.realized_micro + self.funding_micro
+        return self.realized_micro + self.funding_micro + self.adjustments_micro
 
 
 @dataclass(frozen=True)
@@ -437,6 +438,23 @@ class TreasuryReader(Protocol):
     def treasury_usdc_micro(self) -> int: ...
 
 
+class SolvencyRepo(Protocol):
+    """REVIEW_MONEY M7(d): ledger side of the solvency invariant."""
+
+    def solvency_ledger(self) -> Mapping[str, int]:
+        """Normal balances (micro) of: ``user_fee_balances_positive`` (Σ max(0, fee balance)), ``creator_payables``,
+        ``referrer_payables``, ``ps_pending`` (uncollected, owed only once collected), ``withdrawals_pending``,
+        ``payouts_pending``, ``refunds_pending``, ``suspense``, ``builder_receivable``, ``stripe_clearing``,
+        ``treasury_ledger``, ``user_debt`` (Σ max(0, −fee balance))."""
+
+
+class StripeClearingReader(Protocol):
+    """REVIEW_MONEY M7(c) stub: Stripe balance (available + pending, USD, from balance transactions) to reconcile
+    against the ledger's ``stripe:clearing``. Not wired until a Stripe payout posting exists (see reconcile)."""
+
+    def clearing_balance_micro(self) -> int: ...
+
+
 class LedgerReader(Protocol):
     def balance(self, account_code: str) -> int:
         """Signed balance (+debit / −credit)."""
@@ -470,7 +488,17 @@ class SettlementRepo(Protocol):
         """True when the (subscription, settle_date) settlement row exists."""
 
     def pnl_since(self, subscription_id: str, since: datetime | None, until: datetime) -> PnlDelta:
-        """Attributed fills (closedPnl − fee) + funding in (since, until]."""
+        """Attributed fills (closedPnl − fee) + funding in (since, until]. Legacy window read; settlement uses
+        ``claim_pnl`` when the repo has it."""
+
+    def claim_pnl(self, subscription_id: str, until: datetime, settle_date: date) -> PnlDelta:
+        """REVIEW_MONEY M3: sum AND mark (ps_settlement_date = settle_date) every not-yet-settled fill, funding event and
+        book adjustment of the subscription with time ≤ ``until`` — late rows included — in the caller's transaction
+        (one statement per table, so a row is either summed and marked, or left for the next settlement)."""
+
+    def lock_user(self, user_id: str) -> None:
+        """Row lock on the user (same lock as the API's ``store.lock_user``): the fee balance read that decides how
+        much of a profit-share charge is collected cannot race an API spend or withdrawal hold."""
 
     def data_coverage(self, trading_addresses: Sequence[str]) -> Mapping[str, DataCoverage]:
         """Per trading address: how far fills-ingest and funding-scan have completely synced (job_cursors).
@@ -495,6 +523,16 @@ class SettlementRepo(Protocol):
     def set_plan_period(self, user_id: str, plan_period_end: datetime | None, past_due_since: datetime | None) -> None: ...
 
     def downgrade_plan(self, user_id: str, plan: str) -> None: ...
+
+
+class PendingReleaser(Protocol):
+    """REVIEW_MONEY C1: uncollected profit share (``ps_pending:{user}:…``) is released to the creator payable /
+    platform revenue once the user's debt shrinks (SQL ``ps_pending_release``; also fired by the DB on every top-up)."""
+
+    def users_with_pending(self) -> Sequence[str]: ...
+
+    def release(self, user_id: str) -> int:
+        """Release what the user's current balance covers; returns the micro-USD released (0 = nothing)."""
 
 
 class UserEventSink(Protocol):

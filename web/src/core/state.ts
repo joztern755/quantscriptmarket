@@ -44,6 +44,28 @@ export const storage = {
   },
 };
 
+/**
+ * Sign-out hygiene (SECURITY L4): remove every localStorage entry that links this browser to an account or wallet —
+ * subscribe-wizard progress (master/trading/agent addresses, typed data), the referral-bound uid and the per-uid
+ * consent sync map. Device-level choices (theme, site entry-gate acceptance) stay.
+ */
+export function clearUserLocalData(): void {
+  try {
+    const keys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k) keys.push(k);
+    }
+    for (const k of keys) {
+      if (k.startsWith("aijalon.subwiz.") || k === "aij.ref.bound") localStorage.removeItem(k);
+    }
+    const c = storage.get<Record<string, unknown>>("aij.consents.v1");
+    if (c && c.synced) storage.set("aij.consents.v1", { ...c, synced: {} });
+  } catch {
+    /* storage blocked: nothing persisted */
+  }
+}
+
 export interface Me {
   id: string;
   email: string | null;

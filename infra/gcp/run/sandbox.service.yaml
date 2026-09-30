@@ -5,7 +5,10 @@
 #   * aijalon-sandbox SA with no project roles; its only grant is reading SANDBOX_SHARED_SECRET (its own
 #     inbound auth), which it cannot even reach from inside (no route to Google APIs);
 #   * ingress internal + run.invoker only for the api and executor SAs (Cloud Run IAM authenticates callers);
-#   * per-request process isolation + rlimits (runner.py), <=4 concurrent runs per instance, capped instances.
+#   * per-request process isolation + rlimits (runner.py); ONE request per instance (containerConcurrency 1,
+#     REVIEW_WEB_INFRA M5) so creators never share an instance; every script child runs under its own uid;
+#   * the VPC's Cloud DNS answers NXDOMAIN for every name (response policy, bootstrap.sh step_network): no DNS
+#     exfiltration through the metadata-server resolver.
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
@@ -23,14 +26,14 @@ spec:
         commit: ${GIT_SHA_SHORT}
       annotations:
         autoscaling.knative.dev/minScale: "0"
-        autoscaling.knative.dev/maxScale: "5"
+        autoscaling.knative.dev/maxScale: "10"
         run.googleapis.com/execution-environment: ${SANDBOX_EXEC_ENV}
         run.googleapis.com/cpu-throttling: "false"
         run.googleapis.com/network-interfaces: '[{"network":"${SANDBOX_VPC}","subnetwork":"${SANDBOX_SUBNET}","tags":["${SANDBOX_NET_TAG}"]}]'
         run.googleapis.com/vpc-access-egress: all-traffic
     spec:
       serviceAccountName: ${SA_SANDBOX}
-      containerConcurrency: 4
+      containerConcurrency: 1
       timeoutSeconds: 300
       containers:
         - name: sandbox
@@ -45,7 +48,7 @@ spec:
           env:
             - {name: APP_ENV, value: prod}
             - {name: SERVICE_ROLE, value: sandbox}
-            - {name: SANDBOX_MAX_CONCURRENT, value: "4"}
+            - {name: SANDBOX_MAX_CONCURRENT, value: "1"}
             - name: SANDBOX_SHARED_SECRET
               valueFrom: {secretKeyRef: {name: SANDBOX_SHARED_SECRET, key: latest}}
           startupProbe:

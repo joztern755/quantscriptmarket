@@ -146,6 +146,17 @@ function buildShell(): { main: HTMLElement } {
 
 // ---------------------------------------------------------------- boot
 async function boot(): Promise<void> {
+  // SECURITY M1: never run inside a frame (boot-guard.js has already hidden the page; see also firebase.json XFO).
+  let framed = true;
+  try {
+    framed = window.top !== window.self;
+  } catch {
+    framed = true;
+  }
+  if (framed || (window as unknown as { __aijFramed?: boolean }).__aijFramed) {
+    document.body.replaceChildren(document.createTextNode("aijalon.trade cannot be displayed inside another site. Open https://aijalon.trade directly."));
+    return;
+  }
   initTheme();
   await loadAppConfig();
   setApiHooks({

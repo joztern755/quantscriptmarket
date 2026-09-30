@@ -104,8 +104,10 @@ def require_trusted_markets(conn: Any, svc: Services, markets: list[str], *, wha
 
 
 def _owned(conn: Any, svc: Services, ctx: AuthCtx, strategy_id: str, *, for_update: bool = False) -> dict:
+    """The caller's OWN third-party strategy. No admin override (REVIEW_AUTH_API F13): admin actions on a creator's
+    strategy go through /admin/* (maker-checker, audited as admin)."""
     st = svc.store.get_strategy(conn, strategy_id, for_update=for_update)
-    if st is None or (str(st.get("owner_user_id")) != ctx.user_id and ctx.role != "admin") or st["in_house"]:
+    if st is None or str(st.get("owner_user_id")) != ctx.user_id or st["in_house"]:
         raise NotFound("strategy not found")
     return st
 
@@ -150,6 +152,11 @@ def patch_strategy(strategy_id: UUID, body: S.CreatorStrategyPatchIn, ctx: AuthC
         st = _owned(conn, svc, ctx, str(strategy_id), for_update=True)
         if st["status"] not in EDITABLE_STATUSES:
             raise Conflict("listed strategies cannot change their terms", status=st["status"])
+        # F6: terms under review by the admins are frozen while a listing proposal is pending
+        if (body.price_monthly_micro is not None or body.profit_share_bps is not None) and \
+                svc.store.open_change_for(conn, "strategy_list", f"strategy:{strategy_id}") is not None:
+            raise Conflict("a listing review is pending; terms cannot change until it is decided",
+                           reason="listing_pending")
         svc.store.update_strategy_terms(conn, str(strategy_id), name=body.name, description=body.description,
                                         price_monthly_micro=body.price_monthly_micro,
                                         profit_share_bps=body.profit_share_bps)
@@ -220,6 +227,10 @@ def upload_version(strategy_id: UUID, body: S.VersionUploadIn, ctx: AuthCtx = De
 def create_post(body: S.CreatorPostIn, ctx: AuthCtx = Depends(creator_step_up),
                 svc: Services = Depends(get_services)) -> S.PostOut:
     price = svc.domain.validate_post_price(int(body.price_micro))
+    from app.api.billing_ops import max_post_price_micro
+    cap = max_post_price_micro(svc.settings)
+    if price > cap:     # REVIEW_AUTH_API F2 defence in depth: bounded damage from a stolen buyer session
+        raise ValidationFailed("post price above the maximum", max_micro=cap)
     with svc.db.begin() as conn:
         slug = None
         if body.strategy_id is not None:

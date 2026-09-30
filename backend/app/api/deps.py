@@ -10,7 +10,7 @@ Dependency ladder (each includes the previous):
     current_user      token valid + MFA (TOTP) + user row active + per-user rate limit    → /me, /consents
     consented_user    + current versions of terms/risk/privacy/jurisdiction/waiver       → all other auth routes
     step_up_user      + fresh sign-in (auth_time ≤ 300 s) + MFA                          → SPEC §5.2 actions
-    admin_user        + role admin (from DB, never from token claims)
+    admin_user        + role admin (from DB, never from token claims) + ADMIN_EMAILS allowlist (verified email)
     admin_step_up     + step-up                                                          → all admin mutations
     creator_user      + feature flag + role creator|admin + creator_agreement consent
 """
@@ -129,6 +129,7 @@ class ApiConfig:
     launch: "LaunchConfig"
     max_body_bytes: int = 128 * 1024
     max_upload_body_bytes: int = 1024 * 1024
+    admin_emails: frozenset[str] = frozenset()   # REVIEW_AUTH_API F12: ADMIN_EMAILS — admin role AND listed email
 
 
 @dataclass(frozen=True)
@@ -196,7 +197,19 @@ def api_config(settings: Settings) -> ApiConfig:
         legal_versions=legal,
         legal_doc_hashes=legal_by_doc(getattr(settings, "legal_doc_hashes", None)),
         launch=_launch(settings),
+        admin_emails=_admin_emails(settings),
     )
+
+
+def _admin_emails(settings: Settings) -> frozenset[str]:
+    """ADMIN_EMAILS (comma-separated): Settings.admin_emails when config.py has it, else the environment."""
+    import os
+    raw = getattr(settings, "admin_emails", None)
+    if raw is None:
+        raw = os.environ.get("ADMIN_EMAILS", "")
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    return frozenset(str(e).strip().lower() for e in raw if e and str(e).strip())
 
 
 # ============================================================================================================
@@ -455,6 +468,19 @@ class _SeenCache:
 
 _seen_countries = _SeenCache()
 _seen_devices = _SeenCache()
+_seen_networks = _SeenCache()
+
+
+def clean_display_name(raw: Any) -> Optional[str]:
+    """F18: provider-supplied names (Google `name`) are untrusted text: NFC, no control/format characters, no angle
+    brackets, whitespace collapsed, ≤ 64 chars."""
+    import unicodedata
+    if not isinstance(raw, str):
+        return None
+    s = unicodedata.normalize("NFC", raw)
+    s = "".join(ch for ch in s if unicodedata.category(ch) not in ("Cc", "Cf") and ch not in "<>")
+    s = " ".join(s.split())[:64].strip()
+    return s or None
 
 
 def _referral_code_from(request: Request, claims: dict[str, Any], svc: Services) -> Optional[str]:
@@ -468,18 +494,32 @@ def _referral_code_from(request: Request, claims: dict[str, Any], svc: Services)
 def _create_user(conn: Any, svc: Services, request: Request, claims: dict[str, Any], ip_hash: Optional[str]) -> dict:
     uid = str(claims["uid"])
     referrer_id: Optional[str] = None
+    ref_reasons: tuple[str, ...] = ()
     code = _referral_code_from(request, claims, svc)
+    # the signup device and network (peppered) — compared with the referrer's before the binding (F7/M2)
+    from app.api import login_events
+    from app.api.referral_guard import self_referral_check
+    dev_hash, _ = login_events.device_key({k.lower(): val for k, val in request.headers.items()
+                                          if k.lower() in ("user-agent", "x-device-id")}, svc.config.pepper)
+    net_hash = login_events.network_hash(client_ip(request), svc.config.pepper)
     if code:
         ref = svc.store.get_user_by_referral_code(conn, code)
         if ref and ref.get("status") == "active":
-            referrer_id = str(ref["id"])
+            blocked, ref_reasons = self_referral_check(conn, svc, referrer=ref, referee={"id": None},
+                                                       referee_devices=[dev_hash], referee_networks=[net_hash])
+            if blocked:
+                svc.audit.write(conn, actor=f"firebase:{uid[:64]}", action="referral.self_referral_blocked",
+                                target=f"user:{ref['id']}", payload={"reasons": list(ref_reasons), "at": "signup"},
+                                ip_hash=ip_hash)
+            else:
+                referrer_id = str(ref["id"])
     user = None
     for _ in range(5):  # referral code collision → retry with a fresh code
         user = svc.store.create_user(
             conn,
             firebase_uid=uid,
             email=(claims.get("email") or None),
-            display_name=(claims.get("name") or None),
+            display_name=clean_display_name(claims.get("name")),
             referral_code=svc.domain.generate_referral_code(),
             referred_by=referrer_id,
             mfa_enrolled=True,
@@ -489,8 +529,14 @@ def _create_user(conn: Any, svc: Services, request: Request, claims: dict[str, A
     if user is None:
         raise Conflict("could not allocate referral code")
     if user.get("_created"):
+        if dev_hash and hasattr(svc.store, "set_device_fp_hash"):
+            svc.store.set_device_fp_hash(conn, str(user["id"]), dev_hash)
+        if referrer_id and ref_reasons:   # e.g. same network: bound, but flagged (no reward until ops clears it)
+            from app.api.referral_guard import flag_self_referral
+            flag_self_referral(conn, svc, referee_id=str(user["id"]), referrer_id=referrer_id, reasons=ref_reasons,
+                               where="signup")
         svc.audit.write(conn, actor=f"user:{user['id']}", action="user.created", target=f"user:{user['id']}",
-                        payload={"referred_by": referrer_id}, ip_hash=ip_hash)
+                        payload={"referred_by": referrer_id, "referral_flags": list(ref_reasons)}, ip_hash=ip_hash)
     return user
 
 
@@ -547,6 +593,9 @@ def current_user(request: Request, svc: Services = Depends(get_services)) -> Aut
             conn, svc, user=user, claims=claims, country=country, device_hash=dev_hash, device_label_=dev_label,
             ip_hash=ip_hash, check_country=bool(country) and _seen_countries.add(f"{user['id']}:{country}"),
             check_device=bool(dev_hash) and _seen_devices.add(f"{user['id']}:{dev_hash}"))
+        net = login_events.network_hash(client_ip(request), cfg.pepper)
+        if net and hasattr(svc.store, "record_ip_net") and _seen_networks.add(f"{user['id']}:{net}"):
+            svc.store.record_ip_net(conn, str(user["id"]), net)
     ctx = AuthCtx(user=user, claims=claims, ip_hash=ip_hash, ua_hash=ua_hash, request_id=request_id(request),
                   country=country)
     request.state.user_id = ctx.user_id
@@ -578,9 +627,23 @@ def step_up_user(ctx: AuthCtx = Depends(consented_user), svc: Services = Depends
     return ctx
 
 
-def admin_user(ctx: AuthCtx = Depends(consented_user)) -> AuthCtx:
+def check_admin_allowlist(ctx: AuthCtx, svc: Services) -> None:
+    """F12: the DB role alone is not enough — the verified sign-in email must be on ADMIN_EMAILS. Prod without the
+    list refuses every admin (and main._check_prod_config refuses to start the api)."""
+    allow = svc.config.admin_emails
+    if not allow:
+        if svc.settings.is_prod:
+            raise Forbidden("admin access is not configured", reason="admin_allowlist_missing")
+        return
+    email = str(ctx.claims.get("email") or "").strip().lower()
+    if ctx.claims.get("email_verified") is not True or email not in allow:
+        raise Forbidden("admin only", reason="admin_not_allowlisted")
+
+
+def admin_user(ctx: AuthCtx = Depends(consented_user), svc: Services = Depends(get_services)) -> AuthCtx:
     if ctx.role != "admin":
         raise Forbidden("admin only")
+    check_admin_allowlist(ctx, svc)
     return ctx
 
 

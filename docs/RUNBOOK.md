@@ -270,12 +270,14 @@ Platform side (many users lapse at once, or nobody receives Telegram alerts):
 
 ### 13.3 Held USDC deposits: `suspense:usdc_unattributed` release (maker-checker)
 
-`deposits-scan` books a treasury transfer it cannot credit (sender not a verified wallet, amount below the minimum, …) **once**: debit `treasury:hl_usdc` / credit `suspense:usdc_unattributed` (kind `deposit_held`, key `usdc_hl:{hash}`) and raises the ops event `topup_held` (and the user's `topup_held` alert when the sender is known). A later wallet verification does **not** credit it automatically (the key is taken).
-1. **Maker** (Admin A): identify the owner — the user proves control of the sending address (signed message via wallet verification) or it is refunded to the sender; record the tx hash, amount, sender and evidence in the ops log.
-2. **Checker** (Admin B ≠ A) reviews the evidence.
-3. Post **one** ledger transaction, idempotency key `suspense_release:{hash}`: debit `suspense:usdc_unattributed` / credit `user:{id}:fee_balance` for the held amount (or, for a refund, debit `suspense:usdc_unattributed` / credit `treasury:hl_usdc` together with the treasury `usdSend` back to the sender through the payout procedure §5).
-4. **[GAP — backend]** there is no admin-console action for step 3 yet. Until it exists, do not improvise SQL (the ledger is hash-chained and append-only): leave the funds in suspense (they are safe and fully booked) and tell the user the credit is pending review.
-5. Daily: `suspense:usdc_unattributed` balance = Σ open held items; any unexplained balance is a reconciliation mismatch (§6).
+`deposits-scan` books a treasury transfer it cannot credit (sender not a verified wallet, amount below the minimum, …) **once**: debit `treasury:hl_usdc` / credit `suspense:usdc_unattributed` (kind `deposit_held`, key `usdc_hl:{hash}`), records the on-chain sender in `usdc_held_deposits`, and raises the ops event `topup_held` (and the user's `topup_held` alert when the sender is known). A later wallet verification does **not** credit it automatically (the key is taken). Release it in the admin console, **Admin → Held deposits** (API: `/v1/admin/held-deposits…`, API_CONTRACT):
+1. **Maker** (Admin A, step-up): identify the owner and record the evidence (ops-log reference) in the proposal:
+   - **Attribute** — only to the user whose **verified wallet is the sending address** (they prove control by the normal wallet verification, a signed message; the server refuses otherwise). You cannot attribute to yourself.
+   - **Refund** — back to the on-chain sender (recorded by the scan; for transfers held before that existed, enter the sender from the explorer — the server verifies it against the transfer on-chain).
+2. **Checker** (Admin B ≠ A, step-up; never the beneficiary) reviews the evidence and approves (or rejects — the transfer is then open for a new proposal). Approval posts **one** ledger transaction, key `suspense_release:{hash}`: attribute → `user:{id}:fee_balance` (plus a withdrawable USDC `deposits` row and the user's `topup_credited` alert); refund → `refunds:usdc_pending`.
+3. **Refund only — send:** an officer with the treasury hardware wallet clicks *Sign & send refund*: the console builds the `usdSend` to the recorded sender for the held amount; check destination and amount **on the device** (§5 step 4). The tx hash is found automatically (or pasted), verified on-chain by the server, and posted: `refunds:usdc_pending` → `treasury:hl_usdc` (key `suspense_refund:{hash}:sent`). Refunds are not blocked by `PAYOUTS_ENABLED` (it is the sender's own money); they still need two admins + the hardware wallet.
+4. Never improvise SQL (the ledger is hash-chained and append-only; `suspense_releases` rows cannot be re-opened or edited — DB trigger).
+5. Daily: `suspense:usdc_unattributed` balance (shown on the tab) = Σ open held transfers; `refunds:usdc_pending` = Σ approved refunds not yet sent. Any unexplained balance is a reconciliation mismatch (§6).
 
 ### 13.4 `fill_after_settlement` (critical)
 
@@ -304,4 +306,11 @@ Meaning: at the 00:30 `settle-daily` run, `fills-ingest` and/or `funding-scan` h
 3. Still deferred after 06:30: no money is lost — the next day's 00:30 run settles both days in one posting (PnL is summed from the subscription's own `pnl_cursor`), but the user's profit share, renewal and past-due status are a day late. Fix the data job the same day; never settle by editing `job_cursors` by hand.
 4. `missing` lists an address that is no longer tracked (a subscription cancelled > 7 days ago, still unsettled): the data jobs no longer scan it; a cancelled subscription only needs coverage up to its `cancelled_at`, so this means the data never reached that point — SEV3, investigate before touching anything.
 5. `settle-daily-retry` was added after go-live on existing projects: `bootstrap.sh scheduler` creates it **paused**; resume it by name (`gcloud scheduler jobs resume settle-daily-retry --location=asia-southeast1`) once `settle-daily` itself is live.
+
+### 13.8 Hyperliquid rate budget (`hl_rate_budget`)
+
+Every Hyperliquid `/info` call from the executor (tick, data jobs, reconcile) charges one shared per-egress-IP counter in Postgres (`app/hl/budget.py`): `HL_BUDGET_WEIGHT_PER_MINUTE` (default 800; Hyperliquid's own limit is ~1200/min/IP, UNVERIFIED) with `HL_TICK_RESERVE_PER_MINUTE` (300) kept for the tick. The tick is always charged and never blocked; data jobs and reconcile wait for the next minute when their share is spent and stop cleanly at their deadline (cursors resume next run). Request weights are code config (`app.config.HlLimits`, UNVERIFIED — check against Hyperliquid's docs).
+- Symptoms of pressure: executor log `hl_budget_wait` (jobs backing off), `hl_budget_over` (the tick alone exceeded the budget), data jobs ending with `remaining` > 0 several runs in a row, `settlement_deferred` (§13.7), Hyperliquid 429s (`hl_info_retry` status 429).
+- Current usage: `SELECT slot, window_start, spent_tick, spent_jobs FROM hl_rate_budget ORDER BY window_start DESC LIMIT 10;` (read-only; never edit rows by hand).
+- Too little room for jobs (candles backfill, many subscribers): raise `HL_BUDGET_WEIGHT_PER_MINUTE` carefully (stay well below Hyperliquid's limit) or lower the tick reserve; redeploy the executor. If the budget table is unreachable the calls are allowed (fail open, logged `hl_budget_unavailable`).
 

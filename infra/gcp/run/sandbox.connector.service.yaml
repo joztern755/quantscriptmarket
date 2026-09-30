@@ -23,7 +23,7 @@ spec:
         commit: ${GIT_SHA_SHORT}
       annotations:
         autoscaling.knative.dev/minScale: "0"
-        autoscaling.knative.dev/maxScale: "5"
+        autoscaling.knative.dev/maxScale: "10"
         run.googleapis.com/execution-environment: ${SANDBOX_EXEC_ENV}
         run.googleapis.com/cpu-throttling: "false"
         # fallback when Direct VPC egress is unavailable for gen1: connector inside the isolated VPC
@@ -31,7 +31,7 @@ spec:
         run.googleapis.com/vpc-access-egress: all-traffic
     spec:
       serviceAccountName: ${SA_SANDBOX}
-      containerConcurrency: 4
+      containerConcurrency: 1
       timeoutSeconds: 300
       containers:
         - name: sandbox
@@ -46,7 +46,7 @@ spec:
           env:
             - {name: APP_ENV, value: prod}
             - {name: SERVICE_ROLE, value: sandbox}
-            - {name: SANDBOX_MAX_CONCURRENT, value: "4"}
+            - {name: SANDBOX_MAX_CONCURRENT, value: "1"}
             - name: SANDBOX_SHARED_SECRET
               valueFrom: {secretKeyRef: {name: SANDBOX_SHARED_SECRET, key: latest}}
           startupProbe:

@@ -4,6 +4,7 @@
 import { api, ApiError } from "./api.js";
 import { isAddress, toChecksumAddress } from "./keccak.js";
 import { emptyState, h, modal, note } from "./ui.js";
+import { stripeWasLoaded } from "./stripe.js";
 
 export { toChecksumAddress } from "./keccak.js";
 
@@ -53,6 +54,10 @@ function listen(): void {
     const info = sanitizeInfo(e.detail?.info);
     const provider = e.detail?.provider as Eip1193Provider | undefined;
     if (!info || !provider || typeof provider.request !== "function") return;
+    // SECURITY L14: the FIRST announcer of a uuid wins — a later (possibly malicious) extension re-announcing the
+    // same uuid cannot silently replace the provider the user picks; the same provider object is listed once.
+    if (announced.has(info.uuid)) return;
+    for (const a of announced.values()) if (a.provider === provider) return;
     announced.set(info.uuid, { info, provider });
   }) as EventListener);
 }
@@ -65,7 +70,7 @@ export async function discoverWallets(waitMs = 350): Promise<Announced[]> {
   const list = [...announced.values()];
   const legacy = (window as unknown as { ethereum?: Eip1193Provider & { isMetaMask?: boolean } }).ethereum;
   if (!list.length && legacy && typeof legacy.request === "function") {
-    list.push({ info: { uuid: "legacy", name: legacy.isMetaMask ? "MetaMask" : "Browser wallet", icon: "", rdns: "" }, provider: legacy });
+    list.push({ info: { uuid: "legacy", name: legacy.isMetaMask ? "MetaMask (legacy, unverified)" : "Browser wallet (legacy, unverified)", icon: "", rdns: "" }, provider: legacy });
   }
   return list;
 }
@@ -81,6 +86,22 @@ function walletError(err: unknown): ApiError {
   if (e?.code === -32002) return new ApiError(0, "wallet_pending", "Your wallet already has a pending request. Open the wallet to continue.");
   if (e?.code === 4902) return new ApiError(0, "wallet_chain", "That network isn't added to your wallet.");
   return new ApiError(0, "wallet_error", e?.message ? `Wallet error: ${String(e.message).slice(0, 200)}` : "Wallet error.");
+}
+
+/** Reload before any signature in a document that ever loaded Stripe.js (SECURITY M2; see core/stripe.ts). */
+async function ensureSigningIsolation(): Promise<void> {
+  if (!stripeWasLoaded()) return;
+  const m = modal({
+    title: "Reload before signing",
+    body: h("div", { class: "stack" },
+      h("p", null, "A card-payment script (Stripe) was loaded in this page. For your safety, aijalon.trade reloads the page before any wallet signature."),
+      h("p", { class: "small muted" }, "Your progress is saved. After the reload, press the same button again.")),
+    actions: [{ label: "Reload now", kind: "primary" }],
+    dismissible: false,
+  });
+  await m.closed;
+  location.reload();
+  throw new ApiError(0, "reload_required", "The page reloads before signing. Nothing was signed.");
 }
 
 export class Wallet {
@@ -128,6 +149,7 @@ export class Wallet {
   }
 
   async signTypedDataV4(typed: TypedData): Promise<`0x${string}`> {
+    await ensureSigningIsolation();
     await this.assertAccount();
     const chainId = await this.chainId();
     if (typed.domain.chainId !== chainId) throw new ApiError(0, "wallet_chain_mismatch", "Your wallet changed network. Please try again.");
@@ -142,6 +164,7 @@ export class Wallet {
   }
 
   async personalSign(message: string): Promise<`0x${string}`> {
+    await ensureSigningIsolation();
     await this.assertAccount();
     let sig: unknown;
     try {
@@ -182,18 +205,28 @@ export function getConnectedWallet(): Wallet | null {
   return connected;
 }
 
+/** Names announced by more than one provider (a spoofing signal worth showing to the user). */
+export function duplicateWalletNames(list: { info: WalletInfo }[]): Set<string> {
+  const seen = new Map<string, number>();
+  for (const w of list) seen.set(w.info.name.toLowerCase(), (seen.get(w.info.name.toLowerCase()) ?? 0) + 1);
+  return new Set([...seen].filter(([, n]) => n > 1).map(([k]) => k));
+}
+
 function pickDialog(list: Announced[]): Promise<Announced | null> {
   return new Promise((resolve) => {
     let chosen: Announced | null = null;
+    const dup = duplicateWalletNames(list);
     const m = modal({
       title: "Choose a wallet",
       body: h("div", { class: "stack" },
-        h("p", { class: "muted small" }, "Use the wallet that controls your Hyperliquid account."),
+        h("p", { class: "muted small" }, "Use the wallet that controls your Hyperliquid account. Check the extension id under each name."),
+        dup.size ? note("Two wallet extensions claim the same name. One of them may be impersonating the other — pick by the extension id you trust, or disable the extension you don't recognise.", "bad") : null,
         h("div", { class: "wallet-list" }, list.map((w) =>
           h("button", {
             type: "button", class: "wallet-opt",
             onclick: () => { chosen = w; m.close(); },
-          }, w.info.icon ? h("img", { src: w.info.icon, alt: "", width: 28, height: 28 }) : h("span", { class: "wallet-ph", "aria-hidden": "true" }), h("span", null, w.info.name))))),
+          }, w.info.icon ? h("img", { src: w.info.icon, alt: "", width: 28, height: 28 }) : h("span", { class: "wallet-ph", "aria-hidden": "true" }),
+          h("span", { class: "stack tight" }, h("span", null, w.info.name, dup.has(w.info.name.toLowerCase()) ? " ⚠" : ""), h("span", { class: "small muted mono" }, w.info.rdns || (w.info.uuid === "legacy" ? "window.ethereum (no EIP-6963 id)" : "no extension id announced"))))))),
       actions: [{ label: "Cancel", kind: "plain" }],
     });
     m.closed.then(() => resolve(chosen));
@@ -214,7 +247,8 @@ export async function connectWallet(): Promise<Wallet | null> {
     await m.closed;
     return null;
   }
-  const pick = list.length === 1 ? list[0]! : await pickDialog(list);
+  // Always an explicit user choice showing name + extension id (rdns), even with one provider (SECURITY L14).
+  const pick = await pickDialog(list);
   if (!pick) return null;
   let accs: unknown;
   try {

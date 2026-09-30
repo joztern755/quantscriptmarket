@@ -191,6 +191,7 @@ Plain values are rendered into `infra/gcp/run/*.yaml` at deploy time (`infra/gcp
 | `WEB_ORIGIN`, `API_ORIGIN` | api, executor | plain | `https://aijalon.trade`, `https://api.aijalon.trade` | template (`env.sh` domains) |
 | `DATABASE_URL` | api, executor | plain (no password: IAM auth via the proxy sidecar) | `postgresql://<sa>.iam@127.0.0.1:5432/aijalon?…` | template |
 | `KMS_KEY_NAME` | api, executor | plain | `projects/…/cryptoKeys/agent-keys` | template (`env.sh`) |
+| `CREATOR_CODE_KMS_KEY_NAME` | api, executor | plain | `projects/…/cryptoKeys/creator-code` — dedicated creator-code KEK (api encrypt-only, executor decrypt-only; must differ from `KMS_KEY_NAME`, prod refuses to start otherwise) | template (`env.sh` `KMS_CODE_KEY_NAME`) |
 | `HL_API_URL`, `HL_IS_MAINNET`, `AGENT_NAME` | api, executor | plain | `https://api.hyperliquid.xyz`, `true`, `aijalon` | template |
 | `SANDBOX_URL` | api, executor | plain | sandbox service URL | deploy.sh (`gcloud run services describe`) |
 | `SIGNALS_URL` | executor | plain | `https://aijalon-terminal.web.app/signals.json` (= config default; api uses the default) | template |
@@ -463,7 +464,7 @@ The authoring environment had no access to Google Cloud, Cloudflare, PyPI or Doc
 
 | Item | Symptom | Fallback |
 |---|---|---|
-| Browser POST to `https://api.hyperliquid.xyz/exchange` (agent/builder approvals, USDC deposit `usdSend`) allowed by Hyperliquid CORS | wallet step fails with a CORS error in the console | a thin server relay endpoint that forwards the user-signed action unchanged (backend change; the API never signs) |
+| Browser POST to `https://api.hyperliquid.xyz/exchange` (agent/builder approvals, USDC deposit `usdSend`) allowed by Hyperliquid CORS | wallet step fails with a CORS error in the console | built in: the web falls back automatically to `POST /v1/hl/exchange-relay` (validated approveAgent / approveBuilderFee / usdSend-to-treasury only, forwarded unchanged; the API never signs). Verify the direct path anyway: the relay makes every approval pass through our API and its egress IP |
 | Cloud Scheduler counted as "internal" for executor's `ingress: internal` | Scheduler jobs get 404/403 | set executor ingress to `internal-and-cloud-load-balancing` (no LB points at it, so it stays unreachable) — or front the jobs with Pub/Sub push |
 | Direct VPC egress with the gen1 (gVisor) sandbox | `services replace` rejects the sandbox spec | `SANDBOX_EGRESS_MODE=connector ./infra/gcp/bootstrap.sh network` then deploy (connector inside the isolated VPC, same deny-all firewall) |
 | IAM conditions on `roles/cloudsql.client` / `instanceUser` | proxy sidecar logs 403 | `SQL_IAM_CONDITIONS=0 ./infra/gcp/bootstrap.sh sa` |

@@ -394,8 +394,13 @@ def verify_and_parse(
     max_bar_age_days: int = DEFAULT_MAX_BAR_AGE_DAYS,
     expected_script_sha256: Mapping[str, str] | None = None,
     last_accepted: Mapping[str, SignalRecord] | None = None,
+    require_script_pin: bool = False,
 ) -> SignalBatch:
-    """Authenticate and strictly validate one feed. Raises a ``SignalRejected`` subclass on any mismatch."""
+    """Authenticate and strictly validate one feed. Raises a ``SignalRejected`` subclass on any mismatch.
+
+    ``require_script_pin`` (REVIEW_TRADING_KEYS F4; the ingest job always sets it): every listed strategy must have a
+    pinned ``expected_script_sha256`` — the feed's own ``engine_sha256`` is controlled by whoever holds the signing
+    key, so without a pin a compromised terminal repo could sign a different, validly-hashed engine."""
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware (UTC)")
     now = now.astimezone(timezone.utc)
@@ -504,6 +509,9 @@ def verify_and_parse(
             raise fail(SignalStatusNotTrading, "listed strategy's script no longer trades (holds)", strategy_key=lk,
                        markets=lk_markets)
         want = (expected_script_sha256 or {}).get(lk)
+        if want is None and require_script_pin:
+            raise fail(SignalEngineMismatch, "listed strategy version has no pinned script hash", strategy_key=lk,
+                       markets=lk_markets)
         if want is not None and want != r.script_sha256:
             raise fail(SignalEngineMismatch, "script hash differs from the pinned strategy version", strategy_key=lk,
                        expected=want, got=r.script_sha256, markets=lk_markets)
@@ -586,6 +594,7 @@ def fetch_signals(
     last_accepted: Mapping[str, SignalRecord] | None = None,
     timeout: Any = DEFAULT_TIMEOUT,
     allow_http: bool = False,
+    require_script_pin: bool = False,
 ) -> SignalBatch:
     """Fetch ``signals.json`` + ``signals.sig`` (HTTPS, no redirects, timeout, 1 MB cap) and ``verify_and_parse`` them.
 
@@ -623,6 +632,7 @@ def fetch_signals(
         body, sig, pubkey_b64=pubkey_b64 or "", now=now or datetime.now(timezone.utc), listed_keys=listed_keys,
         max_age_hours=max_age_hours, max_bar_age_days=max_bar_age_days,
         expected_script_sha256=expected_script_sha256, last_accepted=last_accepted,
+        require_script_pin=require_script_pin,
     )
 
 

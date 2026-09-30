@@ -92,9 +92,10 @@ export async function verifyAgentAttestation(p: { userId: string; agentAddress: 
     if (!raw) return false;
     const subtle = globalThis.crypto?.subtle;
     if (!subtle) return false;
-    const key = await subtle.importKey("spki", spki, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    const ab = (u: Uint8Array): ArrayBuffer => u.slice().buffer as ArrayBuffer;
+    const key = await subtle.importKey("spki", ab(spki), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
     const msg = new TextEncoder().encode(agentAttestationMessage(p.userId, p.agentAddress));
-    return await subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, raw, msg);
+    return await subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, ab(raw), ab(msg));
   } catch {
     return false;
   }

@@ -9,9 +9,11 @@ refuses any other ``service_role`` in prod).
   plaintext is a ``bytearray`` zeroized when the ``with`` block exits (after the orders are signed).
 
 ``CreatorCodeDecryptor``
-  A DEDICATED decryptor instance for creator strategy code (never the agent-key provider's): AAD
-  ``strategy_code:{strategy_id}:{code_hash}`` exactly as ``app.api.routers.creator.upload_version`` sealed it, and
-  the plaintext must hash to ``code_hash``.
+  A DEDICATED decryptor for creator strategy code over the DEDICATED ``creator-code`` KMS key
+  (``app.security.kms.make_code_decryptor``; REVIEW_TRADING_KEYS F2) — never the agent-key provider's decryptor or
+  key. Record AAD ``app.security.kms.creator_code_aad(strategy_id, code_hash)`` exactly as
+  ``app.api.routers.creator.upload_version`` sealed it, and the plaintext must hash to ``code_hash``. Code sealed under
+  the old scheme (agent-keys KEK, AAD ``strategy_code:…``) does not open (DecryptionFailed) — re-upload it.
 """
 from __future__ import annotations
 
@@ -82,12 +84,22 @@ class DbAgentKeyProvider:
 
 
 def creator_code_aad(strategy_id: str, code_hash: str) -> bytes:
-    return f"strategy_code:{strategy_id}:{code_hash}".encode()
+    from app.security.kms import creator_code_aad as _aad
+
+    return _aad(strategy_id, code_hash)
+
+
+def _code_factory(settings: Any) -> Callable[[], Any]:
+    def build() -> Any:
+        from app.security.kms import make_code_decryptor
+
+        return make_code_decryptor(settings)
+    return build
 
 
 class CreatorCodeDecryptor:
     def __init__(self, *, settings: Any = None, decryptor_factory: Callable[[], Any] | None = None) -> None:
-        self._dec = _LazyDecryptor(decryptor_factory or _default_factory(settings))
+        self._dec = _LazyDecryptor(decryptor_factory or _code_factory(settings))
 
     def open_source(self, *, strategy_id: str, code_hash: str, ciphertext: bytes) -> str:
         """Decrypt + verify sha256(plaintext) == code_hash; returns the source text (the bytearray is wiped)."""

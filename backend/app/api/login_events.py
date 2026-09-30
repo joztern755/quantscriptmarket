@@ -11,16 +11,26 @@ and ``mfa_changed``*). Called by ``deps.current_user`` inside its transaction; n
 * MFA change: Firebase ID tokens of an MFA sign-in carry ``firebase.second_factor_identifier`` (the enrolled
   factor's id). Its HMAC is kept in ``users.mfa_factor_hash`` (0008); the first one is stored silently, a different
   one → ``mfa_changed`` + audit ``auth.mfa_changed``. Tokens without the claim are ignored (never an alert).
-Raw device ids / factor ids are never stored or logged — only peppered hashes.
+* Security hold (REVIEW_AUTH_API F5): a new device / new country sign-in or an MFA change puts the account on a
+  48 h hold (``users.security_hold_until``, 0011): no withdrawal or payout request, and no second approval of one,
+  until it passes (app.api.billing_ops.require_no_payout_hold).
+* Sign-in network (F7): ``network_hash`` = HMAC(pepper, "ipnet" ‖ IPv4 /24 or IPv6 /64 prefix) → user_ip_nets, used
+  by the self-referral heuristics (same network as the referrer → the referee is flagged, no referral reward).
+Raw device ids / factor ids / IPs are never stored or logged — only peppered hashes.
 """
 from __future__ import annotations
 
+import ipaddress
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 
 from app.api import validation as v
 
-__all__ = ["device_key", "device_label", "mfa_factor_hash", "record_sign_in", "DEVICE_ID_RE"]
+__all__ = ["device_key", "device_label", "mfa_factor_hash", "network_hash", "record_sign_in", "DEVICE_ID_RE",
+           "SECURITY_HOLD"]
+
+SECURITY_HOLD = timedelta(hours=48)
 
 DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _VERSIONS = re.compile(r"[0-9._]+")
@@ -71,6 +81,31 @@ def device_key(headers: Mapping[str, str], pepper: bytes | str) -> tuple[Optiona
     return v.hash_identifier(key, pepper, domain="device"), device_label(ua)
 
 
+def network_hash(ip: Optional[str], pepper: bytes | str) -> Optional[str]:
+    """Peppered hash of the sign-in network: IPv4 /24, IPv6 /64 (IPv4-mapped IPv6 → IPv4). None for no/invalid IP."""
+    if not ip:
+        return None
+    try:
+        addr = ipaddress.ip_address(str(ip).strip())
+    except ValueError:
+        return None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    prefix = 24 if isinstance(addr, ipaddress.IPv4Address) else 64
+    net = ipaddress.ip_network(f"{addr}/{prefix}", strict=False)
+    return v.hash_identifier(str(net), pepper, domain="ipnet")
+
+
+def _hold(conn: Any, svc: Any, uid: str) -> None:
+    """48 h money-out hold after a security event (F5). The API store always has it; minimal fakes may not."""
+    extend = getattr(svc.store, "extend_security_hold", None)
+    if extend is None:
+        return
+    clock = getattr(svc, "now", None)
+    now = clock() if callable(clock) else datetime.now(timezone.utc)
+    extend(conn, uid, now + SECURITY_HOLD)
+
+
 def mfa_factor_hash(claims: Mapping[str, Any], pepper: bytes | str) -> Optional[str]:
     fb = claims.get("firebase") or {}
     fid = fb.get("second_factor_identifier") if isinstance(fb, Mapping) else None
@@ -102,6 +137,7 @@ def record_sign_in(conn: Any, svc: Any, *, user: Mapping[str, Any], claims: Mapp
                         target=actor, payload={k: val for k, val in payload.items() if k != "reason"},
                         ip_hash=ip_hash)
         raised.append("new_device_login")
+        _hold(conn, svc, uid)
 
     fh = mfa_factor_hash(claims, svc.config.pepper)
     if fh is not None:
@@ -114,4 +150,5 @@ def record_sign_in(conn: Any, svc: Any, *, user: Mapping[str, Any], claims: Mapp
                 svc.audit.write(conn, actor=actor, action="auth.mfa_changed", target=actor, payload={},
                                 ip_hash=ip_hash)
                 raised.append("mfa_changed")
+                _hold(conn, svc, uid)
     return raised

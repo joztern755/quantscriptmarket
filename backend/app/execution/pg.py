@@ -52,6 +52,7 @@ __all__ = [
     "PgDatabase", "PgSubscriptionRepo", "PgSignalRepo", "PgFlagRepo", "PgLockProvider", "PgSettlementRepo",
     "PgReconcileRepo", "PgReferralLookup", "PgUnitOfWork", "PgLedger", "PgAlertRepo", "PgMarketPauseFlags",
     "PgContactDirectory", "PgReconciliationStore", "PgReferralTierRepo", "PgCreatorSignalRepo", "PgUserEvents",
+    "PgPendingReleaser", "PgChainVerifier",
     "as_datetime", "as_bytes", "json_dumps",
 ]
 
@@ -592,30 +593,53 @@ class PgSettlementRepo:
         self._cols: frozenset[str] | None = None
 
     def _pnl_columns(self) -> frozenset[str]:
-        """Attribution columns added by the data-jobs migration (0006): fills.net_pnl_micro (exact
-        floor((closedPnl − fee)·1e6)) and funding_events.attributed_micro (the subscription's share of an account
-        payment). Used when present; before 0006 the legacy columns are the only source."""
+        """Optional columns, used when present: fills.net_pnl_micro / funding_events.attributed_micro (0006),
+        fills.book_pnl_micro + the ps_settlement_date claim markers + fills.oid_verified (0010, REVIEW_MONEY H1/M3/H2),
+        subscriptions.price_monthly_micro / profit_share_bps (0011: terms pinned at subscribe, M8)."""
         if self._cols is None:
             rows = self.db.all("""
                 SELECT table_name || '.' || column_name AS c FROM information_schema.columns
                  WHERE table_schema = 'public'
-                   AND ((table_name = 'fills' AND column_name = 'net_pnl_micro')
-                        OR (table_name = 'funding_events' AND column_name = 'attributed_micro'))""")
+                   AND ((table_name = 'fills' AND column_name IN ('net_pnl_micro', 'book_pnl_micro',
+                                                                  'ps_settlement_date', 'oid_verified'))
+                        OR (table_name = 'funding_events' AND column_name IN ('attributed_micro', 'ps_settlement_date'))
+                        OR (table_name = 'subscriptions' AND column_name IN ('price_monthly_micro', 'profit_share_bps'))
+                        OR (table_name = 'subscription_pnl_events' AND column_name = 'ps_settlement_date'))""")
             self._cols = frozenset(str(r["c"]) for r in rows)
         return self._cols
 
+    def _claims(self) -> bool:
+        c = self._pnl_columns()
+        return {"fills.ps_settlement_date", "funding_events.ps_settlement_date",
+                "subscription_pnl_events.ps_settlement_date"} <= c
+
     def subscriptions_to_settle(self) -> Sequence[SettlementSubscription]:
-        rows = self.db.all("""
+        cols = self._pnl_columns()
+        bps = ("coalesce(s.profit_share_bps, st.profit_share_bps, 0)" if "subscriptions.profit_share_bps" in cols
+               else "coalesce(st.profit_share_bps, 0)")
+        price = ("coalesce(s.price_monthly_micro, st.price_monthly_micro, 0)"
+                 if "subscriptions.price_monthly_micro" in cols else "coalesce(st.price_monthly_micro, 0)")
+        # M3: a cancelled subscription stays in scope while it has unclaimed PnL rows (late fills after its last
+        # settlement are booked by the next one; funding after cancelled_at is never attributed)
+        late = ("""
+                OR (s.status = 'cancelled' AND s.cancelled_at IS NOT NULL AND (
+                        EXISTS (SELECT 1 FROM fills f WHERE f.subscription_id = s.id AND f.ps_settlement_date IS NULL)
+                     OR EXISTS (SELECT 1 FROM subscription_pnl_events pe
+                                 WHERE pe.subscription_id = s.id AND pe.ps_settlement_date IS NULL)
+                     OR EXISTS (SELECT 1 FROM funding_events e WHERE e.subscription_id = s.id
+                                   AND e.ps_settlement_date IS NULL AND e.time <= s.cancelled_at)))"""
+                if self._claims() else "")
+        rows = self.db.all(f"""
             SELECT s.id::text AS id, s.user_id::text AS user_id, s.strategy_id::text AS strategy_id,
                    st.owner_user_id::text AS creator_user_id, st.in_house, s.status::text AS status,
-                   coalesce(st.profit_share_bps, 0) AS profit_share_bps,
-                   coalesce(st.price_monthly_micro, 0) AS price_monthly_micro, s.cum_pnl_micro, s.hwm_micro,
+                   {bps} AS profit_share_bps,
+                   {price} AS price_monthly_micro, s.cum_pnl_micro, s.hwm_micro,
                    s.pnl_cursor, s.current_period_end, s.past_due_since, s.created_at, s.trading_address,
                    s.cancelled_at
               FROM subscriptions s JOIN strategies st ON st.id = s.strategy_id
              WHERE s.status IN ('active', 'past_due', 'reduce_only', 'paused_user', 'closing')
                 OR (s.status = 'cancelled' AND s.cancelled_at IS NOT NULL
-                    AND (s.pnl_cursor IS NULL OR s.pnl_cursor <= s.cancelled_at))
+                    AND (s.pnl_cursor IS NULL OR s.pnl_cursor <= s.cancelled_at)){late}
              ORDER BY s.created_at, s.id""")
         return [SettlementSubscription(
             id=r["id"], user_id=r["user_id"], strategy_id=r["strategy_id"], creator_user_id=r["creator_user_id"],
@@ -676,6 +700,43 @@ class PgSettlementRepo:
             s=subscription_id, since=_ts(since), until=_ts(until))
         return PnlDelta(realized_micro=int(row["realized"]), funding_micro=int(row["funding"]), until=until)
 
+    def claim_pnl(self, subscription_id: str, until: datetime, settle_date: date) -> PnlDelta:
+        """REVIEW_MONEY M3 + H1: sum and mark every unclaimed row ≤ ``until`` (one data-modifying statement per table:
+        what is summed is exactly what is marked; a row committed later by fills-ingest is left for the next
+        settlement). Fills count with OUR book PnL (``book_pnl_micro``; rows ingested before 0010 fall back to
+        Hyperliquid's closedPnl − fee). Funding after cancelled_at is never attributed. Before 0010: window read."""
+        if not self._claims():
+            sub = self.db.one("SELECT pnl_cursor FROM subscriptions WHERE id = CAST(:s AS uuid)", s=subscription_id)
+            return self.pnl_since(subscription_id, as_datetime((sub or {}).get("pnl_cursor")), until)
+        row = self.db.one("""
+            WITH f AS (
+                UPDATE fills SET ps_settlement_date = CAST(:d AS date)
+                 WHERE subscription_id = CAST(:s AS uuid) AND ps_settlement_date IS NULL
+                   AND time <= CAST(:until AS timestamptz)
+                RETURNING coalesce(book_pnl_micro, net_pnl_micro, closed_pnl_micro - fee_micro) AS pnl),
+            e AS (
+                UPDATE funding_events SET ps_settlement_date = CAST(:d AS date)
+                 WHERE subscription_id = CAST(:s AS uuid) AND ps_settlement_date IS NULL
+                   AND time <= CAST(:until AS timestamptz)
+                   AND time <= coalesce((SELECT c.cancelled_at FROM subscriptions c WHERE c.id = CAST(:s AS uuid)),
+                                        CAST(:until AS timestamptz))
+                RETURNING coalesce(attributed_micro, 0) AS pnl),
+            a AS (
+                UPDATE subscription_pnl_events SET ps_settlement_date = CAST(:d AS date)
+                 WHERE subscription_id = CAST(:s AS uuid) AND ps_settlement_date IS NULL
+                   AND time <= CAST(:until AS timestamptz)
+                RETURNING pnl_micro AS pnl)
+            SELECT (SELECT coalesce(sum(pnl), 0)::bigint FROM f) AS realized,
+                   (SELECT coalesce(sum(pnl), 0)::bigint FROM e) AS funding,
+                   (SELECT coalesce(sum(pnl), 0)::bigint FROM a) AS adjustments""",
+            s=subscription_id, d=settle_date.isoformat(), until=_ts(until))
+        return PnlDelta(realized_micro=int(row["realized"]), funding_micro=int(row["funding"]), until=until,
+                        adjustments_micro=int(row["adjustments"]))
+
+    def lock_user(self, user_id: str) -> None:
+        """Same row lock as ``app.api.store.lock_user`` (inside the settlement's ``atomic()``)."""
+        self.db.all("SELECT 1 AS x FROM users WHERE id = CAST(:u AS uuid) FOR UPDATE", u=user_id)
+
     def save_profit_share(self, subscription_id: str, settle_date: date, *, cum_pnl_micro: int, hwm_micro: int,
                           pnl_cursor: datetime, ledger_tx_id: str | None) -> None:
         self.db.all("""
@@ -703,22 +764,35 @@ class PgSettlementRepo:
         self.db.all("UPDATE subscriptions SET current_period_end = CAST(:e AS timestamptz) WHERE id = CAST(:s AS uuid)",
                     s=subscription_id, e=_ts(period_end))
 
+    def _our_fill_fee_sql(self) -> str:
+        """Builder fee we may recognise for fill ``f`` (REVIEW_MONEY H2): only a fill of an order WE recorded for that
+        subscription whose exchange-assigned oid matches (``oid_verified``, set by fills-ingest), only when the fill
+        reports a builder fee > 0, and never more than notional × our builder rate (a user placing orders with our
+        cloid prefix and their own builder cannot mint builder revenue). Before 0010: cloid prefix only."""
+        rate = int(self.economics.builder_fee_tenths_bp)   # tenths of a bp → micro = px·sz·1e6·f/1e5 = px·sz·f·10
+        if "fills.oid_verified" not in self._pnl_columns():
+            return f"CASE WHEN lower(coalesce(f.cloid, '')) LIKE '{_OUR_CLOID_LIKE}' THEN f.builder_fee_micro ELSE 0 END"
+        return f"""CASE WHEN f.subscription_id IS NOT NULL AND f.oid_verified AND f.builder_fee_micro > 0
+                             AND EXISTS (SELECT 1 FROM orders o WHERE o.cloid = f.cloid
+                                            AND o.subscription_id = f.subscription_id AND o.oid = f.oid)
+                        THEN least(f.builder_fee_micro, floor(f.px * f.sz * {rate} * 10)::bigint)
+                        ELSE 0 END"""
+
     def unrecognised_builder_fee_fills(self, until: datetime, limit: int) -> Sequence[BuilderFeeFill]:
-        """Only fills of OUR orders (cloid prefix) carry OUR builder fee; a user's own trades through another
-        front-end may carry someone else's builder fee — those are marked recognised with nothing posted."""
-        rows = self.db.all("""
+        """Only fills of OUR recorded orders (oid verified) carry OUR builder fee; every other stored fill is marked
+        recognised with nothing posted (see ``_our_fill_fee_sql``)."""
+        rows = self.db.all(f"""
             SELECT f.tid::text AS tid, f.trading_address, f.subscription_id::text AS subscription_id,
                    s.user_id::text AS user_id, st.owner_user_id::text AS creator_user_id,
                    coalesce(st.in_house, false) AS in_house,
-                   CASE WHEN lower(coalesce(f.cloid, '')) LIKE CAST(:pfx AS text) THEN f.builder_fee_micro ELSE 0 END
-                       AS builder_fee_micro,
+                   {self._our_fill_fee_sql()} AS builder_fee_micro,
                    f.time
               FROM fills f
               LEFT JOIN subscriptions s ON s.id = f.subscription_id
               LEFT JOIN strategies st ON st.id = s.strategy_id
              WHERE f.builder_fee_recognised_at IS NULL AND f.time <= CAST(:u AS timestamptz)
              ORDER BY f.time, f.trading_address, f.tid
-             LIMIT CAST(:lim AS integer)""", pfx=_OUR_CLOID_LIKE, u=_ts(until), lim=int(limit))
+             LIMIT CAST(:lim AS integer)""", u=_ts(until), lim=int(limit))
         return [BuilderFeeFill(tid=r["tid"], subscription_id=r["subscription_id"], user_id=r["user_id"],
                                creator_user_id=r["creator_user_id"], in_house=bool(r["in_house"]),
                                builder_fee_micro=int(r["builder_fee_micro"]), time=as_datetime(r["time"]),
@@ -801,11 +875,112 @@ class PgLedger:
         return self._bound.balance(account_code)
 
 
+class PgPendingReleaser:
+    """``PendingReleaser`` over SQL ``ps_pending_release`` (0010, SECURITY DEFINER): uncollected profit share of a
+    user is released pro-rata to the creator payables / platform revenue once the user's debt shrinks."""
+
+    def __init__(self, db: PgDatabase, *, created_by: str = "system:settlement") -> None:
+        self.db = db
+        self.created_by = created_by
+
+    def available(self) -> bool:
+        row = self.db.one("SELECT to_regprocedure('ps_pending_release(uuid, text)') IS NOT NULL AS ok")
+        return bool(row and row["ok"])
+
+    def users_with_pending(self) -> Sequence[str]:
+        if not self.available():
+            return []
+        rows = self.db.all("""
+            SELECT DISTINCT split_part(a.code, ':', 2) AS user_id
+              FROM ledger_accounts a JOIN ledger_account_balances b ON b.account_id = a.id
+             WHERE a.code LIKE 'ps_pending:%' AND b.balance_micro < 0
+             ORDER BY 1""")
+        return [str(r["user_id"]) for r in rows]
+
+    def release(self, user_id: str) -> int:
+        row = self.db.one("SELECT ps_pending_release(CAST(:u AS uuid), CAST(:by AS text)) AS released",
+                          u=user_id, by=self.created_by)
+        return int((row or {}).get("released") or 0)
+
+    def pending_of(self, user_id: str) -> int:
+        row = self.db.one("""SELECT coalesce(sum(-b.balance_micro), 0)::bigint AS p
+                               FROM ledger_accounts a JOIN ledger_account_balances b ON b.account_id = a.id
+                              WHERE a.code LIKE CAST(:pfx AS text) AND b.balance_micro < 0""",
+                          pfx=f"ps_pending:{user_id}:%")
+        return int((row or {}).get("p") or 0)
+
+
+class PgChainVerifier:
+    """REVIEW_MONEY M7(a) / L4 / L5: ``verify_chain()`` (ledger transactions, audit log, ledger accounts, running
+    balances), ``verify_chain_anchors()`` (anchored heads still present and unchanged) and the daily anchor rows."""
+
+    def __init__(self, db: PgDatabase) -> None:
+        self.db = db
+
+    def problems(self) -> list[dict[str, Any]]:
+        return [{"chain": r["chain"], "seq": r.get("seq"), "reason": r["reason"]}
+                for r in self.db.all("SELECT chain, seq, reason FROM verify_chain()")]
+
+    def anchor_problems(self) -> list[dict[str, Any]]:
+        if not self.db.table_exists("ledger_chain_anchors"):
+            return []
+        return [{"chain": r["chain"], "seq": r["seq"], "anchor_date": str(as_date(r["anchor_date"])),
+                 "reason": r["reason"]}
+                for r in self.db.all("SELECT chain, seq, anchor_date, reason FROM verify_chain_anchors()")]
+
+    def heads(self) -> list[dict[str, Any]]:
+        return [{"chain": r["chain"], "seq": int(r["seq"]), "hash": r["hash"]}
+                for r in self.db.all("SELECT chain, seq, hash FROM chain_heads ORDER BY chain")]
+
+    def store_anchor(self, anchor_date: date, heads: Sequence[Mapping[str, Any]], published: Mapping[str, Any]) -> int:
+        n = 0
+        for h in heads:
+            rows = self.db.all("""
+                INSERT INTO ledger_chain_anchors (anchor_date, chain, seq, hash, published)
+                VALUES (CAST(:d AS date), CAST(:c AS text), CAST(:s AS bigint), CAST(:h AS text), CAST(:p AS jsonb))
+                ON CONFLICT (anchor_date, chain) DO NOTHING
+                RETURNING id::text AS id""", d=anchor_date.isoformat(), c=h["chain"], s=int(h["seq"]), h=h["hash"],
+                p=json_dumps(dict(published)))
+            n += len(rows)
+        return n
+
+
 # ---------------------------------------------------------------------------------------------------------- reconcile
 
 class PgReconcileRepo:
     def __init__(self, db: PgDatabase) -> None:
         self.db = db
+
+    def solvency_ledger(self) -> dict[str, int]:
+        """REVIEW_MONEY M7(d): normal balances of every liability class and of the non-treasury assets."""
+        row = self.db.one("""
+            WITH b AS (SELECT a.code, a.kind::text AS kind, coalesce(sum(e.amount_micro), 0)::bigint AS raw
+                         FROM ledger_accounts a LEFT JOIN ledger_entries e ON e.account_id = a.id
+                        GROUP BY a.id)
+            SELECT coalesce(sum(greatest(0, -raw)) FILTER (WHERE code LIKE 'user:%:fee_balance'), 0)::bigint AS user_pos,
+                   coalesce(sum(greatest(0, raw)) FILTER (WHERE code LIKE 'user:%:fee_balance'), 0)::bigint AS user_debt,
+                   coalesce(sum(-raw) FILTER (WHERE code LIKE 'creator:%:payable'), 0)::bigint AS creator_payables,
+                   coalesce(sum(-raw) FILTER (WHERE code LIKE 'referrer:%:payable'), 0)::bigint AS referrer_payables,
+                   coalesce(sum(-raw) FILTER (WHERE code LIKE 'ps_pending:%'), 0)::bigint AS ps_pending,
+                   coalesce(sum(-raw) FILTER (WHERE code = 'withdrawals:pending'), 0)::bigint AS withdrawals_pending,
+                   coalesce(sum(-raw) FILTER (WHERE code = 'payouts:pending'), 0)::bigint AS payouts_pending,
+                   coalesce(sum(-raw) FILTER (WHERE code = 'refunds:usdc_pending'), 0)::bigint AS refunds_pending,
+                   coalesce(sum(-raw) FILTER (WHERE code LIKE 'suspense:%'), 0)::bigint AS suspense,
+                   coalesce(sum(raw) FILTER (WHERE code = 'builder:hl_receivable'), 0)::bigint AS builder_receivable,
+                   coalesce(sum(raw) FILTER (WHERE code = 'stripe:clearing'), 0)::bigint AS stripe_clearing,
+                   coalesce(sum(raw) FILTER (WHERE code = 'treasury:hl_usdc'), 0)::bigint AS treasury_ledger
+              FROM b""")
+        r = row or {}
+        return {"user_fee_balances_positive": int(r.get("user_pos") or 0), "user_debt": int(r.get("user_debt") or 0),
+                "creator_payables": int(r.get("creator_payables") or 0),
+                "referrer_payables": int(r.get("referrer_payables") or 0),
+                "ps_pending": int(r.get("ps_pending") or 0),
+                "withdrawals_pending": int(r.get("withdrawals_pending") or 0),
+                "payouts_pending": int(r.get("payouts_pending") or 0),
+                "refunds_pending": int(r.get("refunds_pending") or 0), "suspense": int(r.get("suspense") or 0),
+                "builder_receivable": int(r.get("builder_receivable") or 0),
+                "stripe_clearing": int(r.get("stripe_clearing") or 0),
+                "treasury_ledger": int(r.get("treasury_ledger") or 0)}
 
     def expected_positions(self) -> Sequence[ExpectedPosition]:
         rows = self.db.all(f"""
@@ -824,8 +999,15 @@ class PgReconcileRepo:
                 for r in rows]
 
     def total_builder_fees_micro(self) -> int:
-        row = self.db.one("""SELECT coalesce(sum(builder_fee_micro), 0)::bigint AS total FROM fills
-                              WHERE lower(coalesce(cloid, '')) LIKE CAST(:pfx AS text)""", pfx=_OUR_CLOID_LIKE)
+        """Σ builder fees of OUR fills (oid-verified fills of recorded orders when 0010 is applied, REVIEW_MONEY H2)."""
+        verified = self.db.one("""SELECT count(*) AS n FROM information_schema.columns WHERE table_schema = 'public'
+                                     AND table_name = 'fills' AND column_name = 'oid_verified'""")
+        if verified and int(verified["n"]):
+            row = self.db.one("""SELECT coalesce(sum(builder_fee_micro), 0)::bigint AS total FROM fills
+                                  WHERE subscription_id IS NOT NULL AND oid_verified""")
+        else:
+            row = self.db.one("""SELECT coalesce(sum(builder_fee_micro), 0)::bigint AS total FROM fills
+                                  WHERE lower(coalesce(cloid, '')) LIKE CAST(:pfx AS text)""", pfx=_OUR_CLOID_LIKE)
         return int(row["total"]) if row else 0
 
 

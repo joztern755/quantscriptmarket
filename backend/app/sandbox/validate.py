@@ -21,6 +21,11 @@ Policy (an allowlist, not a blocklist):
   every frame/code/generator/traceback attribute (``gi_frame``, ``f_globals``, ``tb_frame`` …);
 * identifiers starting with ``__`` and the names in :data:`FORBIDDEN_NAMES` are rejected anywhere.
 
+NaN (REVIEW_TRADING_KEYS F3): CPython hashes NaN by object identity (its address), so a dict/set keyed by NaN iterates
+in a process-dependent order — hidden non-determinism. Statically we reject every NaN we can see (``math.nan``,
+``from math import nan``, ``float("nan")`` with a literal); computed NaNs (``inf - inf``) are caught at runtime by the
+determinism double-run (runner.run_series_checked / run_signal_checked).
+
 Decisions on items the SPEC left open: ``lambda`` allowed; ``try/except`` allowed (but not bare
 ``except:`` — the runner's timeout exception derives from ``BaseException`` and must not be
 swallowable); ``class`` forbidden; ``yield`` forbidden; f-strings allowed (their expressions are
@@ -71,7 +76,7 @@ MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "cos", "cosh", "degrees", "dist", "e", "erf", "erfc", "exp", "exp2", "expm1", "fabs",
         "factorial", "floor", "fmod", "frexp", "fsum", "gamma", "gcd", "hypot", "inf", "isclose",
         "isfinite", "isinf", "isnan", "isqrt", "lcm", "ldexp", "lgamma", "log", "log10", "log1p", "log2",
-        "modf", "nan", "nextafter", "perm", "pi", "pow", "prod", "radians", "remainder", "sin", "sinh",
+        "modf", "nextafter", "perm", "pi", "pow", "prod", "radians", "remainder", "sin", "sinh",
         "sqrt", "tan", "tanh", "tau", "trunc", "ulp",
     ),
     "statistics": (
@@ -253,6 +258,10 @@ class _Checker:
                 self.check_ident(node.id, node, "name")
             elif t is ast.Attribute:
                 attr = node.attr
+                if attr == "nan":
+                    self.err("nondeterministic", "NaN is not allowed (NaN dict/set keys make results "
+                             "non-deterministic); use None or skip the value", node)
+                    continue
                 if attr.startswith("_"):
                     self.err("forbidden_attribute", f"attribute {attr!r}: names starting with '_' are not allowed", node)
                 elif attr not in ALLOWED_ATTRIBUTES:
@@ -286,12 +295,22 @@ class _Checker:
                 if not self._check_module(mod, node):
                     continue
                 for a in node.names:
-                    if a.name == "*":
+                    if a.name == "nan":
+                        self.err("nondeterministic", "NaN is not allowed (NaN dict/set keys make results "
+                                 "non-deterministic); use None or skip the value", node)
+                    elif a.name == "*":
                         self.err("forbidden_import", "'import *' is not allowed", node)
                     elif a.name not in MODULE_EXPORTS[mod]:
                         self.err("forbidden_import", f"{mod}.{a.name} is not allowed", node)
                     if a.asname:
                         self.check_ident(a.asname, node, "alias")
+            elif t is ast.Call:
+                f = node.func
+                if (isinstance(f, ast.Name) and f.id == "float" and node.args
+                        and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)
+                        and node.args[0].value.strip().lower().lstrip("+-") == "nan"):
+                    self.err("nondeterministic", "float('nan') is not allowed (NaN dict/set keys make results "
+                             "non-deterministic); use None or skip the value", node)
             elif t is ast.Constant:
                 v = node.value
                 if not (v is None or isinstance(v, (bool, int, float, str))):

@@ -4,7 +4,7 @@ Pipeline::
 
     fetch_market_data(meta, HyperliquidInfoFetcher())      # trusted side (api) — has egress
       → MarketData (JSON-serialisable, passed to the sandbox service which has NO egress)
-    backtest_on_data(source, data, params)                 # runs the script via runner.run_series
+    backtest_on_data(source, data, params)                 # runs the script twice via runner.run_series_checked
       → report dict (equity curve, trades, metrics full / in-sample / out-of-sample, buy & hold)
 
 ``run_backtest(source, fetcher=...)`` does both in one process (tests, local dev).
@@ -44,7 +44,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from app.errors import ExternalServiceError, ValidationFailed
-from app.sandbox.runner import SERIES_LIMITS, RunLimits, SeriesResult, normalize_bars, run_series, with_limits
+from app.sandbox.runner import (
+    SERIES_LIMITS, RunLimits, SeriesResult, normalize_bars, run_series_checked, with_limits,
+)
 from app.sandbox.validate import TIMEFRAME_MS, StrategyMeta, ensure_valid
 
 __all__ = [
@@ -509,7 +511,9 @@ SeriesRunner = Callable[..., SeriesResult]
 
 def backtest_on_data(source: str, data: MarketData, *, params: BacktestParams | None = None,
                      meta: StrategyMeta | None = None, limits: RunLimits | None = None,
-                     series_runner: SeriesRunner = run_series) -> dict[str, Any]:
+                     series_runner: SeriesRunner = run_series_checked) -> dict[str, Any]:
+    """Backtest ``source`` on ``data``. The default runner executes the script TWICE (fresh processes, different hash
+    seeds / heap layout) and rejects non-deterministic output (REVIEW_TRADING_KEYS F3) — the upload gate."""
     params = params or BacktestParams()
     params.validate()
     meta = meta or ensure_valid(source)
@@ -589,7 +593,8 @@ def backtest_on_data(source: str, data: MarketData, *, params: BacktestParams | 
 
 def run_backtest(source: str, *, fetcher: CandleFetcher, start_ms: int | None = None, end_ms: int | None = None,
                  now_ms: int | None = None, params: BacktestParams | None = None, limits: RunLimits | None = None,
-                 series_runner: SeriesRunner = run_series, known_markets: Iterable[str] | None = None) -> dict[str, Any]:
+                 series_runner: SeriesRunner = run_series_checked,
+                 known_markets: Iterable[str] | None = None) -> dict[str, Any]:
     """Validate, fetch data with ``fetcher`` (injected; ``HyperliquidInfoFetcher`` in prod), and backtest."""
     meta = ensure_valid(source, known_markets=known_markets)
     data = fetch_market_data(meta, fetcher, start_ms=start_ms, end_ms=end_ms, now_ms=now_ms)

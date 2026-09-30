@@ -104,6 +104,7 @@ def _check_prod_config(svc: Services, role: str) -> None:
         ("AUDIT_PEPPER_B64 (audit_pepper_b64)", len(cfg.pepper) >= 32),
         ("STRIPE_WEBHOOK_SECRET", role != "api" or bool(s.stripe_webhook_secret)),
         ("SANDBOX_URL (sandbox_url)", role != "api" or bool(cfg.sandbox_url) or not s.feature_creator_uploads),
+        ("ADMIN_EMAILS (admin_emails)", role != "api" or bool(cfg.admin_emails)),   # REVIEW_AUTH_API F12
     ) if not ok]
     if missing:
         raise RuntimeError(f"prod API config missing: {missing}")

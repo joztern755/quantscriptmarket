@@ -5,9 +5,16 @@ SIGN CONVENTION (same as backend/migrations/0001_init.sql header):
   * ``get_balance`` returns the RAW signed balance Σ amount_micro. Asset/expense accounts are normally >= 0;
     liability/revenue accounts are normally <= 0 (credit = what we owe / earned).
   * A user's spendable fee balance = −get_balance("user:{id}:fee_balance") = ``available_fee_balance``.
-  * Non-negative accounts (every user fee balance; creator/referrer payables created here) may not be
-    DECREASED below zero, except by kinds in ``OVERDRAFT_KINDS`` (debts that exist regardless). The DB enforces
-    the same rule at commit (SQLSTATE AJ402 -> ``InsufficientBalance``).
+  * Non-negative accounts (every user fee balance; creator/referrer payables; ps_pending:*; withdrawals/payouts/
+    refunds pending; suspense:*) may not be DECREASED below zero. The ONLY exception is the fixed (kind, account)
+    allowlist ``overdraft_allowed``: a ``user:{uuid}:fee_balance`` may be overdrawn by ``OVERDRAFT_KINDS`` (debts that
+    exist regardless). The DB (0010_money_fixes.sql) enforces the same rule at commit (SQLSTATE AJ402 ->
+    ``InsufficientBalance``), and additionally GATES those kinds by role: profit_share only for app_executor,
+    stripe_refund / stripe_dispute only through ``ledger_post_payment_reversal`` (SECURITY DEFINER, used by
+    ``PostgresLedgerStore`` for those kinds), ps_pending_release only through the SQL ``ps_pending_release``.
+  * Uncollected profit share (REVIEW_MONEY C1): ``ps_pending:{user}:{creator}`` / ``ps_pending:{user}:platform`` hold
+    the part of a profit-share charge the user's fee balance did not cover. They are never payable; the DB releases
+    them to ``creator:{id}:payable`` / ``platform:revenue:profit_share`` pro-rata when the user tops up.
 
 Idempotency: ``idempotency_key`` is unique. Re-posting the same key with the same kind and the same entries
 (as a multiset; memo/created_by are not compared) returns the existing transaction with ``created=False``;
@@ -34,7 +41,9 @@ from typing import Any, Iterable, Protocol, Sequence, runtime_checkable
 from app.errors import Conflict, InsufficientBalance, NotFound, ValidationFailed
 
 __all__ = [
-    "Account", "PostedTx", "LedgerStore", "ACCOUNT_KINDS", "OVERDRAFT_KINDS", "GENESIS_HASH",
+    "Account", "PostedTx", "LedgerStore", "ACCOUNT_KINDS", "OVERDRAFT_KINDS", "GATED_KINDS", "GENESIS_HASH",
+    "PAYMENT_REVERSAL_KINDS", "PS_PENDING_RELEASE_KIND", "overdraft_allowed", "forced_non_negative",
+    "ps_pending_account",
     "PLATFORM_REVENUE_BUILDER", "PLATFORM_REVENUE_PROFIT_SHARE", "PLATFORM_REVENUE_SUBSCRIPTION",
     "PLATFORM_REVENUE_POSTS", "PLATFORM_REVENUE_PLANS", "TREASURY_HL_USDC", "STRIPE_CLEARING", "BUILDER_HL_RECEIVABLE",
     "fee_balance_account", "creator_payable_account", "referrer_payable_account", "default_account_spec",
@@ -45,8 +54,12 @@ __all__ = [
 
 ACCOUNT_KINDS = ("asset", "liability", "revenue", "expense")
 DEBIT_NORMAL = frozenset({"asset", "expense"})
-# Must equal SQL ledger_kind_allows_overdraft() in 0001_init.sql.
+# Must equal SQL ledger_overdraft_allowed() in 0010_money_fixes.sql (kinds) — and only for user fee balances.
 OVERDRAFT_KINDS = frozenset({"profit_share", "stripe_refund", "stripe_dispute"})
+# Must equal SQL ledger_kind_requires_auth(): kinds the DB only accepts from an authorised role / wrapper.
+GATED_KINDS = frozenset(OVERDRAFT_KINDS | {"ps_pending_release"})
+PAYMENT_REVERSAL_KINDS = frozenset({"stripe_refund", "stripe_dispute"})
+PS_PENDING_RELEASE_KIND = "ps_pending_release"
 GENESIS_HASH = "0" * 64
 MAX_ABS_MICRO = 10**18 - 1          # fits bigint; also the SQL input check (<= 18 digits)
 
@@ -63,12 +76,34 @@ BUILDER_HL_RECEIVABLE = "builder:hl_receivable"
 _CODE_RE = re.compile(r"^[a-z0-9_]+(:[a-z0-9_.-]+)+$")
 _TX_KIND_RE = re.compile(r"^[a-z][a-z0-9_.]{0,63}$")
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-# (pattern, kind, non_negative) for accounts created on demand; group 1 = owner user id
+# (pattern, kind, non_negative) for accounts created on demand; group 1 = owner user id (None = no owner)
 _PER_USER_ACCOUNTS = (
     (re.compile(rf"^user:({_UUID}):fee_balance$"), "liability", True),
     (re.compile(rf"^creator:({_UUID}):payable$"), "liability", True),
     (re.compile(rf"^referrer:({_UUID}):payable$"), "liability", True),
+    # C1: uncollected profit share, creator part (owner = creator) / platform part (no owner)
+    (re.compile(rf"^ps_pending:{_UUID}:({_UUID})$"), "liability", True),
+    (re.compile(rf"^ps_pending:{_UUID}:platform()$"), "liability", True),
 )
+_FEE_BALANCE_RE = re.compile(rf"^user:{_UUID}:fee_balance$")
+# = SQL ledger_account_forced_non_negative(): always non-negative whoever creates them (REVIEW_MONEY M5)
+_FORCED_NON_NEGATIVE = re.compile(
+    rf"^(user:{_UUID}:fee_balance|(creator|referrer):{_UUID}:payable|ps_pending:.*|suspense:.*"
+    r"|withdrawals:pending|payouts:pending|refunds:usdc_pending)$")
+
+
+def overdraft_allowed(kind: str, code: str) -> bool:
+    """= SQL ledger_overdraft_allowed(kind, code): the fixed allowlist of overdrafts."""
+    return kind in OVERDRAFT_KINDS and bool(_FEE_BALANCE_RE.match(code))
+
+
+def forced_non_negative(code: str) -> bool:
+    return bool(_FORCED_NON_NEGATIVE.match(code))
+
+
+def ps_pending_account(user_id: str, creator_user_id: str | None) -> str:
+    """Uncollected profit share of ``user_id``: creator part (``creator_user_id``) or platform part (None)."""
+    return f"ps_pending:{str(user_id).lower()}:{str(creator_user_id).lower() if creator_user_id else 'platform'}"
 
 
 def fee_balance_account(user_id: str) -> str:
@@ -141,7 +176,7 @@ def default_account_spec(code: str) -> tuple[str, str | None, bool] | None:
     for pat, kind, non_neg in _PER_USER_ACCOUNTS:
         m = pat.match(code)
         if m:
-            return kind, m.group(1), non_neg
+            return kind, (m.group(1) or None), non_neg
     return None
 
 
@@ -209,11 +244,16 @@ def ensure_account(conn: Any, code: str, kind: str, owner_user_id: str | None = 
         non_negative = spec[2] if spec else False
     if spec and spec[2] and not non_negative:
         raise ValidationFailed("per-user fee/payable accounts are always non-negative", code=code)
+    if forced_non_negative(code):
+        non_negative = True                   # the DB forces it too (0010); never create these overdraftable
     owner = str(owner_user_id).lower() if owner_user_id is not None else None
     store = _as_store(conn)
     acct = store.get_account(code) or store.insert_account(code, kind, owner, bool(non_negative))
     if acct.kind != kind or (owner is not None and acct.owner_user_id != owner):
         raise Conflict("ledger account exists with a different kind/owner", code=code)
+    if (forced_non_negative(code) or (spec and spec[2])) and not acct.non_negative:
+        # REVIEW_MONEY M5: an existing per-user / pending account that is overdraftable was tampered with
+        raise Conflict("protected ledger account exists without non_negative", code=code)
     return acct
 
 
@@ -265,8 +305,6 @@ def _same_or_conflict(existing: PostedTx, kind: str, canon: tuple[tuple[str, int
 
 def _precheck_balances(store: LedgerStore, kind: str, canon: Sequence[tuple[str, int]]) -> None:
     """Friendly early InsufficientBalance; the DB re-checks authoritatively under the ledger lock."""
-    if kind in OVERDRAFT_KINDS:
-        return
     deltas: dict[str, int] = {}
     for code, amt in canon:
         deltas[code] = deltas.get(code, 0) + amt
@@ -274,7 +312,7 @@ def _precheck_balances(store: LedgerStore, kind: str, canon: Sequence[tuple[str,
         acct = store.get_account(code)
         if acct is None:
             raise NotFound("unknown ledger account", code=code)
-        if not acct.non_negative:
+        if not acct.non_negative or overdraft_allowed(kind, code):
             continue
         sign = 1 if acct.kind in DEBIT_NORMAL else -1
         delta = sign * raw_delta

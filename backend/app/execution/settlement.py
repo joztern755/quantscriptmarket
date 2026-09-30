@@ -38,10 +38,27 @@ event ``settlement_deferred`` per settle date (dedup ``settlement_deferred:{date
 created after that point has nothing to settle and is never deferred. A subscription without a trading address, or
 an address never synced, is deferred (fail closed).
 
+Money-core fixes (docs/security/REVIEW_MONEY.md; migrations/0010_money_fixes.sql):
+- C1 collection: profit share is charged in full on the user's fee balance (it may go negative = the user's debt),
+  but the creator payable / platform revenue are credited ONLY with the part the user's non-negative balance covered
+  (``domain.profit_share.split_collected``, balance read under the user row lock). The uncollected rest is credited to
+  ``ps_pending:{user}:{creator}`` / ``ps_pending:{user}:platform`` — never payable. The DB releases pending to the
+  payable / revenue pro-rata when the user tops up (trigger → SQL ``ps_pending_release``); this job also sweeps every
+  user with pending daily (``PendingReleaser``). A negative balance moves the subscription to past_due (billing).
+- M3 late data: PnL is CLAIMED, not windowed: ``repo.claim_pnl`` sums and marks every not-yet-settled fill, funding
+  event and book adjustment of the subscription with time ≤ cut-off, in the same transaction as the ledger post, so a
+  fill ingested after its day was settled is booked into the next settlement instead of being lost.
+- H1 attribution: realised PnL per fill comes from the subscription's own position book (``fills.book_pnl_micro``,
+  maintained by fills-ingest from OUR fills only), plus mark-to-market adjustments for foreign fills, pause and
+  cancel-"leave" (``subscription_pnl_events``), never from Hyperliquid's account-level ``closedPnl``.
+- H2 builder fees: only fills of orders we recorded (oid verified) with a builder fee > 0 are recognised, capped at
+  notional × our builder rate (``PgSettlementRepo.unrecognised_builder_fee_fills``).
+
 Policy notes:
 - Profit share is charged in full even if it drives the fee balance negative (it is owed on profit already
-  realised in the user's own account); the subscription then moves to past_due. Renewals are prepaid: they
-  are only charged when the balance covers them, and they are retried daily until paid.
+  realised in the user's own account); the subscription then moves to past_due. Only the collected part reaches the
+  creator/platform (C1 above). Renewals are prepaid: they are only charged when the balance covers them (always fully
+  collected; the DB refuses the non-overdraft kind otherwise), and they are retried daily until paid.
 - A renewal after a lapse starts a new period from the anchor strictly after ``now`` (no back-charging for months
   spent past_due / reduce_only).
 """
@@ -51,6 +68,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
+from app.domain.profit_share import split_collected
 from app.logging import get_logger
 
 from .ports import (
@@ -63,7 +81,9 @@ from .ports import (
     FeeSplitter,
     LedgerLine,
     LedgerPoster,
+    PendingReleaser,
     PlanAccount,
+    PnlDelta,
     ProfitShareCalculator,
     ReferralLookup,
     SettlementRepo,
@@ -93,6 +113,12 @@ def creator_payable_account(user_id: str) -> str:
 
 def referrer_payable_account(user_id: str) -> str:
     return f"referrer:{user_id}:payable"
+
+
+def ps_pending_account(user_id: str, creator_user_id: str | None) -> str:
+    """Uncollected profit share (C1): creator part → ``ps_pending:{user}:{creator}``, platform part →
+    ``ps_pending:{user}:platform``. Never payable; released by the DB when the user tops up."""
+    return f"ps_pending:{user_id}:{creator_user_id or 'platform'}"
 
 
 def profit_share_key(subscription_id: str, settle_date: date) -> str:
@@ -130,6 +156,10 @@ class SettlementReport:
     profit_share_deferred: int = 0
     deferred: list[dict[str, Any]] = field(default_factory=list)   # [{subscription_id, missing, needed_until}]
     profit_share_charged_micro: int = 0
+    profit_share_collected_micro: int = 0      # C1: credited to creator payables / platform revenue
+    profit_share_pending_micro: int = 0        # C1: uncollected → ps_pending:* (released on top-up)
+    pending_released_users: int = 0
+    pending_released_micro: int = 0
     renewals_charged: int = 0
     renewals_charged_micro: int = 0
     renewals_failed: int = 0
@@ -150,7 +180,8 @@ class Settlement:
                  profit_share: ProfitShareCalculator, fees: FeeSplitter, billing: BillingPolicy,
                  referrals: ReferralLookup, alerts: AlertSink, clock: Clock, builder_page_size: int = 1000,
                  created_by: str = "system:settlement", events: UserEventSink | None = None,
-                 require_data_coverage: bool = True, coverage_margin: timedelta = timedelta(minutes=2)) -> None:
+                 require_data_coverage: bool = True, coverage_margin: timedelta = timedelta(minutes=2),
+                 pending: PendingReleaser | None = None) -> None:
         self.repo = repo
         self.ledger = ledger
         self.uow = uow
@@ -165,6 +196,7 @@ class Settlement:
         self.events = events
         self.require_data_coverage = require_data_coverage
         self.coverage_margin = coverage_margin
+        self.pending = pending
 
     # --------------------------------------------------------------------------------------------------------- entry
 
@@ -197,6 +229,11 @@ class Settlement:
                 self._renew_and_update_status(sub, now, report)
             except Exception as exc:
                 self._fail(report, f"renewal:{sub.id}", exc, user_id=sub.user_id)
+
+        try:
+            self.release_pending(report)
+        except Exception as exc:
+            self._fail(report, "ps_pending_release", exc)
 
         for acct in self.repo.plans_due(now):
             try:
@@ -269,27 +306,41 @@ class Settlement:
             return
         if not sub.in_house and not sub.creator_user_id:
             raise ValueError("third-party strategy without creator")
-        delta = self.repo.pnl_since(sub.id, sub.pnl_cursor, cutoff)
-        charge = self.ps.settle(cum_pnl_micro=sub.cum_pnl_micro, hwm_micro=sub.hwm_micro,
-                                pnl_delta_micro=delta.total_micro, creator_bps=sub.profit_share_bps,
-                                in_house=sub.in_house)
-        if charge.total_micro < 0 or charge.creator_micro < 0 or charge.platform_micro < 0:
-            raise AssertionError("negative profit-share charge")
 
         with self.uow.atomic():
+            # Serialise with the API's money movements of this user (balance read → post), then CLAIM the PnL rows
+            # (M3: every unclaimed row ≤ cut-off, marked in this transaction — a rollback releases the claim).
+            lock = getattr(self.repo, "lock_user", None)
+            if lock is not None:
+                lock(sub.user_id)
+            delta = self._claim_pnl(sub, cutoff, settle_date)
+            charge = self.ps.settle(cum_pnl_micro=sub.cum_pnl_micro, hwm_micro=sub.hwm_micro,
+                                    pnl_delta_micro=delta.total_micro, creator_bps=sub.profit_share_bps,
+                                    in_house=sub.in_house)
+            if charge.total_micro < 0 or charge.creator_micro < 0 or charge.platform_micro < 0:
+                raise AssertionError("negative profit-share charge")
             tx_id = None
+            collected = pending = 0
             if charge.total_micro > 0:
-                creator_acct = creator_payable_account(sub.creator_user_id) if sub.creator_user_id and not sub.in_house else None
-                creator_amt = charge.creator_micro if creator_acct else 0
+                has_creator = bool(sub.creator_user_id) and not sub.in_house
+                creator_amt = charge.creator_micro if has_creator else 0
                 platform_amt = charge.platform_micro + (charge.creator_micro - creator_amt)
-                pairs = [(fee_balance_account(sub.user_id), charge.total_micro),
-                         (ACC_PLATFORM_PROFIT_SHARE, -platform_amt)]
-                if creator_acct:
-                    pairs.append((creator_acct, -creator_amt))
                 prev = self._spendable(sub.user_id)
+                # C1: only what the user's NON-NEGATIVE balance covers is credited to payable / revenue
+                split = split_collected(creator_amt, platform_amt, prev)
+                if split.collected + split.pending != charge.total_micro:
+                    raise AssertionError("profit-share collection split does not sum to the charge")
+                pairs = [(fee_balance_account(sub.user_id), charge.total_micro),
+                         (ACC_PLATFORM_PROFIT_SHARE, -split.platform_collected),
+                         (ps_pending_account(sub.user_id, None), -split.platform_pending)]
+                if has_creator:
+                    pairs += [(creator_payable_account(sub.creator_user_id), -split.creator_collected),  # type: ignore[arg-type]
+                              (ps_pending_account(sub.user_id, sub.creator_user_id), -split.creator_pending)]
+                collected, pending = split.collected, split.pending
                 tx_id, created = self.ledger.post_transaction(
                     idempotency_key=key, kind="profit_share",
-                    memo=f"profit share {settle_date.isoformat()} profit_micro={charge.profit_micro}",
+                    memo=(f"profit share {settle_date.isoformat()} profit_micro={charge.profit_micro} "
+                          f"collected_micro={collected} pending_micro={pending}"),
                     lines=_lines(*pairs), created_by=self.created_by)
                 if created:
                     self._balance_changed(sub.user_id, prev)
@@ -297,6 +348,7 @@ class Settlement:
                         "amount_micro": charge.total_micro, "profit_micro": charge.profit_micro,
                         "rate_bps": self._profit_share_rate_bps(sub),
                         "creator_micro": creator_amt, "platform_micro": platform_amt,
+                        "collected_micro": collected, "uncollected_micro": pending,
                         "strategy_id": sub.strategy_id, "subscription_id": sub.id,
                         "period_start": sub.pnl_cursor.isoformat() if sub.pnl_cursor else sub.created_at.isoformat(),
                         "period_end": cutoff.isoformat(), "settle_date": settle_date.isoformat()},
@@ -305,9 +357,45 @@ class Settlement:
                                         hwm_micro=charge.new_hwm_micro, pnl_cursor=cutoff, ledger_tx_id=tx_id)
         report.profit_share_settled += 1
         report.profit_share_charged_micro += charge.total_micro
+        report.profit_share_collected_micro += collected
+        report.profit_share_pending_micro += pending
+        if pending:
+            self._alert("warn", "profit_share_uncollected", {
+                "subscription_id": sub.id, "strategy_id": sub.strategy_id, "charge_micro": charge.total_micro,
+                "collected_micro": collected, "uncollected_micro": pending}, user_id=None,
+                dedup=f"ps_uncollected:{sub.id}:{settle_date.isoformat()}")
         log.info("profit_share_settled", extra={"fields": {
             "subscription_id": sub.id, "settle_date": settle_date.isoformat(), "pnl_delta_micro": delta.total_micro,
             "profit_micro": charge.profit_micro, "charge_micro": charge.total_micro}})
+
+    def _claim_pnl(self, sub: SettlementSubscription, cutoff: datetime, settle_date: date) -> PnlDelta:
+        """M3: every not-yet-settled row ≤ cut-off (late fills included), marked as consumed by ``settle_date``.
+        Repos without ``claim_pnl`` (legacy fakes) fall back to the (cursor, cut-off] window."""
+        claim = getattr(self.repo, "claim_pnl", None)
+        if claim is not None:
+            return claim(sub.id, cutoff, settle_date)
+        return self.repo.pnl_since(sub.id, sub.pnl_cursor, cutoff)
+
+    def release_pending(self, report: SettlementReport | None = None) -> int:
+        """C1 sweep: release uncollected profit share of every user whose debt has shrunk (the DB also does it on each
+        top-up). Returns the micro-USD released."""
+        if self.pending is None:
+            return 0
+        total = 0
+        for user_id in self.pending.users_with_pending():
+            try:
+                with self.uow.atomic():
+                    released = int(self.pending.release(user_id))
+            except Exception as exc:
+                if report is not None:
+                    self._fail(report, f"ps_pending_release:{user_id}", exc, user_id=user_id)
+                continue
+            if released > 0:
+                total += released
+                if report is not None:
+                    report.pending_released_users += 1
+                    report.pending_released_micro += released
+        return total
 
     # -------------------------------------------------------------------------------------- renewal + status machine
 

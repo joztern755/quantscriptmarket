@@ -120,11 +120,18 @@ def charge_subscription_start(conn: Any, svc: Any, *, user_id: str, subscription
     return price, tx
 
 
-def charge_plan(conn: Any, svc: Any, *, user_id: str, plan: str, period_start: datetime, actor: str) -> tuple[int, Optional[str]]:
+def charge_plan(conn: Any, svc: Any, *, user_id: str, plan: str, period_start: datetime, actor: str,
+                change_ref: Optional[str] = None) -> tuple[int, Optional[str]]:
+    """First month of a paid plan. ``change_ref`` (the request's Idempotency-Key) makes every plan CHANGE its own
+    ledger transaction (REVIEW_AUTH_API F15 / REVIEW_MONEY L2); without it the legacy per-day key is used."""
     price = svc.domain.plan_price(plan)
     if price <= 0:
         return 0, None
-    tx = post(conn, svc, key=f"plan:{user_id}:start:{plan}:{period_start.date().isoformat()}", kind="plan_purchase",
+    key = f"plan:{user_id}:start:{plan}:{period_start.date().isoformat()}"
+    if change_ref:
+        import hashlib
+        key += ":" + hashlib.sha256(f"{user_id}:{change_ref}".encode()).hexdigest()[:24]
+    tx = post(conn, svc, key=key, kind="plan_purchase",
               memo=f"plan {plan} first month", created_by=actor,
               entries=[(fee_balance(user_id), price), (ACC_PLANS_REVENUE, -price)])
     return price, tx

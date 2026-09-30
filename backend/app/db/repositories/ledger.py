@@ -1,6 +1,7 @@
 """Postgres implementation of ``app.ledger.service.LedgerStore``.
 
-Writes go through the SQL function ``ledger_post`` (0001_init.sql), which validates, locks the ledger chain,
+Writes go through the SQL function ``ledger_post`` (0001/0010; Stripe refunds and disputes through
+``ledger_post_payment_reversal``), which validates, gates kinds by role, locks the ledger chain,
 handles idempotency race-free and checks balances; the deferred constraint triggers re-check at COMMIT.
 Custom SQLSTATEs are mapped to ``app.errors``.
 """
@@ -12,7 +13,7 @@ from typing import Any, Mapping, Sequence
 
 from app.db.engine import SqlAlchemyRunner, SqlRunner, sqlstate_of
 from app.errors import AppError, Conflict, InsufficientBalance, NotFound, ValidationFailed
-from app.ledger.service import Account, PostedTx
+from app.ledger.service import PAYMENT_REVERSAL_KINDS, Account, PostedTx
 
 __all__ = ["PostgresLedgerStore", "map_db_error"]
 
@@ -63,6 +64,13 @@ SELECT t.id::text AS id, t.idempotency_key, t.kind, t.memo, t.created_by, t.seq,
 _POST_SQL = """
 SELECT tx_id::text AS tx_id, created
   FROM ledger_post(:key, :kind, :memo, :created_by, CAST(:entries AS jsonb))
+"""
+
+# Stripe refund / dispute may overdraw a fee balance: the DB only accepts them through this SECURITY DEFINER wrapper
+# (0010_money_fixes.sql — fixed key prefix and entry shape; the API role cannot post those kinds directly).
+_POST_REVERSAL_SQL = """
+SELECT tx_id::text AS tx_id, created
+  FROM ledger_post_payment_reversal(:key, :kind, :memo, :created_by, CAST(:entries AS jsonb))
 """
 
 _BALANCE_SQL = """
@@ -132,8 +140,9 @@ class PostgresLedgerStore:
         payload = json.dumps([{"account": c, "amount_micro": int(a)} for c, a in entries])
         savepoint = getattr(self.runner, "savepoint", None)
         with (savepoint() if savepoint else nullcontext()):
-            rows = self._q(_POST_SQL, {"key": idempotency_key, "kind": kind, "memo": memo,
-                                       "created_by": created_by, "entries": payload})
+            rows = self._q(_POST_REVERSAL_SQL if kind in PAYMENT_REVERSAL_KINDS else _POST_SQL,
+                           {"key": idempotency_key, "kind": kind, "memo": memo, "created_by": created_by,
+                            "entries": payload})
         created = bool(rows[0]["created"]) if rows else False
         tx = self.get_tx_by_key(idempotency_key)
         if tx is None:  # pragma: no cover

@@ -1,6 +1,8 @@
-"""In-memory ``LedgerStore`` for tests and dev. Same rules as the Postgres ledger (0001_init.sql): balanced,
+"""In-memory ``LedgerStore`` for tests and dev. Same rules as the Postgres ledger (0001 + 0010): balanced,
 >= 2 non-zero entries, idempotency by (kind, entries multiset), non-negative accounts cannot be decreased below 0
-except by OVERDRAFT_KINDS, append-only, and the same hash chain (so hashes are comparable with the DB's)."""
+except by the fixed (kind, account) allowlist ``overdraft_allowed`` (fee balances only), protected accounts are forced
+non-negative, ps_pending accounts only move by ps_pending_release, append-only, and the same hash chain (so
+hashes are comparable with the DB's). Role gating of kinds is a DB-only control (no roles here)."""
 from __future__ import annotations
 
 import threading
@@ -13,11 +15,13 @@ from app.errors import Conflict, InsufficientBalance, NotFound, ValidationFailed
 from app.ledger.service import (
     DEBIT_NORMAL,
     GENESIS_HASH,
-    OVERDRAFT_KINDS,
+    PS_PENDING_RELEASE_KIND,
     Account,
     PostedTx,
     entries_digest,
+    forced_non_negative,
     normalize_entries,
+    overdraft_allowed,
     tx_hash,
 )
 
@@ -53,6 +57,7 @@ class InMemoryLedgerStore:
                 if code.startswith("user:") and code.endswith(":fee_balance") and not (
                         kind == "liability" and non_negative and owner_user_id):
                     raise ValidationFailed("fee balance accounts must be non-negative liabilities with an owner")
+                non_negative = bool(non_negative) or forced_non_negative(code)
                 self.accounts[code] = Account(str(uuid.uuid4()), code, kind, owner_user_id, bool(non_negative))
                 self._balances[code] = 0
             return self.accounts[code]
@@ -78,15 +83,16 @@ class InMemoryLedgerStore:
             deltas: dict[str, int] = {}
             for c, a in canon:
                 deltas[c] = deltas.get(c, 0) + a
-            if kind not in OVERDRAFT_KINDS:
-                for c, raw in deltas.items():
-                    acct = self.accounts[c]
-                    if not acct.non_negative:
-                        continue
-                    sign = 1 if acct.kind in DEBIT_NORMAL else -1
-                    after = sign * (self._balances[c] + raw)
-                    if sign * raw < 0 and after < 0:
-                        raise InsufficientBalance("insufficient balance", account=c, shortfall_micro=-after)
+            if kind != PS_PENDING_RELEASE_KIND and any(c.startswith("ps_pending:") and raw > 0 for c, raw in canon):
+                raise ValidationFailed("ps_pending accounts may only be debited by ps_pending_release")
+            for c, raw in deltas.items():
+                acct = self.accounts[c]
+                if not acct.non_negative or overdraft_allowed(kind, c):
+                    continue
+                sign = 1 if acct.kind in DEBIT_NORMAL else -1
+                after = sign * (self._balances[c] + raw)
+                if sign * raw < 0 and after < 0:
+                    raise InsufficientBalance("insufficient balance", account=c, shortfall_micro=-after)
             prev = self.txs[-1].hash if self.txs else GENESIS_HASH
             tx_id = str(uuid.uuid4())
             created_at = _utc_iso(self._clock())

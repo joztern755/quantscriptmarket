@@ -30,6 +30,7 @@ __all__ = [
     "STATUSES",
     "StatusDecision",
     "next_status",
+    "resume_after_pause",
     "entries_allowed",
     "exits_allowed",
     "add_months",
@@ -93,6 +94,30 @@ def next_status(
             return StatusDecision(REDUCE_ONLY, since, True, "grace_expired")
         return StatusDecision(PAST_DUE, since, False, "unchanged")
     return StatusDecision(REDUCE_ONLY, since, False, "unchanged")
+
+
+def resume_after_pause(
+    pre_pause_status: str | None,
+    pre_pause_past_due_since: datetime | None,
+    balance_micro: int,
+    amount_due_micro: int,
+    now: datetime,
+    grace_hours: int = 72,
+) -> StatusDecision:
+    """Status when the user un-pauses (REVIEW_AUTH_API F3 / REVIEW_MONEY H3).
+
+    The billing state saved at pause time is RESTORED (a pause never launders ``past_due`` / ``reduce_only`` back to
+    ``active``) and the status machine runs on it with whatever is due now — the grace clock keeps its original
+    ``past_due_since`` (never restarted by a pause/unpause cycle). ``amount_due_micro`` = the renewal price when the
+    paid period ended while paused (the caller refuses the unpause, or charges it, BEFORE applying an ``active``
+    result). A missing saved state (paused before the fix) resumes from ``active`` and is re-evaluated against the
+    balance. ``pending`` is restored as is (activation still in progress)."""
+    prev = pre_pause_status or ACTIVE
+    if prev == PENDING:
+        return StatusDecision(PENDING, None, True, "restored")
+    if prev not in _BILLABLE:
+        raise ValueError(f"cannot resume a subscription into {prev!r}")
+    return next_status(prev, balance_micro, amount_due_micro, pre_pause_past_due_since, now, grace_hours)
 
 
 def entries_allowed(status: str, past_due_since: datetime | None, now: datetime, grace_hours: int = 72) -> bool:

@@ -391,9 +391,10 @@ class ExecIntegrationDbTest(unittest.TestCase):
                                audit_pepper_b64=base64.b64encode(b"p" * 32).decode(),
                                sandbox_shared_secret=SANDBOX_SECRET, email_provider_api_key="",
                                telegram_bot_token="")
-        from app.security.kms import make_encryptor
+        from app.security.kms import make_code_encryptor, make_encryptor
 
         cls.enc = make_encryptor(cls.settings)
+        cls.code_enc = make_code_encryptor(cls.settings)   # dedicated creator-code key (REVIEW_TRADING_KEYS F2)
         cls.silver = cls.admin.fetchall("""SELECT st.id::text AS sid, v.id::text AS vid FROM strategies st
                                            JOIN strategy_versions v ON v.strategy_id = st.id AND v.version = 1
                                            WHERE st.slug = 'silver'""")[0]
@@ -1067,7 +1068,8 @@ class ExecIntegrationDbTest(unittest.TestCase):
                                                  'listed') RETURNING id::text AS id""", {"s": slug, "o": creator})[0]["id"]
             raw = CREATOR_CODE.encode()
             code_hash = hashlib.sha256(raw).hexdigest()
-            blob = self.enc.seal(raw, f"strategy_code:{sid}:{code_hash}".encode())   # exactly as the API seals it
+            from app.security.kms import creator_code_aad
+            blob = self.code_enc.seal(raw, creator_code_aad(sid, code_hash))   # exactly as the API seals it
             vid = self.admin.fetchall("""INSERT INTO strategy_versions (strategy_id, version, code_hash, code_ciphertext,
                                                                         params, markets, timeframe, lookback,
                                                                         max_leverage, published_at, live_since)

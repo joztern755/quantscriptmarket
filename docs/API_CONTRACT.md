@@ -114,6 +114,20 @@ refuses any hash ≠ `legal_doc_hashes[doc]` of the current version.
 The web never signs server typed data as received: it validates it (`hl.validateServerTypedData`) and rebuilds the
 action locally with the wallet's current chain id.
 
+### `/exchange` relay fallback — POST `/hl/exchange-relay` (Bearer + MFA, consent; 20/h per user; audit-logged)
+
+Used by `web/src/core/hl.ts postExchange` ONLY when the direct browser POST to `https://api.hyperliquid.xyz/exchange`
+fails at the network level (fetch throws: offline / CORS preflight refused). Request = exactly the /exchange body
+`{action, nonce, signature: {r, s, v}}` (no `vaultAddress` / `expiresAfter`, no extra keys). Response 200
+`HlRelayOut {upstream_status, response}` = Hyperliquid's own HTTP status and body (the web interprets it like a direct
+answer). 422 `validation_failed` (nothing sent) unless ALL hold: `action.type` ∈ {`approveAgent`, `approveBuilderFee`,
+`usdSend`} with exactly the typed fields + `type` + `signatureChainId`; `hyperliquidChain` = our network; body nonce =
+`action.nonce` (`action.time` for usdSend), within [now − 15 min, now + 5 min]; low-s signature, v ∈ {27, 28}; the
+EIP-712 signer is one of the caller's **verified wallets**; approveAgent: `agentAddress` = one of the caller's
+**pending** agents, `agentName` = its name, signer = its master; approveBuilderFee: `builder` = config builder,
+`maxFeeRate` ≤ config fee; usdSend: `destination` = config treasury, positive amount (≤ 6 dp). Orders, cancels,
+withdrawals and every other type are refused. 429 rate limit · 502 Hyperliquid unreachable (nothing known to be sent).
+
 ## Subscriptions (SPEC §12 cancel flow)
 
 | Method & path | Gate | Request | Response | Errors / reasons | Web caller |
@@ -201,6 +215,13 @@ No-code spec = exactly `backend/app/sandbox/nocode.py` (SPEC §10): `{version: 1
 | POST `/admin/payouts/{kind}/{id}/reject` | `{reason}` | `AdminPayoutOut` | releases hold |
 | POST `/admin/payouts/{kind}/{id}/typed-data` | `{signature_chain_id}` | `{payout, payload{typed_data, action, nonce}, exchange_url}` | web **refuses unless the connected wallet = config `treasury_address`**, validates destination/amount |
 | POST `/admin/payouts/{kind}/{id}/sent` | `{tx_hash, time_ms}` | `AdminPayoutOut` | web finds the hash in the treasury's `userNonFundingLedgerUpdates` (or asks); server verifies on-chain |
+| GET `/admin/held-deposits` | `?open=true\|false&limit&cursor` | `HeldDepositsOut {items: HeldDepositOut[] {tx_hash, held_tx_id, amount_micro, sender_address\|null, reason, memo, transfer_time, created_at, release_id, release_status, release_action}, next_cursor, suspense_balance_micro}` | "Held deposits" tab: transfers booked to `suspense:usdc_unattributed` (ledger kind `deposit_held`); `open` = not yet released (none or only `proposed`). `sender_address` null = held before 0009 |
+| GET `/admin/held-deposits/releases` | `?status=proposed\|approved\|sent\|rejected` | `Page<SuspenseReleaseOut {id, created_at, tx_hash, amount_micro, action (attribute\|refund), user_id, sender_address, sender_source (scan\|onchain), evidence, status, maker_admin, checker_admin, decided_at, decision_reason, release_tx_id, refund_tx_hash, refund_ledger_tx_id, sent_at}>` | |
+| POST `/admin/held-deposits/{tx_hash}/release` | **Idempotency-Key**; `{action: "attribute"\|"refund", user_id? (attribute), sender_address? (only when not recorded; verified on-chain), evidence (5–1000)}` | 201 `SuspenseReleaseOut` (status `proposed`) | MAKER. attribute: only to a user whose **verified wallet is the on-chain sender** (403 `sender_not_verified_for_user`), never to yourself (403); refund: back to the sender, no user_id (422). 404 no such held transfer · 409 a live release exists · 422 `sender_unverified` |
+| POST `/admin/held-deposits/releases/{id}/approve` | **Idempotency-Key**; `{reason}` | `SuspenseReleaseOut` (`approved`) | CHECKER ≠ maker (403), never the beneficiary (403). ONE ledger tx key `suspense_release:{hash}`: attribute → `user:{id}:fee_balance` (+ `deposits` row usdc_hl, withdrawable; user alert `topup_credited`); refund → `refunds:usdc_pending` |
+| POST `/admin/held-deposits/releases/{id}/reject` | **Idempotency-Key**; `{reason}` | `SuspenseReleaseOut` (`rejected`) | a different admin; the transfer is open again |
+| POST `/admin/held-deposits/releases/{id}/typed-data` | `{signature_chain_id}` | `{release, payload{typed_data, action, nonce}, exchange_url}` | approved refunds only (409 otherwise); destination = recorded sender, amount = held amount; web refuses unless the connected wallet = config treasury. NOT gated by PAYOUTS_ENABLED (returns the sender's own money) |
+| POST `/admin/held-deposits/releases/{id}/sent` | **Idempotency-Key**; `{tx_hash, time_ms}` | `SuspenseReleaseOut` (`sent`) | server verifies on-chain (treasury → sender, hash, exact amount; 422 not found yet), 409 hash already recorded (withdrawals/payouts/refunds); ledger `suspense_refund:{hash}:sent` refunds:usdc_pending → treasury:hl_usdc |
 | GET `/admin/strategies` | `?status=review\|listed\|paused\|draft\|delisted` | `Page<AdminStrategyOut {…, owner_user_id, owner_kyc_status, versions: CreatorVersionOut[] (5)}>` | |
 | POST `/admin/strategies/{id}/list` | `{version_id, reason}` | pending change | approval checks price set, creator KYC, **≥ risk.min_listing_history_days (180)** (was a hard-coded 365) |
 | POST `/admin/strategies/{id}/pause` \| `/delist` \| `/reject` | `{reason}` | applied | |

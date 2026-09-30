@@ -19,7 +19,8 @@
 #         #   Hyperliquid, the DB, or Google APIs. The metadata server is still reachable on Cloud Run,
 #         #   which is why the service account must have no roles.
 #     --set-secrets=SANDBOX_SHARED_SECRET=sandbox-shared-secret:latest
-#     --concurrency=4 --cpu=2 --memory=2Gi --timeout=300 --max-instances=5 --no-cpu-throttling
+#     --concurrency=1 --cpu=2 --memory=2Gi --timeout=300 --max-instances=10 --no-cpu-throttling
+#         # ↑ ONE request per instance (REVIEW_WEB_INFRA M5): two creators' scripts never share an instance
 #
 # Read-only root FS: Cloud Run has no read-only-rootfs flag (its writable layer is in-memory).
 # Mitigations: the app is owned by root and not writable by the runtime user; script processes run with
@@ -35,7 +36,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/srv \
     PORT=8080
 
-# Unprivileged runtime user (RLIMIT_NPROC=0 is only enforced for non-root users).
+# Process model (REVIEW_WEB_INFRA M5): the service PARENT runs as root inside the gVisor sandbox for ONE reason —
+# to drop every script child to its own fresh uid/gid (app/sandbox/runner.py _child_identity, uids 200000+, no
+# supplementary groups). The parent never executes creator code; it reads SANDBOX_SHARED_SECRET once, deletes it from
+# its environment and sets PR_SET_DUMPABLE=0 (service.py). Children: non-root per-run uid (RLIMIT_NPROC=0 enforced),
+# empty environment, no_new_privs, non-dumpable, rlimits. A per-run uid means an escaped child cannot read the
+# parent's /proc/<pid>/environ|mem, nor signal/ptrace another run. The sandbox SA has no IAM roles, the VPC has no
+# egress and DNS answers NXDOMAIN (bootstrap.sh). The `sandbox` user below is kept for local `docker run --user`.
 RUN groupadd --system --gid 10001 sandbox \
  && useradd --system --uid 10001 --gid sandbox --no-create-home --home-dir /nonexistent \
             --shell /usr/sbin/nologin sandbox \
@@ -48,6 +55,6 @@ COPY --chown=root:root --chmod=0444 backend/app/sandbox/*.py /srv/app/sandbox/
 RUN chmod 0555 /srv /srv/app /srv/app/sandbox \
  && python3 -m compileall -q /srv/app
 
-USER 10001:10001
+USER 0:0
 EXPOSE 8080
 CMD ["python3", "-m", "app.sandbox.service"]

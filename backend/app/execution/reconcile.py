@@ -3,6 +3,13 @@
 (a) positions: last executed target per (subscription, coin) vs the on-chain position → drift alerts.
 (b) builder fees: Σ builder fees of fills in our DB vs builder rewards accrued on-chain → critical alert if > $1.
 (c) treasury: ledger balance of ``treasury:hl_usdc`` vs the treasury's on-chain USDC → critical alert if > $1.
+(d) solvency (REVIEW_MONEY M7(d)): on-chain treasury USDC + builder receivable + Stripe clearing (ledger) must cover
+    every liability: Σ positive user fee balances + creator/referrer payables + uncollected profit share (ps_pending,
+    conservatively) + withdrawals/payouts/refunds pending + suspense. Negative fee balances (user debt) are NOT counted
+    as assets (receivables of doubtful value, C1). Shortfall → critical alert.
+(e) Stripe clearing (REVIEW_MONEY M7(c), stub): when a ``StripeClearingReader`` is wired, ledger ``stripe:clearing`` vs
+    the Stripe balance (from balance transactions). Not wired yet: there is no Stripe payout posting (bank ← clearing),
+    so the ledger side only grows; the report says ``stripe_clearing_status = "not_configured"``.
 
 Every check is isolated: one failing (e.g. an info endpoint outage) is reported and the others still run.
 """
@@ -21,6 +28,8 @@ from .ports import (
     LedgerReader,
     PositionReader,
     ReconcileRepo,
+    SolvencyRepo,
+    StripeClearingReader,
     TreasuryReader,
 )
 
@@ -58,6 +67,11 @@ class ReconcileReport:
     treasury_ledger_micro: int | None = None
     treasury_chain_micro: int | None = None
     treasury_mismatch: bool = False
+    solvency: dict[str, int] | None = None
+    solvency_shortfall_micro: int | None = None
+    stripe_clearing_status: str = "not_configured"
+    stripe_clearing_ledger_micro: int | None = None
+    stripe_clearing_stripe_micro: int | None = None
     errors: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -68,14 +82,21 @@ class ReconcileReport:
             "builder_db_micro": self.builder_db_micro, "builder_chain_micro": self.builder_chain_micro,
             "builder_mismatch": self.builder_mismatch,
             "treasury_ledger_micro": self.treasury_ledger_micro, "treasury_chain_micro": self.treasury_chain_micro,
-            "treasury_mismatch": self.treasury_mismatch, "errors": list(self.errors),
+            "treasury_mismatch": self.treasury_mismatch,
+            "solvency": dict(self.solvency) if self.solvency is not None else None,
+            "solvency_shortfall_micro": self.solvency_shortfall_micro,
+            "stripe_clearing_status": self.stripe_clearing_status,
+            "stripe_clearing_ledger_micro": self.stripe_clearing_ledger_micro,
+            "stripe_clearing_stripe_micro": self.stripe_clearing_stripe_micro,
+            "errors": list(self.errors),
         }
 
 
 class Reconciler:
     def __init__(self, *, repo: ReconcileRepo, positions: PositionReader, builder_rewards: BuilderRewardsReader,
                  treasury: TreasuryReader, ledger: LedgerReader, alerts: AlertSink,
-                 config: ReconcileConfig | None = None) -> None:
+                 config: ReconcileConfig | None = None, solvency: SolvencyRepo | None = None,
+                 stripe: StripeClearingReader | None = None) -> None:
         self.repo = repo
         self.positions = positions
         self.builder_rewards = builder_rewards
@@ -83,12 +104,19 @@ class Reconciler:
         self.ledger = ledger
         self.alerts = alerts
         self.cfg = config or ReconcileConfig()
+        self.solvency = solvency if solvency is not None else (repo if hasattr(repo, "solvency_ledger") else None)
+        self.stripe = stripe
 
     def run(self, date_key: str) -> ReconcileReport:
         """``date_key`` (e.g. "2026-09-30") scopes alert dedup keys to one run per day."""
         report = ReconcileReport()
-        for name, fn in (("positions", self.check_positions), ("builder_fees", self.check_builder_fees),
-                         ("treasury", self.check_treasury)):
+        checks = [("positions", self.check_positions), ("builder_fees", self.check_builder_fees),
+                  ("treasury", self.check_treasury)]
+        if self.solvency is not None:
+            checks.append(("solvency", self.check_solvency))
+        if self.stripe is not None:
+            checks.append(("stripe_clearing", self.check_stripe_clearing))
+        for name, fn in checks:
             try:
                 fn(report, date_key)
             except Exception as exc:
@@ -146,6 +174,38 @@ class Reconciler:
             self._alert("critical", "reconciliation_mismatch", {"scope": "treasury USDC", "ledger_micro": ledger,
                                                                 "onchain_micro": chain, "diff_micro": chain - ledger},
                         dedup=f"treasury_mismatch:{date_key}")
+
+    # (d) -------------------------------------------------------------------------------------------------------------
+    def check_solvency(self, report: ReconcileReport, date_key: str) -> None:
+        assert self.solvency is not None
+        led = {k: int(v) for k, v in dict(self.solvency.solvency_ledger()).items()}
+        chain = report.treasury_chain_micro
+        if chain is None:
+            chain = int(self.treasury.treasury_usdc_micro())
+        assets = chain + max(0, led.get("builder_receivable", 0)) + max(0, led.get("stripe_clearing", 0))
+        liabilities = sum(max(0, led.get(k, 0)) for k in (
+            "user_fee_balances_positive", "creator_payables", "referrer_payables", "ps_pending", "withdrawals_pending",
+            "payouts_pending", "refunds_pending", "suspense"))
+        led.update({"treasury_chain": chain, "assets": assets, "liabilities": liabilities})
+        report.solvency = led
+        report.solvency_shortfall_micro = max(0, liabilities - assets)
+        if liabilities - assets > self.cfg.mismatch_threshold_micro:
+            self._alert("critical", "solvency_shortfall", {
+                "assets_micro": assets, "liabilities_micro": liabilities, "shortfall_micro": liabilities - assets,
+                "user_debt_micro": led.get("user_debt", 0)}, dedup=f"solvency:{date_key}")
+
+    # (e) -------------------------------------------------------------------------------------------------------------
+    def check_stripe_clearing(self, report: ReconcileReport, date_key: str) -> None:
+        assert self.stripe is not None
+        ledger = int(self.ledger.balance("stripe:clearing"))
+        stripe = int(self.stripe.clearing_balance_micro())
+        report.stripe_clearing_ledger_micro, report.stripe_clearing_stripe_micro = ledger, stripe
+        report.stripe_clearing_status = "ok"
+        if abs(ledger - stripe) > self.cfg.mismatch_threshold_micro:
+            report.stripe_clearing_status = "mismatch"
+            self._alert("critical", "reconciliation_mismatch", {"scope": "stripe clearing", "ledger_micro": ledger,
+                                                                "stripe_micro": stripe, "diff_micro": stripe - ledger},
+                        dedup=f"stripe_clearing_mismatch:{date_key}")
 
     def _alert(self, severity: str, kind: str, payload: dict[str, Any], *, user_id: str | None = None,
                dedup: str | None = None) -> None:

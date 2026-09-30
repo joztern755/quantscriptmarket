@@ -731,11 +731,13 @@ class DomainAdapter:
     def normalize_referral_code(self, raw: Optional[str]) -> Optional[str]:
         return _require("app.domain.referrals").normalize_referral_code(raw)
 
-    def self_referral_reasons(self, *, referrer: tuple[str, list[str], list[Optional[str]]],
-                              referee: tuple[str, list[str], list[Optional[str]]]) -> tuple[str, ...]:
+    def self_referral_reasons(self, *, referrer: tuple, referee: tuple) -> tuple[str, ...]:
+        """referrer / referee = (user_id, wallets, devices[, networks]) — networks optional (F7)."""
         r = _require("app.domain.referrals")
-        a = r.ReferralIdentity.of(referrer[0], wallets=referrer[1], devices=referrer[2])
-        b = r.ReferralIdentity.of(referee[0], wallets=referee[1], devices=referee[2])
+        a = r.ReferralIdentity.of(referrer[0], wallets=referrer[1], devices=referrer[2],
+                                  networks=referrer[3] if len(referrer) > 3 else ())
+        b = r.ReferralIdentity.of(referee[0], wallets=referee[1], devices=referee[2],
+                                  networks=referee[3] if len(referee) > 3 else ())
         return tuple(r.self_referral_reasons(a, b))
 
     def estimate_monthly_need(self, prices: Any, plan_price: int) -> int:

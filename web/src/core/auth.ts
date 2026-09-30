@@ -7,6 +7,8 @@ import { ApiError } from "./api.js";
 import type { PageContext } from "./router.js";
 import { button, checkbox, clear, copyButton, field, h, modal, mount, note, promptDialog, spinner, toast } from "./ui.js";
 import { qrSvg } from "./qr.js";
+import { clearUserLocalData } from "./state.js";
+import { getConnectedWallet } from "./wallet.js";
 
 export interface SessionUser {
   uid: string;
@@ -301,6 +303,8 @@ export function takeRedirectNext(): string | null {
 export async function signOut(): Promise<void> {
   if (fb && auth) await fb.signOut(auth);
   current = null;
+  clearUserLocalData(); // SECURITY L4: no wallet/uid linkage left behind on shared devices
+  getConnectedWallet()?.disconnect();
   emit();
 }
 

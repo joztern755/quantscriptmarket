@@ -7,7 +7,14 @@ exact bytes, strict schema, staleness, continuity against the last stored signal
 stored in ``signals`` (source ``terminal``, raw = the signed JSON, signature) idempotently on
 UNIQUE(strategy_version_id, bar_close, coin).
 
-Pinning: when the version's ``params`` carry ``script_sha256`` it is enforced (a different script → rejected).
+Pinning (REVIEW_TRADING_KEYS F4): the version's ``params.script_sha256`` is MANDATORY (migration 0012 refuses an
+in-house version without it). A listed key whose latest version has no valid pin is not ingested at all (critical
+``signals_unpinned`` + auto-pause of its markets), and the feed is verified with ``require_script_pin=True`` so a
+different script is rejected.
+
+Trusted dexes (SPEC §12, REVIEW_TRADING_KEYS F1): a record for a coin on a builder dex that is not on the active
+``trusted_dexes`` allowlist is not stored (critical ``signals_untrusted_dex`` + auto-pause of that coin). If the
+allowlist cannot be read, only validator-perp records are stored (fail closed).
 
 On rejection nothing is stored; the error's alerts become ops events (``signals_<reason>``) and, for CRITICAL
 rejections (bad signature, stale, malformed, …), new entries are paused on the affected market
@@ -19,9 +26,25 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 
+import re
+
 from app.jobs_data import _db
+from app.strategies.dexes import dex_of, is_trusted_coin, load_trusted
 
 __all__ = ["ingest"]
+
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _trusted_dexes(db: Any) -> Optional[frozenset[str]]:
+    """Active trusted dexes, or None (fail closed: validator perps only) when the allowlist cannot be read. Its own
+    transaction, so a failure cannot abort the ingest transaction."""
+    try:
+        with _db.transaction(db) as conn:
+            return load_trusted(_db.runner(conn))
+    except Exception as e:  # noqa: BLE001
+        _db.log.error("trusted_dexes_unavailable", extra={"fields": {"error": type(e).__name__}})
+        return None
 
 
 def _last_accepted(conn: Any, version_id: str, key: str) -> Optional[Any]:
@@ -67,10 +90,12 @@ def ingest(db: Any, now: datetime, *, settings: Any = None, session: Any = None,
     versions: dict[str, Mapping[str, Any]] = {}
     last: dict[str, Any] = {}
     pinned: dict[str, str] = {}
+    trusted = _trusted_dexes(db)
     with _db.transaction(db) as conn:
         for key in keys:
             v = _db.one(conn, """
-                SELECT v.id::text AS version_id, v.strategy_id::text AS strategy_id, v.version, v.params
+                SELECT v.id::text AS version_id, v.strategy_id::text AS strategy_id, v.version, v.params,
+                       COALESCE(v.markets, s.markets) AS markets
                   FROM strategy_versions v JOIN strategies s ON s.id = v.strategy_id
                  WHERE s.slug = :slug
                  ORDER BY v.version DESC LIMIT 1""", slug=key)
@@ -78,13 +103,22 @@ def ingest(db: Any, now: datetime, *, settings: Any = None, session: Any = None,
                 _db.ops_alert(conn, "signals_no_version", {"strategy_key": key}, severity="critical",
                               dedup_key=f"signals_no_version:{key}:{now.date().isoformat()}")
                 continue
+            sha = _db.jload(v.get("params")).get("script_sha256")
+            if not (isinstance(sha, str) and _HEX64.match(sha)):
+                markets = [str(m) for m in (v.get("markets") or [])]
+                _db.ops_alert(conn, "signals_unpinned", {"strategy_key": key, "version": v.get("version"),
+                                                         "markets": markets}, severity="critical",
+                              dedup_key=f"signals_unpinned:{key}:{now.date().isoformat()}")
+                for coin in markets:
+                    if _db.pause_market_entries(conn, coin, "signals_unpinned"):
+                        out.setdefault("paused_markets", []).append(coin)
+                out.setdefault("unpinned", []).append(key)
+                continue
+            pinned[key] = sha
             versions[key] = v
             rec = _last_accepted(conn, v["version_id"], key)
             if rec is not None:
                 last[key] = rec
-            sha = _db.jload(v.get("params")).get("script_sha256")
-            if isinstance(sha, str) and len(sha) == 64:
-                pinned[key] = sha
     if not versions:
         out["error"] = "no strategy version for the listed keys"
         return out
@@ -92,7 +126,8 @@ def ingest(db: Any, now: datetime, *, settings: Any = None, session: Any = None,
     kwargs: dict[str, Any] = {"now": now, "pubkey_b64": settings.signals_pubkey_b64, "listed_keys": list(versions),
                               "max_age_hours": settings.risk.signal_max_age_hours,
                               "max_bar_age_days": settings.risk.signal_max_bar_age_days,
-                              "expected_script_sha256": pinned or None, "last_accepted": last or None}
+                              "expected_script_sha256": pinned, "last_accepted": last or None,
+                              "require_script_pin": True}
     if session is not None:
         kwargs["session"] = session
     result = ingest_signals(url or settings.signals_url, **kwargs)
@@ -109,6 +144,14 @@ def ingest(db: Any, now: datetime, *, settings: Any = None, session: Any = None,
         for rec in batch.records:
             v = versions.get(rec.strategy_key)
             if v is None:
+                continue
+            if not is_trusted_coin(rec.coin, trusted):
+                out["untrusted"] = out.get("untrusted", 0) + 1
+                _db.ops_alert(conn, "signals_untrusted_dex", {
+                    "strategy_key": rec.strategy_key, "coin": rec.coin, "dex": dex_of(rec.coin),
+                    "bar_close": rec.bar_close.isoformat(), "allowlist_loaded": trusted is not None},
+                    severity="critical", dedup_key=f"signals_untrusted_dex:{rec.coin}:{now.date().isoformat()}")
+                _db.pause_market_entries(conn, rec.coin, "signals_untrusted_dex")
                 continue
             ins = _db.one(conn, """
                 INSERT INTO signals (strategy_id, strategy_version_id, bar_close, coin, target_weight_bps, source, raw,

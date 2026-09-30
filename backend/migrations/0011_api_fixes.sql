@@ -220,9 +220,10 @@ CREATE TRIGGER payouts_send_guard BEFORE UPDATE ON payouts
 
 -- ---------------------------------------------------------------- funding source (F4, H4)
 -- Replays one user's fee-balance history in ledger order. Card credits (idempotency key 'stripe:%' with a credit)
--- add to the card lot; card reversals (refund / dispute: 'stripe:%' debits) and every SPEND reduce it first
--- (floored at 0); withdrawal holds never touch it (they may only draw on USDC money). Everything else credited
--- (USDC top-ups, attributed suspense, released holds) is USDC-funded.
+-- add to the card lot — minus whatever part of them paid an existing debt (negative balance), which is spent at
+-- once; card reversals (refund / dispute: 'stripe:%' debits) and every SPEND reduce the lot first (floored at 0);
+-- withdrawal holds never touch it (they may only draw on USDC money). The lot never exceeds the positive balance.
+-- Everything else credited (USDC top-ups, attributed suspense, released holds) is USDC-funded.
 CREATE FUNCTION fee_funding_card_unspent(p_user uuid, p_before_seq bigint DEFAULT NULL) RETURNS bigint
 LANGUAGE plpgsql
 STABLE
@@ -231,6 +232,7 @@ AS $$
 DECLARE
     r record;
     cu bigint := 0;
+    bal bigint := 0;
 BEGIN
     FOR r IN
         SELECT e.amount_micro AS amt, t.kind, t.idempotency_key AS k
@@ -243,11 +245,16 @@ BEGIN
     LOOP
         IF r.amt < 0 THEN
             IF r.k LIKE 'stripe:%' THEN
-                cu := cu - r.amt;
+                cu := cu + greatest(0, -r.amt - greatest(0, -bal));
             END IF;
-        ELSIF r.kind <> 'withdrawal_hold' THEN
-            cu := greatest(0, cu - r.amt);
+            bal := bal - r.amt;
+        ELSE
+            bal := bal - r.amt;
+            IF r.kind <> 'withdrawal_hold' THEN
+                cu := greatest(0, cu - r.amt);
+            END IF;
         END IF;
+        cu := least(cu, greatest(bal, 0));
     END LOOP;
     RETURN cu;
 END
@@ -296,12 +303,25 @@ DECLARE
     held bigint := 0;
 BEGIN
     FOR r IN
-        SELECT t.id AS tx_id, -e.amount_micro AS credited
+        SELECT t.id AS tx_id, -e.amount_micro AS credited, t.kind, t.idempotency_key AS k
           FROM ledger_entries e
           JOIN ledger_accounts a ON a.id = e.account_id
           JOIN ledger_transactions t ON t.id = e.tx_id
          WHERE a.code = p_code AND e.amount_micro < 0 AND t.created_at >= p_since
     LOOP
+        -- 0010 (C1): uncollected profit share released to the payable when the user's debt was paid; key
+        -- ps_release:{user}:{seq of the triggering posting}. Held in full when that posting was a CARD top-up.
+        IF r.kind = 'ps_pending_release' THEN
+            IF split_part(r.k, ':', 3) ~ '^[0-9]{1,18}$' AND EXISTS (
+                   SELECT 1 FROM ledger_transactions c
+                     JOIN ledger_entries ce ON ce.tx_id = c.id AND ce.amount_micro < 0
+                     JOIN ledger_accounts ca ON ca.id = ce.account_id
+                    WHERE c.seq = CAST(split_part(r.k, ':', 3) AS bigint) AND c.idempotency_key LIKE 'stripe:%'
+                      AND ca.code = 'user:' || split_part(r.k, ':', 2) || ':fee_balance') THEN
+                held := held + r.credited;
+            END IF;
+            CONTINUE;
+        END IF;
         SELECT * INTO part FROM fee_tx_card_part(r.tx_id);
         IF part.spend_micro > 0 AND part.card_micro > 0 THEN
             -- ceil: never release a micro too early

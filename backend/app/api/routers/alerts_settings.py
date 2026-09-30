@@ -128,11 +128,26 @@ def get_contacts(ctx: AuthCtx = Depends(consented_user), svc: Services = Depends
 
 @router.post("/telegram/link", response_model=LinkOut, dependencies=[user_limit("tg_link", 10, 3600)])
 def telegram_link(ctx: AuthCtx = Depends(consented_user), svc: Services = Depends(get_services)) -> LinkOut:
+    """First link: consented session. RE-linking while a chat is linked re-routes mandatory alerts, so it needs a
+    fresh sign-in (step-up) and warns the CURRENT chat + email (REVIEW_AUTH_API F2)."""
+    now = svc.now()
     with svc.db.begin() as conn:
-        link = telegram_bot.create_link(conn, user_id=ctx.user_id, now=svc.now(),
+        linked = user_sinks.contact_status(conn, ctx.user_id, now).telegram == "linked"
+    if linked:
+        svc.auth.require_step_up(ctx.claims, STEP_UP_MAX_AGE_SECONDS)
+        check_step_up_claims(ctx.claims, now)
+    with svc.db.begin() as conn:
+        link = telegram_bot.create_link(conn, user_id=ctx.user_id, now=now,
                                         bot_username=svc.settings.telegram_bot_username)
+        if linked:
+            # delivered by the alert worker to the chat linked NOW (and by email: critical) before any re-link
+            svc.notifier.notify(conn, user_id=ctx.user_id, severity="critical", kind="alert_contacts_changed",
+                                payload={"change": "telegram_relink_requested",
+                                         "text": "A new Telegram chat is being linked to your aijalon.trade alerts. "
+                                                 "If this was not you, sign in and contact support immediately."},
+                                dedup_key=f"alert_contacts_changed:{ctx.user_id}:{link['expires_at'].isoformat()}")
         svc.audit.write(conn, actor=ctx.actor, action="alerts.telegram_link_created", target=f"user:{ctx.user_id}",
-                        payload={"expires_at": link["expires_at"].isoformat()}, ip_hash=ctx.ip_hash)
+                        payload={"expires_at": link["expires_at"].isoformat(), "relink": linked}, ip_hash=ctx.ip_hash)
     return LinkOut(url=link["url"], expires_at=link["expires_at"])
 
 

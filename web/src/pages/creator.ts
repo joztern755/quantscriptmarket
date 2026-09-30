@@ -13,6 +13,7 @@ import { backtestPanel } from "./_shared/backtest.js";
 import { noCodeBuilder } from "./_shared/nocode-ui.js";
 import { precheckPython, PYTHON_TEMPLATE, defaultSpec } from "./_shared/nocode.js";
 import { renderMarkdown } from "./_shared/markdown.js";
+import { trustAnchors } from "../core/config.js";
 import { ensurePageCss, listOf, isAbortError, errCode, errMessage, pageHead, panel, usdInput, pctToBps, bpsToPctInput, isRec, kvWide, BACKTEST_WARNING } from "./_shared/util.js";
 
 export const title = "Creator Studio";
@@ -94,8 +95,18 @@ function kycBanner(ctx: PageContext, cfg: PublicConfig): HTMLElement {
                   return;
                 }
                 const url = typeof res.url === "string" ? res.url : "";
-                if (!/^https:\/\/[^\s]+$/i.test(url)) throw new Error("Verification could not be started. Please try again later.");
-                window.location.assign(url);
+                // SECURITY L2: only the KYC provider's own host (pinned in app-config.json), exact match, https.
+                let target: URL | null = null;
+                try {
+                  target = new URL(url);
+                } catch {
+                  target = null;
+                }
+                const allowed = trustAnchors().kycRedirectHosts;
+                if (!target || target.protocol !== "https:" || target.username || target.password || target.port || !allowed.includes(target.host.toLowerCase())) {
+                  throw new Error("Verification could not be started (unexpected verification address). Please contact support.");
+                }
+                window.location.assign(target.href);
               },
             }),
           ),

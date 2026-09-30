@@ -5,7 +5,9 @@ import type { PageContext } from "../core/router.js";
 import { h, mount, skeleton, errorState, emptyState, note, stat, kv, table, tabs, button, toast, confirmDialog, modal, field, badge, subStatusBadge, type Column } from "../core/ui.js";
 import { cancelButtons } from "../core/subscriptions.js";
 import { api, publicConfig, peekPublicConfig, newIdempotencyKey, type PublicConfig } from "../core/api.js";
-import { appConfig } from "../core/config.js";
+import { appConfig, trustAnchors } from "../core/config.js";
+import { addressCheck } from "../core/addr.js";
+import { proveDestination } from "./_shared/walletproof.js";
 import { loadStripe, stripeFeeNotice } from "../core/stripe.js";
 import { connectWallet, getConnectedWallet } from "../core/wallet.js";
 import { usdSend } from "../core/hl.js";
@@ -439,18 +441,34 @@ function depositPanel(ctx: PageContext, cfg: PublicConfig, onDone: () => void): 
   const payUsdc = async (): Promise<void> => {
     const m = valid();
     if (m === null) return;
-    if (!isAddress(cfg.treasury_address)) {
+    const treasury = trustAnchors().treasuryAddress; // PINNED in app-config.json (SECURITY H1), never the API's value
+    if (!isAddress(treasury) || !isAddress(cfg.treasury_address)) {
       toast("USDC deposits are not configured yet.", "bad");
+      return;
+    }
+    if (cfg.treasury_address !== treasury) {
+      toast("The server's deposit address does not match the address pinned by this site. Nothing was sent — contact support.", "bad");
       return;
     }
     const w = getConnectedWallet() ?? (await connectWallet());
     if (!w) return;
+    const ok = await confirmDialog({
+      title: `Send ${fmtUsd(m)} USDC to aijalon?`,
+      message: h(
+        "div",
+        { class: "stack" },
+        h("p", null, `Your wallet will ask you to sign a Hyperliquid UsdSend of ${fmtUsd(m)} from your perps balance to aijalon's treasury.`),
+        addressCheck(treasury, { label: "Treasury (destination) — compare with your wallet's screen" }),
+      ),
+      confirmLabel: "Sign in wallet",
+    });
+    if (!ok) return;
     usdcStatus.className = "status";
     usdcStatus.textContent = "Preparing…";
     const td = await api.post<UsdcTypedDataOut>("/deposits/usdc/typed-data", { amount_micro: m, from_address: w.address, signature_chain_id: await w.chainIdHex() }, { signal: ctx.signal });
-    if (td.destination.toLowerCase() !== cfg.treasury_address) throw new Error("The server's deposit address does not match the published treasury address. Nothing was sent.");
-    usdcStatus.textContent = `Check your wallet: send ${fmtUsd(m)} USDC from ${shortAddr(w.address)} to ${shortAddr(cfg.treasury_address)} (Hyperliquid UsdSend)…`;
-    const r = await usdSend(w, { destination: cfg.treasury_address, amountMicro: m, serverTypedData: td.payload.typed_data, expectDestination: cfg.treasury_address });
+    if (td.destination.toLowerCase() !== treasury) throw new Error("The server's deposit address does not match the pinned treasury address. Nothing was sent.");
+    usdcStatus.textContent = `Check your wallet: send ${fmtUsd(m)} USDC from ${shortAddr(w.address)} to ${treasury} (Hyperliquid UsdSend)…`;
+    const r = await usdSend(w, { destination: treasury, amountMicro: m, serverTypedData: td.payload.typed_data, expectDestination: treasury });
     if (!r.ok) {
       usdcStatus.className = "status err";
       usdcStatus.textContent = `Hyperliquid rejected the transfer: ${r.error ?? "unknown error"}`;
@@ -576,14 +594,20 @@ function withdrawPanel(ctx: PageContext, cfg: PublicConfig, getBal: () => Balanc
           if (b && m > b.withdrawable_micro) return toast(`You can withdraw up to ${fmtUsd(b.withdrawable_micro)}.`, "warn");
           const ok = await confirmDialog({
             title: "Request withdrawal?",
-            message: kv([
-              ["Amount", fmtUsd(m)],
-              ["To", h("span", { class: "mono break" }, addr.toLowerCase())],
-              ["Network", `Hyperliquid (${cfg.hl_chain})`],
-            ]),
-            confirmLabel: "Request withdrawal",
+            message: h(
+              "div",
+              { class: "stack" },
+              kv([
+                ["Amount", fmtUsd(m)],
+                ["Network", `Hyperliquid (${cfg.hl_chain})`],
+              ]),
+              addressCheck(addr, { label: "To (your verified wallet)" }),
+              h("p", { class: "small muted" }, "Next, your wallet asks you to sign a short ownership message WITH this wallet. Administrators re-check that signature before sending."),
+            ),
+            confirmLabel: "Sign proof & request",
           });
           if (!ok) return;
+          if (!(await proveDestination(addr))) return;
           try {
             await api.post<PayoutOut>("/withdrawals", { amount_micro: m, to_address: addr.toLowerCase() }, { signal: ctx.signal, idempotencyKey: key });
           } catch (err) {

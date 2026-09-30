@@ -2,7 +2,12 @@
 //
 // Policy: typed data offered by our server is VALIDATED (never signed as received); the payload that
 // is actually signed is always rebuilt here with the wallet's CURRENT chain id as signatureChainId and
-// a fresh nonce. Addresses/limits come from /v1/public/config (builder, treasury, agent name, fee cap).
+// a fresh nonce. Addresses/limits (builder, treasury, agent name, chain, fee cap) are the PINNED trust anchors of
+// app-config.json; /v1/public/config must agree with them or nothing is signed (trustedConfig, SECURITY H1).
+//
+// Submission: direct browser POST to Hyperliquid /exchange; if that fails at the network level (e.g. CORS), the
+// same body goes through our authenticated relay POST /v1/hl/exchange-relay (only approveAgent / approveBuilderFee
+// / usdSend; the server validates every field and the signer, then forwards it unchanged). See postExchange.
 //
 // Action key order mirrors the Hyperliquid Python SDK (hyperliquid/exchange.py + utils/signing.py
 // `sign_user_signed_action`, which APPENDS signatureChainId and hyperliquidChain to the dict built by
@@ -11,7 +16,8 @@
 // affect validity — but check against the SDK before go-live.
 
 import { api, publicConfig, ApiError } from "./api.js";
-import { appConfig } from "./config.js";
+import { appConfig, HL_MAX_BUILDER_FEE_TENTHS_BP, trustAnchors } from "./config.js";
+import { verifyAgentAttestation } from "./attest.js";
 import { microToDecimal, toMicro, type MicroLike } from "./format.js";
 import { isAddress } from "./keccak.js";
 import type { TypedData, Wallet } from "./wallet.js";
@@ -98,9 +104,12 @@ function checkAddr(a: string, what: string): string {
   return a.toLowerCase();
 }
 
-/** Tenths of a bp → Hyperliquid percent string: 100 → "0.1%", 10 → "0.01%", 1 → "0.001%". */
+/**
+ * Tenths of a bp → Hyperliquid percent string: 100 → "0.1%", 10 → "0.01%", 1 → "0.001%".
+ * Hard cap 100 (= 0.1 %, Hyperliquid's perps maximum): a compromised config can never make us ask for more.
+ */
 export function maxFeeRateFromTenthsBp(t: number): string {
-  if (!Number.isInteger(t) || t < 0 || t > 1000) throw new HlValidationError("Invalid builder fee rate");
+  if (!Number.isInteger(t) || t < 0 || t > HL_MAX_BUILDER_FEE_TENTHS_BP) throw new HlValidationError("Invalid builder fee rate");
   const whole = Math.floor(t / 1000);
   const frac = String(t % 1000).padStart(3, "0").replace(/0+$/, "");
   return `${whole}${frac ? "." + frac : ""}%`;
@@ -343,27 +352,70 @@ export async function signAndSubmit(wallet: Wallet, built: BuiltAction): Promise
   return { ...res, nonce: built.nonce };
 }
 
-async function liveConfig() {
-  const cfg = await publicConfig();
-  if (cfg._fallback) throw new ApiError(0, "config_unavailable", "Couldn't load the platform configuration. Try again in a moment.");
-  return cfg;
+/**
+ * Public config from the API, CROSS-CHECKED against the trust anchors pinned in app-config.json (SECURITY H1).
+ * The API is not trusted for anything a wallet signs: chain, agent name, builder, treasury and the fee ceiling must
+ * equal the pinned values (any disagreement = a compromised/buggy API or edge → refuse), and the values used for
+ * signing are the PINNED ones.
+ */
+export interface TrustedConfig {
+  hl_chain: HlChain;
+  agent_name: string;
+  builder_address: string;
+  treasury_address: string;
+  builder_fee_tenths_bp: number;
 }
 
-/** Master wallet approves our per-user agent (named `agent_name`). */
-export async function approveAgent(wallet: Wallet, p: { agentAddress: string; serverTypedData?: unknown }): Promise<HlResult> {
-  const cfg = await liveConfig();
-  if (p.serverTypedData !== undefined) {
-    validateServerTypedData("approveAgent", p.serverTypedData, { hyperliquidChain: cfg.hl_chain, agentAddress: p.agentAddress, agentName: cfg.agent_name });
+export async function trustedConfig(need: { builder?: boolean; treasury?: boolean } = {}): Promise<TrustedConfig> {
+  const cfg = await publicConfig();
+  if (cfg._fallback) throw new ApiError(0, "config_unavailable", "Couldn't load the platform configuration. Try again in a moment.");
+  const t = trustAnchors();
+  const refuse = (what: string) => {
+    throw new HlValidationError(`Signing refused: ${what}. Nothing was signed — please contact support.`);
+  };
+  if (!t.hlChain || !t.agentName || !t.maxBuilderFeeTenthsBp) refuse("this site build has no pinned signing configuration");
+  if (cfg.hl_chain !== t.hlChain) refuse("the server's Hyperliquid network does not match this site's pinned network");
+  if (cfg.agent_name !== t.agentName) refuse("the server's agent name does not match this site's pinned agent name");
+  const fee = cfg.economics.builder_fee_tenths_bp;
+  if (!Number.isInteger(fee) || fee <= 0 || fee > t.maxBuilderFeeTenthsBp || fee > HL_MAX_BUILDER_FEE_TENTHS_BP) refuse("the server's builder fee is above this site's pinned maximum");
+  if (need.builder) {
+    if (!t.builderAddress) refuse("this site build has no pinned builder address");
+    if (cfg.builder_address !== t.builderAddress) refuse("the server's builder address does not match this site's pinned builder address");
   }
-  const built = buildApproveAgent({ agentAddress: p.agentAddress, agentName: cfg.agent_name, nonce: Date.now(), signatureChainId: await wallet.chainIdHex(), hyperliquidChain: cfg.hl_chain });
+  if (need.treasury) {
+    if (!t.treasuryAddress) refuse("this site build has no pinned treasury address");
+    if (cfg.treasury_address !== t.treasuryAddress) refuse("the server's treasury address does not match this site's pinned treasury address");
+  }
+  return { hl_chain: t.hlChain as HlChain, agent_name: t.agentName, builder_address: t.builderAddress, treasury_address: t.treasuryAddress, builder_fee_tenths_bp: fee };
+}
+
+/** Executor-signed proof that `agentAddress` is the user's sealed agent (see core/attest.ts). */
+export interface AgentAttestationProof {
+  userId: string;
+  signatureB64: string;
+}
+
+/**
+ * Master wallet approves our per-user agent (named `agent_name`). Refuses unless the agent address carries a valid
+ * executor attestation verified with the PINNED public key (a compromised API cannot mint one).
+ */
+export async function approveAgent(wallet: Wallet, p: { agentAddress: string; serverTypedData?: unknown; attestation: AgentAttestationProof | null | undefined }): Promise<HlResult> {
+  const cfg = await trustedConfig();
+  const agentAddress = checkAddr(p.agentAddress, "agent");
+  if (!p.attestation || !(await verifyAgentAttestation({ userId: p.attestation.userId, agentAddress, signatureB64: p.attestation.signatureB64 }))) {
+    throw new HlValidationError("Signing refused: this agent address is not attested by aijalon's executor. Nothing was signed — please contact support.");
+  }
+  if (p.serverTypedData !== undefined) {
+    validateServerTypedData("approveAgent", p.serverTypedData, { hyperliquidChain: cfg.hl_chain, agentAddress, agentName: cfg.agent_name });
+  }
+  const built = buildApproveAgent({ agentAddress, agentName: cfg.agent_name, nonce: Date.now(), signatureChainId: await wallet.chainIdHex(), hyperliquidChain: cfg.hl_chain });
   return signAndSubmit(wallet, built);
 }
 
-/** Master wallet approves our builder fee at the published rate (never above config). */
+/** Master wallet approves our builder fee at the published rate (never above the pinned ceiling, never above 0.1 %). */
 export async function approveBuilderFee(wallet: Wallet, p: { serverTypedData?: unknown } = {}): Promise<HlResult> {
-  const cfg = await liveConfig();
-  if (!cfg.builder_address) throw new ApiError(0, "config_unavailable", "Builder address is not configured.");
-  const maxT = cfg.economics.builder_fee_tenths_bp;
+  const cfg = await trustedConfig({ builder: true });
+  const maxT = cfg.builder_fee_tenths_bp;
   if (p.serverTypedData !== undefined) {
     validateServerTypedData("approveBuilderFee", p.serverTypedData, { hyperliquidChain: cfg.hl_chain, builder: cfg.builder_address, maxFeeTenthsBp: maxT });
   }
@@ -372,13 +424,19 @@ export async function approveBuilderFee(wallet: Wallet, p: { serverTypedData?: u
 }
 
 /**
- * USDC transfer (perps balance) — fee-balance deposits to the treasury, or admin payouts.
- * `expectDestination` must come from a trusted source (public config treasury, or the maker-checker
- * approved payout record) and must equal `destination`.
+ * USDC transfer (perps balance).
+ *  * From a USER wallet it can only be a fee-balance deposit: the destination must be the PINNED treasury.
+ *  * From the PINNED treasury wallet (admin payouts / refunds, maker-checker approved) the destination is the
+ *    approved record's address; the caller must have shown it in full and verified the beneficiary's proof.
+ * `expectDestination` must come from a trusted source and must equal `destination`.
  */
 export async function usdSend(wallet: Wallet, p: { destination: string; amountMicro: MicroLike; expectDestination: string; serverTypedData?: unknown }): Promise<HlResult> {
-  const cfg = await liveConfig();
+  const cfg = await trustedConfig({ treasury: true });
   if (!isAddress(p.destination) || p.destination.toLowerCase() !== String(p.expectDestination).toLowerCase()) throw new HlValidationError("Destination does not match the expected address");
+  const fromTreasury = wallet.address.toLowerCase() === cfg.treasury_address;
+  if (!fromTreasury && p.destination.toLowerCase() !== cfg.treasury_address) {
+    throw new HlValidationError("Signing refused: deposits can only go to this site's pinned treasury address. Nothing was signed.");
+  }
   const amt = toMicro(p.amountMicro);
   if (amt <= 0n) throw new HlValidationError("Amount must be positive");
   if (p.serverTypedData !== undefined) {

@@ -44,6 +44,7 @@ def verify_wallet(body: S.WalletVerifyIn, ctx: AuthCtx = Depends(step_up_user),
         msg = v.parse_siwe(body.message)
         issued = v.parse_issued_at(msg["Issued At"])
         expires = v.parse_issued_at(msg["Expiration Time"]) if "Expiration Time" in msg else None
+        not_before = v.parse_issued_at(msg["Not Before"]) if "Not Before" in msg else None
     except v.InputError as e:
         raise ValidationFailed(str(e)) from None
     now = svc.now()
@@ -58,6 +59,8 @@ def verify_wallet(body: S.WalletVerifyIn, ctx: AuthCtx = Depends(step_up_user),
         raise ValidationFailed("sign-in message expired; request a new nonce")
     if expires is not None and expires <= now:
         raise ValidationFailed("sign-in message expired; request a new nonce")
+    if not_before is not None and not_before > now:     # F18: EIP-4361 Not Before is honoured
+        raise ValidationFailed("sign-in message is not valid yet")
     signer = svc.wallet_sig.recover(body.message, body.signature)
     if signer != body.address:
         raise ValidationFailed("signature does not match the wallet address")
@@ -71,14 +74,17 @@ def verify_wallet(body: S.WalletVerifyIn, ctx: AuthCtx = Depends(step_up_user),
             raise Conflict("this wallet is linked to another account")
         referrer = ctx.user.get("referred_by")
         if referrer:
-            reasons = svc.domain.self_referral_reasons(
-                referrer=(str(referrer), [w["address"] for w in svc.store.list_wallets(conn, str(referrer))], []),
-                referee=(ctx.user_id, [body.address], []))
-            if reasons:
-                # Referral binding is immutable (SPEC §1.2): flag for ops instead of silently rewriting it.
-                svc.notifier.notify(conn, user_id=None, severity="warn", kind="self_referral_suspected",
-                                    payload={"user_id": ctx.user_id, "referrer": str(referrer),
-                                             "reasons": list(reasons)})
+            # Referral binding is immutable (SPEC §1.2): a match (wallet, device, network) FLAGS the referee — no
+            # referral reward from this account until ops clears it — instead of silently rewriting the binding.
+            from app.api.referral_guard import flag_self_referral, self_referral_check
+
+            ref_user = svc.store.get_user(conn, str(referrer))
+            if ref_user is not None:
+                _, reasons = self_referral_check(conn, svc, referrer=ref_user, referee=ctx.user,
+                                                 referee_wallets=[body.address])
+                if reasons:
+                    flag_self_referral(conn, svc, referee_id=ctx.user_id, referrer_id=str(referrer),
+                                       reasons=reasons, where="wallet_verify")
         svc.audit.write(conn, actor=ctx.actor, action="wallet.verify", target=f"wallet:{body.address}",
                         payload={"chain_id": msg["Chain ID"]}, ip_hash=ctx.ip_hash)
     return S.WalletOut(address=row["address"], verified_at=row["verified_at"])

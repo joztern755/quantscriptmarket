@@ -5,7 +5,8 @@ Endpoints (JSON in, JSON out; errors → ``{"error": code, "message": ..., "deta
 * ``GET  /healthz``                      → ``{"ok": true}`` (no auth; carries no data)
 * ``POST /validate``   ``{source, known_markets?, platform_max_leverage?}`` → ValidationResult
 * ``POST /run``        ``{source, bars, now_ms?}`` → ``{weights, cpu_seconds, code_hash}``
-  (live: the executor calls this once per strategy version per bar close)
+  (live: the executor calls this once per strategy version per bar close). Runs the script twice (fresh processes,
+  different hash seeds / heap layout) and fails (422 ``nondeterministic``) if the two results differ.
 * ``POST /backtest``   ``{source, data: MarketData, params?}`` → backtest report. The sandbox has **no
   egress**, so the caller (api) fetches candles/funding with ``backtest.fetch_market_data`` and sends them.
 * ``POST /nocode/compile`` ``{spec}`` → ``{source, meta, code_hash}``
@@ -18,15 +19,19 @@ Auth, two layers:
    the request reaches this process.
 2. **Shared secret** header ``X-Sandbox-Secret`` (constant-time compare), from Secret Manager mounted as
    the env var ``SANDBOX_SHARED_SECRET``. Defense in depth, and the only auth for local runs.
-   The service refuses to start without it.
+   The service refuses to start without it. ``main`` reads it ONCE, deletes it from ``os.environ`` and marks the
+   process non-dumpable (``PR_SET_DUMPABLE=0``) before serving (REVIEW_WEB_INFRA M5): children never inherit it
+   (their environment is built from scratch, runner._CHILD_ENV) and, running under their own uid, cannot read the
+   parent's ``/proc/<pid>/environ`` or memory.
 
 Source code is never logged (creator IP): logs carry a 16-hex prefix of the SHA-256 code hash, timings, outcome.
 Env is read only in :func:`main` (this entrypoint runs in its own container without ``app.config``).
 
 Recommended Cloud Run flags (see sandbox/Dockerfile): ``--execution-environment gen1`` (gVisor),
 ``--service-account sandbox@…`` (no roles), ``--network … --subnet … --vpc-egress all-traffic`` into a
-VPC with no NAT and a deny-all egress firewall, ``--concurrency 4 --cpu 2 --memory 2Gi``,
-``--max-instances`` small, ``--timeout 300``.
+VPC with no NAT, a deny-all egress firewall and an NXDOMAIN DNS response policy, ``--concurrency 1 --cpu 2
+--memory 2Gi`` (one creator's script per instance; ``SANDBOX_MAX_CONCURRENT=1``), ``--max-instances`` small,
+``--timeout 300``. The container runs the parent as root ONLY to give every child its own uid (runner.py).
 """
 from __future__ import annotations
 
@@ -45,7 +50,7 @@ from app.logging import get_logger
 from app.sandbox import backtest as bt
 from app.sandbox import nocode, runner, validate
 
-__all__ = ["make_server", "SandboxHandler", "main", "MAX_BODY_BYTES", "SECRET_HEADER"]
+__all__ = ["make_server", "SandboxHandler", "main", "MAX_BODY_BYTES", "SECRET_HEADER", "take_secret", "harden_parent"]
 
 MAX_BODY_BYTES = 16 * 1024 * 1024
 SECRET_HEADER = "X-Sandbox-Secret"
@@ -89,7 +94,7 @@ def h_run(body: dict[str, Any]) -> dict[str, Any]:
     now_ms = body.get("now_ms")
     if now_ms is not None and (isinstance(now_ms, bool) or not isinstance(now_ms, int)):
         raise ValidationFailed("now_ms must be an integer")
-    res = runner.run_signal(src, bars, now_ms=now_ms)
+    res = runner.run_signal_checked(src, bars, now_ms=now_ms)
     return {"weights": res.weights, "cpu_seconds": res.cpu_seconds, "code_hash": _code_hash(src)}
 
 
@@ -194,7 +199,7 @@ class SandboxHandler(BaseHTTPRequestHandler):
             self._send(500, {"error": "internal", "message": "internal error", "details": {}})
 
 
-def make_server(host: str, port: int, secret: str, *, max_concurrent: int = 4) -> ThreadingHTTPServer:
+def make_server(host: str, port: int, secret: str, *, max_concurrent: int = 1) -> ThreadingHTTPServer:
     if not secret or len(secret) < 16:
         raise RuntimeError("SANDBOX_SHARED_SECRET must be set (≥ 16 chars)")
     handler = type("BoundSandboxHandler", (SandboxHandler,), {
@@ -204,16 +209,38 @@ def make_server(host: str, port: int, secret: str, *, max_concurrent: int = 4) -
     return srv
 
 
+SECRET_ENV = "SANDBOX_SHARED_SECRET"
+
+
+def take_secret(environ: Any = None) -> str:
+    """Read the shared secret ONCE and remove it from the process environment (REVIEW_WEB_INFRA M5)."""
+    env = os.environ if environ is None else environ
+    return str(env.pop(SECRET_ENV, "") or "")
+
+
+def harden_parent() -> bool:
+    """``PR_SET_DUMPABLE=0`` on the service process: other uids cannot ptrace it or read /proc/<pid>/{environ,mem}.
+    Returns True when applied (Linux)."""
+    try:
+        import ctypes
+
+        return ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0) == 0     # PR_SET_DUMPABLE = 4
+    except Exception:  # noqa: BLE001 - non-Linux dev machines
+        return False
+
+
 def main() -> None:  # pragma: no cover - container entrypoint
     port = int(os.environ.get("PORT", "8080"))
-    secret = os.environ.get("SANDBOX_SHARED_SECRET", "")
-    conc = int(os.environ.get("SANDBOX_MAX_CONCURRENT", "4"))
+    secret = take_secret()
+    dumpable_off = harden_parent()
+    conc = int(os.environ.get("SANDBOX_MAX_CONCURRENT", "1"))
     try:
         srv = make_server("0.0.0.0", port, secret, max_concurrent=conc)
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
         sys.exit(2)
-    log.info("sandbox listening", extra={"fields": {"port": port, "max_concurrent": conc}})
+    log.info("sandbox listening", extra={"fields": {"port": port, "max_concurrent": conc,
+                                                    "non_dumpable": dumpable_off, "root_parent": os.geteuid() == 0}})
     srv.serve_forever()
 
 

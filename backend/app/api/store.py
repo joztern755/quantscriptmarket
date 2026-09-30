@@ -20,6 +20,8 @@ from typing import Any, Optional
 
 from contextlib import nullcontext
 
+from app.api.store_security import SecurityStoreMixin
+
 Cursor = Optional[tuple[datetime, str]]
 
 LIVE_SUB_STATUSES = ("pending", "active", "past_due", "reduce_only", "paused_user", "closing")
@@ -33,7 +35,9 @@ _AGENT_COLS = ("id, created_at, user_id, master_address, agent_address, agent_na
 _SUB_COLS = ("s.id, s.created_at, s.user_id, s.strategy_id, s.strategy_version_id, s.trading_address, "
              "s.master_address, s.allocation_micro, s.max_leverage_x100, s.status::text AS status, "
              "s.current_period_end, s.hwm_micro, s.cum_pnl_micro, s.cancel_positions::text AS cancel_positions, "
-             "s.cancelled_at")
+             "s.cancelled_at, s.past_due_since, s.pre_pause_status::text AS pre_pause_status, "
+             "s.price_monthly_micro AS pinned_price_micro, s.profit_share_bps AS pinned_profit_share_bps, "
+             "s.end_reason")
 _STRAT_COLS = ("st.id, st.created_at, st.slug, st.name, st.owner_user_id, st.in_house, st.markets, st.timeframe, "
                "st.price_monthly_micro, st.profit_share_bps, st.status::text AS status, st.description")
 _VERSION_COLS = ("v.id, v.created_at, v.strategy_id, v.version, v.code_hash, v.params, v.markets, v.timeframe, "
@@ -48,7 +52,7 @@ def _j(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"), default=str)
 
 
-class SqlStore:
+class SqlStore(SecurityStoreMixin):
     # ------------------------------------------------------------------------------------------ helpers
     @staticmethod
     def _runner(conn: Any) -> Any:
@@ -184,12 +188,14 @@ class SqlStore:
         self._exec(conn, "UPDATE users SET mfa_factor_hash = :h WHERE id = CAST(:u AS uuid)", h=factor_hash, u=user_id)
 
     def search_users(self, conn: Any, q: Optional[str], limit: int, cursor: Cursor) -> list[dict]:
+        """Prefix search on e-mail (LIKE wildcards in the query are escaped: F18) or exact id."""
+        like = None if q is None else q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         return self._all(conn, f"""
             SELECT {_USER_COLS} FROM users
-            WHERE (CAST(:q AS text) IS NULL OR lower(email) LIKE lower(CAST(:q AS text)) || '%'
+            WHERE (CAST(:q AS text) IS NULL OR lower(email) LIKE lower(CAST(:like AS text)) || '%' ESCAPE '\\'
                    OR id::text = CAST(:q AS text))
               AND (CAST(:cts AS timestamptz) IS NULL OR (created_at, id) < (CAST(:cts AS timestamptz), CAST(:cid AS uuid)))
-            ORDER BY created_at DESC, id DESC LIMIT :lim""", q=q, lim=limit + 1, **_c(cursor))
+            ORDER BY created_at DESC, id DESC LIMIT :lim""", q=q, like=like, lim=limit + 1, **_c(cursor))
 
     # ------------------------------------------------------------------------------------------ consents
     def accepted_consents(self, conn: Any, user_id: str) -> dict[str, str]:
@@ -231,10 +237,11 @@ class SqlStore:
                                     AND verified_at IS NOT NULL""", u=user_id, a=address)
 
     def upsert_verified_wallet(self, conn: Any, user_id: str, address: str, now: datetime) -> dict:
-        """Bind address → user. Never re-binds a wallet that belongs to another user (returns that row)."""
+        """Bind address → user. Never re-binds a wallet that belongs to another user (returns that row). The FIRST
+        verification time is kept (it is the wallet's age for the 48 h payout-address hold and the USDC credit cut-off)."""
         row = self._one(conn, """
             INSERT INTO wallets (user_id, master_address, verified_at) VALUES (CAST(:u AS uuid), :a, :t)
-            ON CONFLICT (master_address) DO UPDATE SET verified_at = EXCLUDED.verified_at
+            ON CONFLICT (master_address) DO UPDATE SET verified_at = coalesce(wallets.verified_at, EXCLUDED.verified_at)
                 WHERE wallets.user_id = EXCLUDED.user_id
             RETURNING user_id, master_address AS address, verified_at""", u=user_id, a=address, t=now)
         if row is None:
@@ -406,7 +413,8 @@ class SqlStore:
                    CASE WHEN p.price_micro = 0 THEN left(p.body, 280) ELSE NULL END AS preview
               FROM posts p JOIN users u ON u.id = p.creator_id
               LEFT JOIN strategies st ON st.id = p.strategy_id
-             WHERE p.published_at IS NOT NULL
+             WHERE p.published_at IS NOT NULL AND u.status = 'active'
+               AND (p.strategy_id IS NULL OR st.status IN ('listed', 'paused'))
                AND (CAST(:slug AS text) IS NULL OR st.slug = CAST(:slug AS text))
                AND (CAST(:cts AS timestamptz) IS NULL OR (p.created_at, p.id) < (CAST(:cts AS timestamptz), CAST(:cid AS uuid)))
              ORDER BY p.created_at DESC, p.id DESC LIMIT :lim""", slug=strategy_slug, lim=limit + 1, **_c(cursor))
@@ -450,19 +458,24 @@ class SqlStore:
 
     def insert_subscription(self, conn: Any, *, user_id: str, strategy_id: str, version_id: str, trading_address: str,
                             master_address: str, allocation_micro: int, max_leverage_x100: int, status: str,
-                            current_period_end: datetime) -> dict:
+                            current_period_end: datetime, price_monthly_micro: Optional[int] = None,
+                            profit_share_bps: Optional[int] = None) -> dict:
+        """M8: the terms the user acknowledged are PINNED on the row (the 0011 trigger pins the strategy's current
+        terms when they are not passed)."""
         row = self._one(conn, f"""
             WITH s AS (
                 INSERT INTO subscriptions (user_id, strategy_id, strategy_version_id, trading_address, master_address,
-                                           allocation_micro, max_leverage_x100, status, current_period_end)
+                                           allocation_micro, max_leverage_x100, status, current_period_end,
+                                           price_monthly_micro, profit_share_bps)
                 VALUES (CAST(:u AS uuid), CAST(:sid AS uuid), CAST(:vid AS uuid), :a, :m, :alloc, :lev,
-                        CAST(:st AS subscription_status), :pe)
+                        CAST(:st AS subscription_status), :pe, CAST(:price AS bigint), CAST(:ps AS integer))
                 RETURNING *)
             SELECT {_SUB_COLS}, st.slug AS strategy_slug, st.name AS strategy_name, st.markets AS strategy_markets
               FROM s JOIN strategies st ON st.id = s.strategy_id""",
                         u=user_id, sid=strategy_id, vid=version_id, a=trading_address, m=master_address,
                         alloc=allocation_micro,
-                        lev=max_leverage_x100, st=status, pe=current_period_end)
+                        lev=max_leverage_x100, st=status, pe=current_period_end, price=price_monthly_micro,
+                        ps=profit_share_bps)
         assert row is not None
         return row
 
@@ -577,7 +590,7 @@ class SqlStore:
                SET status = 'credited', credited_tx_id = EXCLUDED.credited_tx_id, amount_micro = EXCLUDED.amount_micro,
                    fee_micro = EXCLUDED.fee_micro, withdrawable = EXCLUDED.withdrawable,
                    amount_minor = coalesce(EXCLUDED.amount_minor, deposits.amount_minor), meta = EXCLUDED.meta
-             WHERE deposits.status <> 'credited' AND deposits.user_id = EXCLUDED.user_id
+             WHERE deposits.status = 'pending' AND deposits.user_id = EXCLUDED.user_id
             RETURNING {cols}""", u=user_id, m=method, r=external_ref, a=amount_micro,
                         cur=(currency or None) and currency.upper(), minor=amount_minor, fee=fee_micro, w=withdrawable,
                         tx=tx_id, meta=_j(meta or {}))
@@ -591,19 +604,26 @@ class SqlStore:
                    r=external_ref)
 
     def withdrawable_usdc(self, conn: Any, user_id: str) -> int:
-        """USDC-funded credits minus non-rejected withdrawals. Card credits are spend-only (never withdrawable)."""
+        """USDC-funded UNSPENT balance (F4/H4). Card-funded credits are spend-only and are spent FIRST
+        (fee_funding_card_unspent, 0011), so withdrawable = spendable − card lot, and never more than the USDC ever
+        credited minus what was already withdrawn."""
         row = self._one(conn, """
-            SELECT (SELECT coalesce(sum(amount_micro), 0) FROM deposits
-                     WHERE user_id = CAST(:u AS uuid) AND withdrawable AND status = 'credited')
-                 - (SELECT coalesce(sum(amount_micro), 0) FROM withdrawals
-                     WHERE beneficiary_user_id = CAST(:u AS uuid) AND status <> 'rejected') AS w""", u=user_id)
-        return max(0, int(row["w"])) if row else 0
+            SELECT (SELECT -coalesce(sum(e.amount_micro), 0) FROM ledger_entries e
+                      JOIN ledger_accounts a ON a.id = e.account_id
+                     WHERE a.code = 'user:' || CAST(:u AS text) || ':fee_balance') AS spendable,
+                   fee_funding_card_unspent(CAST(:u2 AS uuid)) AS card_unspent""", u=user_id, u2=user_id)
+        if not row:
+            return 0
+        lot = max(0, int(row["spendable"] or 0) - int(row["card_unspent"] or 0))
+        return max(0, min(lot, self.usdc_credited_minus_withdrawn(conn, user_id)))
 
     # ------------------------------------------------------------------------------------------ withdrawals / payouts
     _PAYOUT_COLS_W = ("id, created_at, 'withdrawal' AS kind, beneficiary_user_id AS beneficiary, amount_micro, "
-                      "to_address, status::text AS status, maker_admin, checker_admin, tx_hash, NULL::uuid AS ledger_account_id")
+                      "to_address, status::text AS status, maker_admin, checker_admin, tx_hash, NULL::uuid AS ledger_account_id, "
+                      "send_nonce, send_issued_at")
     _PAYOUT_COLS_P = ("id, created_at, 'payout' AS kind, beneficiary_user_id AS beneficiary, amount_micro, "
-                      "to_address, status::text AS status, maker_admin, checker_admin, tx_hash, ledger_account_id")
+                      "to_address, status::text AS status, maker_admin, checker_admin, tx_hash, ledger_account_id, "
+                      "send_nonce, send_issued_at")
 
     def pending_withdrawals_total(self, conn: Any, user_id: str) -> int:
         row = self._one(conn, """SELECT coalesce(sum(amount_micro), 0)::bigint AS s FROM withdrawals
@@ -791,7 +811,8 @@ class SqlStore:
             WITH ref AS (SELECT id FROM users WHERE referred_by = CAST(:u AS uuid))
             SELECT (SELECT count(*) FROM ref) AS total,
                    (SELECT count(DISTINCT s.user_id) FROM subscriptions s JOIN ref ON ref.id = s.user_id
-                     WHERE s.status IN ('active', 'past_due', 'reduce_only')) AS active,
+                     WHERE s.status IN ('active', 'past_due', 'reduce_only')
+                       AND user_has_paid_activity(s.user_id)) AS active,
                    (SELECT coalesce(sum(round(f.px * f.sz * 1000000)), 0)::bigint
                       FROM fills f JOIN subscriptions s ON s.id = f.subscription_id JOIN ref ON ref.id = s.user_id
                      WHERE f.time >= :since) AS notional""", u=user_id, since=since)

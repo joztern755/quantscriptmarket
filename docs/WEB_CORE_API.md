@@ -285,7 +285,11 @@ interface BuiltAction { action: Record<string, unknown>; nonce: number; typedDat
 validateServerTypedData(kind: "approveAgent"|"approveBuilderFee"|"usdSend", typed: unknown, expect: {...}): { nonce: number; fields: Record<string,string|number> }
   // throws HlValidationError if primaryType/domain/types/chain/agent/builder/maxFeeRate/destination/amount differ from expectations
 splitSignature(sig: string): { r: string; s: string; v: number }
-postExchange(body: { action; nonce; signature }): Promise<HlResult>     // POST https://api.hyperliquid.xyz/exchange
+postExchange(body: { action; nonce; signature }): Promise<HlResult>     // POST https://api.hyperliquid.xyz/exchange;
+  // on a NETWORK/CORS failure (fetch throws) and action.type ∈ RELAYABLE_ACTIONS (approveAgent, approveBuilderFee,
+  // usdSend) the same body goes to the authenticated relay POST /v1/hl/exchange-relay (API_CONTRACT); an HTTP error
+  // from Hyperliquid is an answer and is never relayed. A relayed "nonce" error means the first try may have landed.
+relayExchange(body): Promise<HlResult>; interpretExchange(status, text, json): HlResult; RELAYABLE_ACTIONS
 signAndSubmit(wallet: Wallet, built: BuiltAction): Promise<HlResult>
 approveAgent(wallet, p: { agentAddress: string; serverTypedData?: unknown }): Promise<HlResult>        // uses publicConfig().agent_name / hl_chain
 approveBuilderFee(wallet, p?: { serverTypedData?: unknown }): Promise<HlResult>                        // builder + max rate from publicConfig()

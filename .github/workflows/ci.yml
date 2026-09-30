@@ -219,7 +219,9 @@ jobs:
               echo "::warning::sandbox base image not pinned yet — CI smoke build uses the tag"; args="--build-arg PYTHON_IMAGE=python:3.12-slim"
             fi
             DOCKER_BUILDKIT=1 docker build $args -f sandbox/Dockerfile -t aijalon-sandbox:ci .
-            test "$(docker run --rm --entrypoint id aijalon-sandbox:ci -u)" = "10001"
+            # parent runs as root ONLY to drop every script child to its own uid (REVIEW_WEB_INFRA M5, runner.py)
+            test "$(docker run --rm --entrypoint id aijalon-sandbox:ci -u)" = "0"
+            docker run --rm --entrypoint python3 aijalon-sandbox:ci -c "from app.sandbox.runner import _child_identity as c; kw, uid = c(); assert kw and uid >= 200000 and kw['user'] == uid, kw; print('child uid', uid)"
           else
             echo "::warning::sandbox/Dockerfile not present"
           fi

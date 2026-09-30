@@ -33,19 +33,27 @@ SANDBOX_IMAGE_REPO="${AR_HOST}/${PROJECT_ID}/${AR_REPO}/sandbox"
 
 # ---- network ---------------------------------------------------------------------------------------------
 : "${VPC:=aijalon-vpc}"
-: "${RUN_SUBNET:=aijalon-run}"                   # Direct VPC egress for api / executor / migrate job
+: "${RUN_SUBNET:=aijalon-run}"                   # Direct VPC egress for api / migrate job
 : "${RUN_SUBNET_RANGE:=10.10.0.0/24}"
+# The executor has its OWN subnet + Cloud NAT + static egress IP (REVIEW_AUTH_API F1): Hyperliquid meters weight per
+# IP, so user-triggered API reads can never spend the budget the executor needs for orders and exits.
+: "${EXEC_SUBNET:=aijalon-run-exec}"
+: "${EXEC_SUBNET_RANGE:=10.10.1.0/24}"
 : "${PSA_RANGE_NAME:=aijalon-psa}"               # Private Service Access range (Cloud SQL private IP)
 : "${PSA_RANGE_ADDR:=10.100.0.0}"
 : "${PSA_RANGE_PREFIX:=20}"
 : "${ROUTER:=aijalon-router}"
 : "${NAT:=aijalon-nat}"
-: "${NAT_IP_NAME:=aijalon-nat-ip-1}"            # static egress IP (allow-list it at e-mail provider etc.)
+: "${NAT_IP_NAME:=aijalon-nat-ip-1}"            # api + migrate static egress IP (allow-list it at e-mail provider etc.)
+: "${EXEC_NAT:=aijalon-nat-exec}"                # executor-only NAT on the same router
+: "${EXEC_NAT_IP_NAME:=aijalon-nat-exec-ip-1}"  # executor static egress IP (Hyperliquid budget of its own)
 : "${RUN_NET_TAG:=run-egress}"                  # firewall tag carried by api/executor/migrate egress
 : "${SANDBOX_VPC:=aijalon-sandbox-vpc}"         # isolated: no NAT, no Private Google Access, deny-all egress
 : "${SANDBOX_SUBNET:=aijalon-sandbox}"
 : "${SANDBOX_SUBNET_RANGE:=10.20.0.0/24}"
 : "${SANDBOX_NET_TAG:=sandbox-egress}"
+: "${SANDBOX_DNS_POLICY:=aijalon-sandbox-nxdomain}"   # Cloud DNS response policy: every name → no answer (M5)
+: "${SANDBOX_DNS_LOG_POLICY:=aijalon-sandbox-dnslog}" # DNS query logging on the sandbox VPC (alert on any query)
 
 # ---- Cloud SQL -------------------------------------------------------------------------------------------
 : "${SQL_INSTANCE:=aijalon-pg}"
@@ -62,7 +70,10 @@ SQL_CONNECTION_NAME="${PROJECT_ID}:${REGION}:${SQL_INSTANCE}"
 : "${KMS_KEYRING:=aijalon}"
 : "${KMS_KEY:=agent-keys}"                       # SPEC §5.3 envelope KEK for agent keys (HSM, 90-day rotation)
 : "${KMS_SQL_KEY:=cloudsql}"                     # CMEK for the Cloud SQL disk
+: "${KMS_CODE_KEY:=creator-code}"                # creator strategy code KEK (HSM, 90-day rotation; REVIEW F2):
+                                                 # api encrypt-only, executor decrypt-only — never agent-keys
 KMS_KEY_NAME="projects/${PROJECT_ID}/locations/${REGION}/keyRings/${KMS_KEYRING}/cryptoKeys/${KMS_KEY}"
+KMS_CODE_KEY_NAME="projects/${PROJECT_ID}/locations/${REGION}/keyRings/${KMS_KEYRING}/cryptoKeys/${KMS_CODE_KEY}"
 KMS_SQL_KEY_NAME="projects/${PROJECT_ID}/locations/${REGION}/keyRings/${KMS_KEYRING}/cryptoKeys/${KMS_SQL_KEY}"
 
 # ---- service accounts (ids must be 6-30 chars) ----------------------------------------------------------

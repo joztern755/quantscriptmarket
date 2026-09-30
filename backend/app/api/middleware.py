@@ -211,4 +211,13 @@ class EdgeGuardMiddleware:
             await send_json_error(send, 451, "jurisdiction_restricted",
                                   "aijalon.trade is not available in your jurisdiction", rid)
             return
+        # REVIEW_AUTH_API F11: through the edge, an unknown location ("XX" or no CF-IPCountry) fails closed, and a
+        # request relayed by a Cloudflare Worker (CF-Worker: geolocated at the Worker's egress) is refused.
+        if trusted and (country is None or country == "XX"):
+            await send_json_error(send, 451, "jurisdiction_unknown",
+                                  "your location could not be determined; aijalon.trade is not available", rid)
+            return
+        if trusted and headers.get("cf-worker"):
+            await send_json_error(send, 403, "edge_required", "requests must come through aijalon.trade", rid)
+            return
         await self.app(scope, receive, send)

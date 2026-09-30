@@ -5,13 +5,16 @@
 // Progress is kept per user+strategy in localStorage (no secrets: addresses and server ids only) and every
 // on-chain/server step is re-checkable, so the wizard can be resumed after a reload or a top-up.
 import type { PageContext } from "../core/router.js";
-import { h, mount, skeleton, errorState, emptyState, note, kv, button, toast, checkbox, field, badge, type Child } from "../core/ui.js";
+import { h, mount, skeleton, errorState, emptyState, note, kv, button, toast, checkbox, field, badge, confirmDialog, type Child } from "../core/ui.js";
 import { api, publicConfig, newIdempotencyKey, type PublicConfig } from "../core/api.js";
 import { storage } from "../core/state.js";
 import { ensureMfaEnrolled } from "../core/auth.js";
 import { subscribeGate, feeSummary } from "../core/gate.js";
 import { connectWallet, getConnectedWallet, proveOwnership, type Wallet } from "../core/wallet.js";
-import { approveAgent, approveBuilderFee, hlInfo } from "../core/hl.js";
+import { approveAgent, approveBuilderFee, hlInfo, type AgentAttestationProof } from "../core/hl.js";
+import { verifyAgentAttestation } from "../core/attest.js";
+import { addressCheck } from "../core/addr.js";
+import { trustAnchors } from "../core/config.js";
 import { fmtUsd, fmtBps, fmtTenthsBp, shortAddr, microToDecimal } from "../core/format.js";
 import type { StrategyDetail, Subscription, Balance, AgentOut, AgentCreateOut } from "./_shared/types.js";
 import { ApiError } from "../core/api.js";
@@ -26,6 +29,15 @@ function errReason(err: unknown): string {
 
 export const title = "Subscribe";
 
+/** GET /v1/agents/{id}/attestation (backend app/api/routers/trust.py). */
+interface AgentAttestationOut {
+  agent_id: string;
+  user_id: string;
+  agent_address: string;
+  status: string;
+  attestation: { signature_b64: string; key_version: string; attested_at: string } | null;
+}
+
 interface WizState {
   v: 1;
   savedAt: number;
@@ -36,6 +48,8 @@ interface WizState {
   agentId?: string;
   agentAddress?: string;
   agentTypedData?: unknown;
+  /** executor attestation of agentAddress (base64 signature), bound to agentId */
+  agentAttestation?: { agentId: string; sig: string };
   agentDone?: boolean;
   builderDone?: boolean;
   allocation?: string;
@@ -530,6 +544,7 @@ class Wizard {
           st.agentId = undefined;
           st.agentAddress = undefined;
           st.agentTypedData = undefined;
+          st.agentAttestation = undefined;
           this.save();
           this.draw();
         }
@@ -552,6 +567,28 @@ class Wizard {
       this.next();
       return true;
     };
+    /** Executor attestation of the agent address (SECURITY H1), polled until the executor job has signed it. */
+    const attestation = async (): Promise<AgentAttestationProof | null> => {
+      const uid = String(this.ctx.me?.id ?? "").toLowerCase();
+      if (!uid) throw new Error("Your profile hasn't loaded yet. Reload the page and try again.");
+      const agentId = st.agentId as string;
+      if (st.agentAttestation?.agentId === agentId) return { userId: uid, signatureB64: st.agentAttestation.sig };
+      const deadline = Date.now() + 180_000;
+      this.say("Waiting for aijalon's executor to attest your new agent (usually under a minute)…");
+      while (Date.now() < deadline && this.ctx.isCurrent()) {
+        const r = await api.get<AgentAttestationOut>(`/agents/${encodeURIComponent(agentId)}/attestation`, { signal: this.ctx.signal });
+        if (r.attestation?.signature_b64) {
+          if (String(r.agent_address).toLowerCase() !== st.agentAddress || String(r.user_id).toLowerCase() !== uid) {
+            throw new Error("The server returned an attestation for a different agent. Nothing was signed — please contact support.");
+          }
+          st.agentAttestation = { agentId, sig: r.attestation.signature_b64 };
+          this.save();
+          return { userId: uid, signatureB64: r.attestation.signature_b64 };
+        }
+        await new Promise((res) => window.setTimeout(res, 5000));
+      }
+      return null;
+    };
     const sign = async (): Promise<void> => {
       const w = await this.requireWallet();
       if (!w) return;
@@ -570,11 +607,36 @@ class Wizard {
         st.agentId = id;
         st.agentAddress = addr;
         st.agentTypedData = res.approve_agent?.typed_data;
+        st.agentAttestation = undefined;
         this.save();
         this.draw();
       }
+      const att = await attestation();
+      if (!att) {
+        this.say("Your agent is not attested yet. Wait a minute, then press the button again.", "err");
+        return;
+      }
+      const agentAddress = st.agentAddress as string;
+      if (!(await verifyAgentAttestation({ userId: att.userId, agentAddress, signatureB64: att.signatureB64 }))) {
+        st.agentAttestation = undefined;
+        this.save();
+        this.say("Signing refused: this agent address does not carry a valid aijalon attestation. Nothing was signed — please contact support.", "err");
+        return;
+      }
+      const ok = await confirmDialog({
+        title: "Approve this trading agent?",
+        message: h(
+          "div",
+          { class: "stack" },
+          h("p", null, "Your wallet will ask you to approve an agent named ", h("b", null, this.cfg.agent_name), ". Verified: this address is attested by aijalon's executor (signature checked in your browser)."),
+          addressCheck(agentAddress, { label: "Agent address — compare with your wallet's approval screen" }),
+          note("An agent can trade but can never withdraw or transfer your funds.", "info"),
+        ),
+        confirmLabel: "Sign in wallet",
+      });
+      if (!ok) return;
       this.say("Check your wallet: approve the agent (Hyperliquid ApproveAgent)…");
-      const r = await approveAgent(w, { agentAddress: st.agentAddress as string, serverTypedData: st.agentTypedData });
+      const r = await approveAgent(w, { agentAddress, serverTypedData: st.agentTypedData, attestation: att });
       if (!r.ok) {
         this.say(`Hyperliquid rejected the approval: ${r.error ?? "unknown error"}`, "err");
         return;
@@ -589,7 +651,8 @@ class Wizard {
         h("b", null, "An agent can place and cancel orders but can never withdraw or transfer your funds."),
         " You can revoke it any time in Hyperliquid's API settings (all strategy trading stops).",
       ),
-      st.agentAddress ? kv([["Agent address", h("span", { class: "mono break" }, st.agentAddress)], ["Agent name", this.cfg.agent_name]]) : null,
+      st.agentAddress ? kv([["Agent name", this.cfg.agent_name], ["Attested by aijalon", st.agentAttestation?.agentId === st.agentId ? "yes (verified before signing)" : "checked before signing"]]) : null,
+      st.agentAddress ? addressCheck(st.agentAddress, { label: "Agent address" }) : null,
       this.walletLine(),
       h(
         "div",
@@ -639,18 +702,22 @@ class Wizard {
       ),
       kv([
         ["Max builder fee", fmtTenthsBp(e.builder_fee_tenths_bp)],
-        ["Builder address", h("span", { class: "mono break" }, this.cfg.builder_address || "—")],
+        ["Builder address", trustAnchors().builderAddress ? "pinned by this site (below)" : "—"],
         ["Example", `${fmtUsd(10_000_000_000)} order → ${fmtUsd(Math.floor((10_000_000_000 * e.builder_fee_tenths_bp) / 100_000))} fee`],
       ]),
+      trustAnchors().builderAddress ? addressCheck(trustAnchors().builderAddress, { label: "Builder address — compare with your wallet's approval screen" }) : null,
       pre,
       this.walletLine(),
-      !this.cfg.builder_address ? note("Builder address is not configured yet — subscriptions are temporarily unavailable.", "bad") : null,
+      !this.cfg.builder_address || !trustAnchors().builderAddress ? note("Builder address is not configured yet — subscriptions are temporarily unavailable.", "bad") : null,
+      this.cfg.builder_address && trustAnchors().builderAddress && this.cfg.builder_address !== trustAnchors().builderAddress
+        ? note("The server's builder address does not match the address pinned by this site. Do not approve anything; contact support.", "bad")
+        : null,
       h(
         "div",
         { class: "btns" },
         button("Approve in wallet", {
           kind: "primary",
-          disabled: !this.cfg.builder_address,
+          disabled: !this.cfg.builder_address || this.cfg.builder_address !== trustAnchors().builderAddress,
           onClick: async () => {
             const w = await this.requireWallet();
             if (!w) return;

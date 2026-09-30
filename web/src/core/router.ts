@@ -1,6 +1,7 @@
 // Hash router: "#/s/silver?tab=x" → lazy import("../pages/strategy.js").render(root, ctx).
 // Enforces (in order): site-entry gate (all routes but legal) → auth + MFA → admin role (UI only).
 
+import { stripeWasLoaded } from "./stripe.js";
 import { publicConfig } from "./api.js";
 import { authReady, currentUser, type SessionUser } from "./auth.js";
 import { renderSiteGate, siteGateAccepted } from "./gate.js";
@@ -178,6 +179,11 @@ export async function render(): Promise<void> {
     return;
   }
   const { route, params } = m;
+  // SECURITY M2: never render the admin console in a document where Stripe.js was loaded — reload into it instead.
+  if (route.access === "admin" && stripeWasLoaded()) {
+    location.reload();
+    return;
+  }
 
   // 1. Site-entry gate
   const cfg = await publicConfig();

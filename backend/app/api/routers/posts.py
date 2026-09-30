@@ -1,6 +1,8 @@
 """Posts ("subletters"): GET /posts/{id} (body only if free, purchased, own, or admin) and
-POST /posts/{id}/purchase (Idempotency-Key; paid posts need a plan with the `paid_posts` feature — Pro/Max).
-Price split: creator = price − $1, platform $1 (app.domain.fees.post_sale_split); in-house → platform."""
+POST /posts/{id}/purchase (STEP-UP + Idempotency-Key; paid posts need a plan with the `paid_posts` feature — Pro/Max).
+Price split: creator = price − $1, platform $1 (app.domain.fees.post_sale_split); in-house → platform.
+REVIEW_AUTH_API F2: a purchase pays a third party, so it needs a fresh sign-in (a stolen session cannot drain the
+balance into an attacker's creator payable) and posts above the price cap ($500) cannot be bought."""
 from __future__ import annotations
 
 from typing import Any
@@ -17,6 +19,7 @@ from app.api.deps import (
     get_services,
     idempotency_key,
     run_idempotent,
+    step_up_user,
     user_limit,
 )
 from app.errors import Conflict, Forbidden, NotFound
@@ -39,7 +42,7 @@ def get_post(post_id: UUID, ctx: AuthCtx = Depends(consented_user), svc: Service
 
 @router.post("/{post_id}/purchase", response_model=S.PurchaseOut, status_code=201,
              dependencies=[user_limit("post_purchase", 20, 3600)])
-def purchase_post(post_id: UUID, ctx: AuthCtx = Depends(consented_user), key: str = Depends(idempotency_key),
+def purchase_post(post_id: UUID, ctx: AuthCtx = Depends(step_up_user), key: str = Depends(idempotency_key),
                   svc: Services = Depends(get_services)):
     econ = svc.settings.economics
 
@@ -50,6 +53,9 @@ def purchase_post(post_id: UUID, ctx: AuthCtx = Depends(consented_user), key: st
             raise NotFound("post not found")
         if int(p["price_micro"]) == 0:
             raise Conflict("this post is free")
+        from app.api.billing_ops import max_post_price_micro
+        if int(p["price_micro"]) > max_post_price_micro(svc.settings):
+            raise Conflict("this post is priced above the platform maximum", reason="post_price_above_cap")
         if str(p["creator_id"]) == ctx.user_id:
             raise Conflict("you wrote this post")
         if "paid_posts" not in econ.plan(user["plan"]).features:

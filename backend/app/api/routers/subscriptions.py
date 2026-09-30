@@ -24,7 +24,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
 
-from app.api import ledger_ops
+from app.api import billing_ops, ledger_ops
 from app.api import schemas as S
 from app.api.deps import (
     AuthCtx,
@@ -188,7 +188,8 @@ def create_subscription(body: S.SubscriptionCreateIn, ctx: AuthCtx = Depends(ste
         row = svc.store.insert_subscription(
             conn, user_id=ctx.user_id, strategy_id=sid, version_id=str(version["id"]), trading_address=addr,
             master_address=master, allocation_micro=allocation, max_leverage_x100=body.max_leverage_x100,
-            status="active", current_period_end=svc.domain.add_months(now, 1))
+            status="active", current_period_end=svc.domain.add_months(now, 1),
+            price_monthly_micro=price, profit_share_bps=ps_bps)   # M8: terms pinned for the life of the subscription
         charged, tx = ledger_ops.charge_subscription_start(conn, svc, user_id=ctx.user_id,
                                                            subscription_id=str(row["id"]), strategy=st,
                                                            actor=ctx.actor)
@@ -225,19 +226,25 @@ def patch_subscription(sub_id: UUID, body: S.SubscriptionPatchIn, ctx: AuthCtx =
             others = svc.store.total_live_allocation(conn, ctx.user_id, exclude_subscription_id=str(sub_id))
             _check_allocation_caps(conn, svc, ctx.user_id, others + int(body.allocation_micro), delta)
             changes["allocation_micro"] = int(body.allocation_micro)
-        status = None
+        svc.store.update_subscription(conn, str(sub_id), allocation_micro=changes.get("allocation_micro"),
+                                      max_leverage_x100=changes.get("max_leverage_x100"), status=None)
         if body.paused is True and row["status"] != "paused_user":
-            status = "paused_user"
+            # F3/H3: the billing state (status + past_due_since) is saved and restored on unpause
+            if svc.store.pause_subscription(conn, str(sub_id)) is None:
+                raise Conflict("subscription state changed; reload")
+            changes["status"] = "paused_user"
         elif body.paused is False and row["status"] == "paused_user":
             if svc.store.live_subscription_on_address(conn, row["trading_address"]) is not None:
                 raise Conflict("another subscription now uses this trading address")
             if svc.store.active_agent_for_master(conn, ctx.user_id, row["master_address"] or row["trading_address"]) is None:
                 raise Conflict("approve the trading agent in your wallet first", reason="agent_not_active")
-            status = "active"   # billing job moves it to past_due/reduce_only if the balance is short
-        if status:
-            changes["status"] = status
-        svc.store.update_subscription(conn, str(sub_id), allocation_micro=changes.get("allocation_micro"),
-                                      max_leverage_x100=changes.get("max_leverage_x100"), status=status)
+            # restores the pre-pause billing state (never a fresh `active` / grace), charges a renewal that fell due
+            # while paused (402 when the balance cannot pay it) and refuses when the strategy is no longer listed
+            resumed = billing_ops.resume_subscription(conn, svc, user_id=ctx.user_id, sub_id=str(sub_id),
+                                                      actor=ctx.actor)
+            changes["status"] = resumed["status"]
+            if resumed["charged_micro"]:
+                changes["renewal_charged_micro"] = resumed["charged_micro"]
         svc.audit.write(conn, actor=ctx.actor, action="subscription.update", target=f"subscription:{sub_id}",
                         payload={"changes": changes, "from": {"allocation_micro": int(row["allocation_micro"]),
                                                              "max_leverage_x100": int(row["max_leverage_x100"]),

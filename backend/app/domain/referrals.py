@@ -21,6 +21,8 @@ __all__ = [
     "normalize_referral_code",
     "ReferralIdentity",
     "self_referral_reasons",
+    "BLOCKING_REASONS",
+    "blocking",
     "is_self_referral",
     "first_touch_valid",
 ]
@@ -85,17 +87,25 @@ def normalize_referral_code(raw: str | None) -> str | None:
 
 @dataclass(frozen=True)
 class ReferralIdentity:
-    """What we know about one side of a referral. Empty/None values never match anything."""
+    """What we know about one side of a referral. Empty/None values never match anything.
+
+    ``network_hashes``: peppered hashes of the networks the user signed in from recently (IPv4 /24, IPv6 /64 —
+    app.api.login_events.network_hash). Two accounts on the same home/office network are not proof of one person,
+    so callers treat ``same_network`` as a *suspicion* (flag + no reward until ops clears it), while ``same_device``
+    and ``same_wallet`` block the binding outright."""
     user_id: str
     wallet_addresses: frozenset[str] = field(default_factory=frozenset)
     device_hashes: frozenset[str] = field(default_factory=frozenset)
+    network_hashes: frozenset[str] = field(default_factory=frozenset)
 
     @staticmethod
-    def of(user_id: str, wallets: Iterable[str | None] = (), devices: Iterable[str | None] = ()) -> "ReferralIdentity":
+    def of(user_id: str, wallets: Iterable[str | None] = (), devices: Iterable[str | None] = (),
+           networks: Iterable[str | None] = ()) -> "ReferralIdentity":
         return ReferralIdentity(
             user_id=user_id,
             wallet_addresses=frozenset(w.strip().lower() for w in wallets if w and w.strip()),
             device_hashes=frozenset(d.strip() for d in devices if d and d.strip()),
+            network_hashes=frozenset(n.strip() for n in networks if n and n.strip()),
         )
 
 
@@ -108,8 +118,9 @@ def _devices(i: ReferralIdentity) -> set[str]:
 
 
 def self_referral_reasons(referrer: ReferralIdentity, referee: ReferralIdentity) -> tuple[str, ...]:
-    """Reasons ("same_user", "same_wallet", "same_device") the referral is a self-referral; empty if none.
-    Wallets compare case-insensitively; device hashes compare exactly. Blank values are ignored."""
+    """Reasons ("same_user", "same_wallet", "same_device", "same_network") the referral looks like a self-referral;
+    empty if none. Wallets compare case-insensitively; device / network hashes compare exactly. Blank values are
+    ignored. See BLOCKING_REASONS for which ones refuse a binding (the rest flag it)."""
     reasons: list[str] = []
     if referrer.user_id and referee.user_id and str(referrer.user_id) == str(referee.user_id):
         reasons.append("same_user")
@@ -117,7 +128,19 @@ def self_referral_reasons(referrer: ReferralIdentity, referee: ReferralIdentity)
         reasons.append("same_wallet")
     if _devices(referrer) & _devices(referee):
         reasons.append("same_device")
+    if {n.strip() for n in referrer.network_hashes if n and n.strip()} & \
+            {n.strip() for n in referee.network_hashes if n and n.strip()}:
+        reasons.append("same_network")
     return tuple(reasons)
+
+
+#: Reasons that refuse a referral binding outright; any other reason binds but flags the referee
+#: (users.referral_flagged_at → no referral reward until ops clears it).
+BLOCKING_REASONS: frozenset[str] = frozenset({"same_user", "same_wallet", "same_device"})
+
+
+def blocking(reasons: Iterable[str]) -> bool:
+    return any(r in BLOCKING_REASONS for r in reasons)
 
 
 def is_self_referral(referrer: ReferralIdentity, referee: ReferralIdentity) -> bool:

@@ -7,7 +7,13 @@ so it cannot be spent twice; two different admins approve; an admin signs the us
 hardware wallet (treasury key never on a server) and records the tx hash, which is verified on-chain before the
 hold settles against treasury:hl_usdc (admin router). Rejection releases the hold.
 Destination = one of the user's verified wallets (binding a wallet is itself a step-up action).
-Card-funded credits are spend-only: a fee-balance withdrawal is limited to USDC-funded (withdrawable) credits.
+Security-fix round (docs/security/REVIEW_AUTH_API.md F4 F5, REVIEW_MONEY.md H4 M1; app.api.billing_ops):
+  * card-funded credits are spend-only and are spent FIRST: a fee-balance withdrawal is limited to the USDC-funded
+    UNSPENT balance, and must leave the accrued-but-unsettled profit share + the per-subscription reserve (refused
+    while a subscription is past_due / reduce_only);
+  * creator / referrer earnings paid from card-funded spending stay held for the card dispute window (120 days);
+  * nothing goes to a wallet verified < 48 h ago, nor while the account is on a security hold (48 h after an MFA
+    change or a new-device / new-country sign-in): 403 reason payout_address_hold | security_hold.
 """
 from __future__ import annotations
 
@@ -15,7 +21,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Query
 
-from app.api import ledger_ops
+from app.api import billing_ops, ledger_ops
 from app.api import schemas as S
 from app.api.deps import (
     AuthCtx,
@@ -63,11 +69,13 @@ def request_withdrawal(body: S.WithdrawalIn, ctx: AuthCtx = Depends(step_up_user
         svc.store.lock_user(conn, ctx.user_id)
         if svc.store.verified_wallet(conn, ctx.user_id, body.to_address) is None:
             raise Forbidden("withdrawals go only to one of your verified wallets")
+        billing_ops.require_no_payout_hold(conn, svc, user_id=ctx.user_id, to_address=body.to_address)
         ledger_ops.require_balance(conn, svc, ctx.user_id, amount)
         withdrawable = svc.store.withdrawable_usdc(conn, ctx.user_id)
         if amount > withdrawable:
             raise InsufficientBalance("card-funded balance can be spent but not withdrawn",
                                       withdrawable_micro=withdrawable)
+        billing_ops.require_withdrawal_headroom(conn, svc, user_id=ctx.user_id, amount_micro=amount)
         row = svc.store.insert_withdrawal(conn, user_id=ctx.user_id, amount_micro=amount, to_address=body.to_address)
         tx = ledger_ops.hold_withdrawal(conn, svc, user_id=ctx.user_id, withdrawal_id=str(row["id"]), amount=amount,
                                         actor=ctx.actor)
@@ -102,9 +110,12 @@ def request_payout(body: S.PayoutRequestIn, ctx: AuthCtx = Depends(step_up_user)
                 raise Forbidden("complete creator KYC before requesting a payout", reason="kyc_required")
         if svc.store.verified_wallet(conn, ctx.user_id, body.to_address) is None:
             raise Forbidden("payouts go only to one of your verified wallets")
-        available = -svc.ledger.balance(conn, account)
+        billing_ops.require_no_payout_hold(conn, svc, user_id=ctx.user_id, to_address=body.to_address)
+        avail = billing_ops.payout_available(conn, svc, account)
+        available = avail["available_micro"]
         if amount > available:
-            raise InsufficientBalance("amount exceeds your available earnings", available_micro=available)
+            raise InsufficientBalance("amount exceeds your available earnings", available_micro=available,
+                                      held_card_funded_micro=avail["held_micro"])
         account_id = svc.store.account_id(conn, account)
         if account_id is None:
             raise InsufficientBalance("no earnings yet", available_micro=0)

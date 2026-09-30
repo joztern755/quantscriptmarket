@@ -149,7 +149,7 @@ def _prod_settings(**kw):
     base = dict(env="prod", edge_auth_secret=EDGE, audit_pepper_b64="cGVwcGVy" * 8, sandbox_url="https://sandbox",
                 scheduler_sa_email="scheduler@p.iam.gserviceaccount.com", internal_audience="https://exec.run.app",
                 launch_phase="public", payouts_enabled=True, kms_key_name="k", firebase_project_id="p",
-                signals_pubkey_b64="x")
+                signals_pubkey_b64="x", admin_emails=("admin1@example.com",))
     base.update(kw)
     return make_settings(**base)
 
@@ -159,7 +159,12 @@ def test_prod_requires_edge_and_hides_openapi():
     assert c.get("/openapi.json").status_code == 404
     r = c.get("/v1/public/config")
     assert r.status_code == 403 and r.json()["error"]["code"] == "edge_required"
-    assert c.get("/v1/public/config", headers={"X-Edge-Auth": EDGE}).status_code == 200
+    assert c.get("/v1/public/config", headers={"X-Edge-Auth": EDGE, "CF-IPCountry": "MY"}).status_code == 200
+    # REVIEW_AUTH_API F11: unknown location through the edge fails closed; Worker-relayed requests are refused
+    assert c.get("/v1/public/config", headers={"X-Edge-Auth": EDGE}).status_code == 451
+    assert c.get("/v1/public/config", headers={"X-Edge-Auth": EDGE, "CF-IPCountry": "XX"}).status_code == 451
+    assert c.get("/v1/public/config", headers={"X-Edge-Auth": EDGE, "CF-IPCountry": "MY",
+                                               "CF-Worker": "evil.example"}).status_code == 403
     assert c.get("/healthz").status_code == 200
 
 

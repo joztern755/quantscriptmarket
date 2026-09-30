@@ -12,17 +12,29 @@ interpreter bug. The *real* security boundary is the ``sandbox`` Cloud Run servi
 * a dedicated service account with **no IAM roles** (no DB, KMS, Secret Manager, metadata-token value);
 * nothing secret in the container: no env secrets besides the service's own inbound shared secret,
   no credentials files, no data other than what a request carries;
-* per-request process isolation (this module) + ``--concurrency`` kept low + max instances capped;
-* the container runs as an unprivileged uid (10001); if this module ever runs as root (dev/CI) the child
-  is dropped to ``nobody``. The child also sets ``PR_SET_NO_NEW_PRIVS`` and ``PR_SET_DUMPABLE=0`` so a
-  concurrently running script (same uid) cannot ptrace it or read its memory.
+* per-request process isolation (this module) + ``containerConcurrency: 1`` (one creator's script per instance at
+  a time; REVIEW_WEB_INFRA M5) + max instances capped;
+* EVERY child runs as its OWN uid/gid (``_child_identity``: a fresh id from ``CHILD_UID_BASE…`` per run, no
+  supplementary groups). The service parent runs as root in the container ONLY so it can drop each child to a
+  distinct uid (it never runs creator code itself); a child can therefore never read the parent's
+  ``/proc/<ppid>/environ`` / ``mem`` (different uid; the parent is also ``PR_SET_DUMPABLE=0`` and deletes
+  ``SANDBOX_SHARED_SECRET`` from its environment at start-up, see service.py), signal or ptrace another run, and
+  ``RLIMIT_NPROC=0`` is enforced (non-root). When the parent is not root (dev without root) children keep the
+  parent's uid — acceptable only outside prod. The child also sets ``PR_SET_NO_NEW_PRIVS`` and
+  ``PR_SET_DUMPABLE=0``.
+* determinism (REVIEW_TRADING_KEYS F3): ``run_series_checked`` / ``run_signal_checked`` run the script TWICE, in two
+  fresh processes with different ``PYTHONHASHSEED`` values and a different heap layout (``perturb``), and reject the
+  script (``kind="nondeterministic"``) when any output differs by more than ``DETERMINISM_TOLERANCE``. This catches
+  hidden non-determinism the AST allowlist cannot see, e.g. NaN keys in a dict/set (CPython hashes NaN by object
+  identity, i.e. by address) or set-of-string iteration order. The backtest (upload) and the live ``/run`` both use
+  the checked variants.
 
 What this module adds on top of the static AST allowlist (validate.py):
 
 1. A fresh interpreter per request: ``python3 -s -S -B -P`` with an **empty environment** (only
-   ``PYTHONHASHSEED=0`` for determinism — that is why ``-I``'s ``-E`` is not used; ``-P -s`` give the
-   rest of ``-I``), cwd = a fresh empty temp dir, ``close_fds``, its own session/process group (so the
-   whole group is SIGKILLed on timeout).
+   ``PYTHONHASHSEED`` and ``LC_ALL`` — that is why ``-I``'s ``-E`` is not used; ``-P -s`` give the rest of ``-I``;
+   in particular the parent's ``SANDBOX_SHARED_SECRET`` is never passed), cwd = a fresh empty temp dir,
+   ``close_fds``, its own session/process group (so the whole group is SIGKILLed on timeout).
 2. Resource limits set by the child on itself before any user code runs: ``RLIMIT_CPU`` (hard CPU
    ceiling → SIGXCPU), ``RLIMIT_AS`` 256 MB, ``RLIMIT_FSIZE`` 0 (no file writes), ``RLIMIT_NOFILE``
    16, ``RLIMIT_NPROC`` 0 (no fork; not enforced for root — the container runs as non-root), and
@@ -46,10 +58,10 @@ RESIDUAL RISKS (accepted; covered by the Cloud Run boundary, not by this module)
 * The AST validator is the only in-process control against object-graph traversal
   (``().__class__.__base__.__subclasses__()`` → ``os``). Tests prove that with the validator bypassed,
   such an escape still cannot fork (RLIMIT_NPROC=0, non-root), write a byte to disk (RLIMIT_FSIZE=0),
-  read root-only files, exceed CPU/memory, or forge a result — but it CAN read world-readable files,
-  open sockets (only the VPC egress policy stops traffic), and send signals to other same-uid processes
-  in the instance (DoS of a concurrent run; results are never forged because each run has its own nonce
-  and the parent validates output). Keep ``--concurrency`` low and the container free of anything secret.
+  read root-only files, exceed CPU/memory, or forge a result — but it CAN read world-readable files and
+  open sockets (only the VPC egress policy + the NXDOMAIN DNS response policy on the sandbox VPC stop traffic,
+  infra/gcp/bootstrap.sh). Each run has its own uid, so it cannot signal / ptrace another run or the parent.
+  Keep ``containerConcurrency: 1`` and the container free of anything secret.
 * CPython interpreter bugs (e.g. crashes in C code reachable from allowed builtins) are contained by
   gVisor + the empty service account.
 * A script can legitimately return any weights within the contract (|w|, Σ|w| ≤ MAX_LEVERAGE); the
@@ -79,7 +91,8 @@ from app.sandbox.validate import (
 
 __all__ = [
     "RunLimits", "SINGLE_LIMITS", "SERIES_LIMITS", "ScriptRuntimeError", "SignalResult", "SeriesStep",
-    "SeriesResult", "run_signal", "run_series", "normalize_bars", "with_limits", "BadOutput",
+    "SeriesResult", "run_signal", "run_series", "run_signal_checked", "run_series_checked", "normalize_bars",
+    "with_limits", "BadOutput", "DETERMINISM_TOLERANCE", "CHILD_UID_BASE", "CHILD_UID_SPAN",
 ]
 
 MB = 1024 * 1024
@@ -157,6 +170,9 @@ def _main():
 
     lim = req["limits"]
     applied = {}
+    # Determinism probe: a different heap layout per run (kept alive until exit), so object addresses — and with them
+    # any identity-hash-dependent ordering (NaN dict/set keys) — differ between the two runs of a checked execution.
+    _pad = [bytearray((i * 7919) % 97 + 1) for i in range(int(req.get("perturb", 0)))]
     # Not ptrace-able / not /proc/<pid>/mem-readable by other same-uid processes (concurrent scripts),
     # and no privilege gain through setuid binaries even after an escape.
     try:
@@ -331,23 +347,57 @@ def _python_argv() -> list[str]:
     return [sys.executable, "-s", "-S", "-B", "-P", "-c", _BOOTSTRAP]
 
 
+#: the ONLY variables a child ever sees (built fresh per run; nothing is inherited from the parent's environment)
 _CHILD_ENV = {"PYTHONHASHSEED": "0", "LC_ALL": "C.UTF-8"}
-# If the parent runs as root (it must not in prod — the image runs as uid 10001 — but dev/CI often do),
-# drop the child to nobody so RLIMIT_NPROC=0 is enforced and root-only files stay out of reach.
-_NOBODY = 65534
+#: per-run child uids/gids (not in /etc/passwd; own no files) — REVIEW_WEB_INFRA M5
+CHILD_UID_BASE = 200_000
+CHILD_UID_SPAN = 100_000
+#: max |difference| between the two runs of a checked execution (float summation order may differ in the last bits)
+DETERMINISM_TOLERANCE = 1e-9
+
+_uids_in_use: set[int] = set()
+_uid_lock = threading.Lock()
 
 
-def _privilege_kwargs() -> dict[str, Any]:
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        return {"user": _NOBODY, "group": _NOBODY, "extra_groups": []}
-    return {}
+def _child_identity() -> tuple[dict[str, Any], int | None]:
+    """Popen kwargs dropping the child to a fresh uid/gid (no supplementary groups), and the uid to release after
+    the run. Only possible when the parent is root (the sandbox container; dev/CI as root); otherwise ``({}, None)``."""
+    if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+        return {}, None
+    with _uid_lock:
+        for _ in range(64):
+            uid = CHILD_UID_BASE + secrets.randbelow(CHILD_UID_SPAN)
+            if uid not in _uids_in_use:
+                _uids_in_use.add(uid)
+                return {"user": uid, "group": uid, "extra_groups": []}, uid
+    raise ScriptRuntimeError("no free sandbox uid", kind="crash")
+
+
+def _release_identity(uid: int | None) -> None:
+    if uid is not None:
+        with _uid_lock:
+            _uids_in_use.discard(uid)
+
+
+def _privilege_kwargs() -> dict[str, Any]:   # kept for callers/tests of the old name
+    return _child_identity()[0]
 _SIG_NAMES = {getattr(signal, n): n for n in ("SIGXCPU", "SIGKILL", "SIGSEGV", "SIGXFSZ", "SIGABRT", "SIGBUS") if hasattr(signal, n)}
 
 
-def _spawn(request: dict[str, Any], limits: RunLimits) -> dict[str, Any]:
-    """Run the bootstrap child with ``request``; return its decoded response or raise ScriptRuntimeError."""
+def _spawn(request: dict[str, Any], limits: RunLimits, *, hash_seed: str = "0", perturb: int = 0) -> dict[str, Any]:
+    """Run the bootstrap child with ``request``; return its decoded response or raise ScriptRuntimeError.
+    ``hash_seed`` / ``perturb``: determinism probes (see ``run_series_checked``); live defaults are ``"0"`` / 0."""
+    ident, uid = _child_identity()
+    try:
+        return _spawn_as(request, limits, ident, hash_seed=hash_seed, perturb=perturb)
+    finally:
+        _release_identity(uid)
+
+
+def _spawn_as(request: dict[str, Any], limits: RunLimits, ident: dict[str, Any], *, hash_seed: str,
+              perturb: int) -> dict[str, Any]:
     nonce = secrets.token_hex(16)
-    request = dict(request, nonce=nonce, limits={
+    request = dict(request, nonce=nonce, perturb=max(0, min(int(perturb), 1 << 16)), limits={
         "cpu_seconds_per_call": limits.cpu_seconds_per_call, "total_cpu_seconds": limits.total_cpu_seconds,
         "memory_bytes": limits.memory_bytes, "max_open_files": limits.max_open_files,
         "recursion_limit": limits.recursion_limit,
@@ -359,7 +409,8 @@ def _spawn(request: dict[str, Any], limits: RunLimits) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="sbx-") as cwd:
         proc = subprocess.Popen(
             _python_argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            cwd=cwd, env=dict(_CHILD_ENV), close_fds=True, start_new_session=True, **_privilege_kwargs(),
+            cwd=cwd, env=dict(_CHILD_ENV, PYTHONHASHSEED=str(hash_seed)), close_fds=True, start_new_session=True,
+            **ident,
         )
 
         def kill() -> None:
@@ -513,6 +564,13 @@ def normalize_bars(bars: Mapping[str, Sequence[Any]]) -> dict[str, list[list[flo
 
 def run_signal(source: str, bars: Mapping[str, Sequence[Any]], *, meta: StrategyMeta | None = None,
                limits: RunLimits = SINGLE_LIMITS, now_ms: int | None = None) -> SignalResult:
+    """Single run (no determinism check); the sandbox service uses ``run_signal_checked``."""
+    return _run_signal(source, bars, meta=meta, limits=limits, now_ms=now_ms)
+
+
+def _run_signal(source: str, bars: Mapping[str, Sequence[Any]], *, meta: StrategyMeta | None = None,
+                limits: RunLimits = SINGLE_LIMITS, now_ms: int | None = None, hash_seed: str = "0",
+                perturb: int = 0) -> SignalResult:
     """Evaluate ``signal(bars)`` once (live: once per bar close per strategy version).
 
     ``bars`` must contain every coin in MARKETS and only CLOSED bars. Each coin is trimmed to the last
@@ -532,7 +590,7 @@ def run_signal(source: str, bars: Mapping[str, Sequence[Any]], *, meta: Strategy
         if now_ms is not None and r[-1][0] + meta.interval_ms > now_ms:
             raise ValidationFailed(f"last bar for {c} is not closed yet (look-ahead guard)")
         view[c] = r
-    resp = _spawn({"mode": "single", "source": source, "bars": view}, limits)
+    resp = _spawn({"mode": "single", "source": source, "bars": view}, limits, hash_seed=hash_seed, perturb=perturb)
     if not resp.get("ok"):
         _raise_child_error(resp)
     try:
@@ -545,6 +603,13 @@ def run_signal(source: str, bars: Mapping[str, Sequence[Any]], *, meta: Strategy
 def run_series(source: str, aligned_bars: Mapping[str, Sequence[Any]], *, meta: StrategyMeta | None = None,
                start_index: int | None = None, end_index: int | None = None,
                limits: RunLimits = SERIES_LIMITS) -> SeriesResult:
+    """Single run (no determinism check); backtests use ``run_series_checked``."""
+    return _run_series(source, aligned_bars, meta=meta, start_index=start_index, end_index=end_index, limits=limits)
+
+
+def _run_series(source: str, aligned_bars: Mapping[str, Sequence[Any]], *, meta: StrategyMeta | None = None,
+                start_index: int | None = None, end_index: int | None = None,
+                limits: RunLimits = SERIES_LIMITS, hash_seed: str = "0", perturb: int = 0) -> SeriesResult:
     """Evaluate ``signal`` at every bar index ``i`` in ``[start_index, end_index)`` in ONE child process.
 
     ``aligned_bars``: every coin in MARKETS with identical timestamp sequences (see
@@ -573,7 +638,7 @@ def run_series(source: str, aligned_bars: Mapping[str, Sequence[Any]], *, meta: 
     if start == end:
         return SeriesResult([], 0.0)
     resp = _spawn({"mode": "series", "source": source, "bars": rows, "lookback": meta.lookback,
-                   "start": start, "end": end}, limits)
+                   "start": start, "end": end}, limits, hash_seed=hash_seed, perturb=perturb)
     if not resp.get("ok"):
         _raise_child_error(resp)
     steps: list[SeriesStep] = []
@@ -590,6 +655,85 @@ def run_series(source: str, aligned_bars: Mapping[str, Sequence[Any]], *, meta: 
     if expected != end:
         raise ScriptRuntimeError("sandbox returned an incomplete series", kind="protocol")
     return SeriesResult(steps=steps, cpu_seconds=float(resp.get("cpu", 0.0)), rlimits=dict(resp.get("rlimits") or {}))
+
+
+# ---------------------------------------------------------------------------------------------------
+# Determinism gate (REVIEW_TRADING_KEYS F3)
+# ---------------------------------------------------------------------------------------------------
+
+def _probe_settings() -> list[tuple[str, int]]:
+    """Two runs: the live settings (seed 0, no padding) and a random different seed + heap padding."""
+    return [("0", 0), (str(1 + secrets.randbelow(4_294_967_294)), 1 + secrets.randbelow(4096))]
+
+
+def _parallel(fns: list[Any]) -> list[Any]:
+    """Run the callables concurrently (each spawns its own child process); re-raise the first error in order."""
+    results: list[Any] = [None] * len(fns)
+    errors: list[BaseException | None] = [None] * len(fns)
+
+    def run(i: int) -> None:
+        try:
+            results[i] = fns[i]()
+        except BaseException as e:  # noqa: BLE001 - re-raised below in the caller's thread
+            errors[i] = e
+
+    threads = [threading.Thread(target=run, args=(i,), daemon=True) for i in range(len(fns))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for e in errors:
+        if e is not None:
+            raise e
+    return results
+
+
+def _weights_differ(a: Mapping[str, float], b: Mapping[str, float]) -> str | None:
+    if set(a) != set(b):
+        return "different markets"
+    for k in sorted(a):
+        if not abs(float(a[k]) - float(b[k])) <= DETERMINISM_TOLERANCE:   # also catches NaN
+            return k
+    return None
+
+
+def _nondeterministic(where: str, **details: Any) -> ScriptRuntimeError:
+    return ScriptRuntimeError(
+        f"strategy output is not deterministic ({where}): two runs over the same data returned different weights. "
+        "Avoid NaN values as dict/set keys and do not depend on set iteration order (sort first).",
+        kind="nondeterministic", **details)
+
+
+def run_signal_checked(source: str, bars: Mapping[str, Sequence[Any]], *, meta: StrategyMeta | None = None,
+                       limits: RunLimits = SINGLE_LIMITS, now_ms: int | None = None) -> SignalResult:
+    """``run_signal`` twice (fresh processes, different hash seeds + heap layout); reject differing outputs."""
+    a, b = _parallel([lambda seed=seed, pad=pad: _run_signal(source, bars, meta=meta, limits=limits, now_ms=now_ms,
+                                                             hash_seed=seed, perturb=pad)
+                      for seed, pad in _probe_settings()])
+    coin = _weights_differ(a.weights, b.weights)
+    if coin is not None:
+        raise _nondeterministic("live signal", coin=coin)
+    return a
+
+
+def run_series_checked(source: str, aligned_bars: Mapping[str, Sequence[Any]], *, meta: StrategyMeta | None = None,
+                       start_index: int | None = None, end_index: int | None = None,
+                       limits: RunLimits = SERIES_LIMITS) -> SeriesResult:
+    """``run_series`` twice (fresh processes, different hash seeds + heap layout, run concurrently so the wall-clock
+    budget is unchanged); reject the script if ANY step's weights differ. Returns the first (live-settings) run."""
+    a, b = _parallel([lambda seed=seed, pad=pad: _run_series(source, aligned_bars, meta=meta, start_index=start_index,
+                                                             end_index=end_index, limits=limits, hash_seed=seed,
+                                                             perturb=pad)
+                      for seed, pad in _probe_settings()])
+    if len(a.steps) != len(b.steps):
+        raise _nondeterministic("step count")
+    for sa, sb in zip(a.steps, b.steps):
+        if sa.index != sb.index or sa.t != sb.t:
+            raise _nondeterministic("step order", step=sa.index)
+        coin = _weights_differ(sa.weights, sb.weights)
+        if coin is not None:
+            raise _nondeterministic(f"bar t={sa.t}", step=sa.index, t=sa.t, coin=coin)
+    return a
 
 
 def with_limits(base: RunLimits, **changes: Any) -> RunLimits:

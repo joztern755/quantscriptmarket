@@ -4,10 +4,56 @@
 // horizontal rules (---), blockquotes (> ).
 // Everything else is rendered as literal text.
 
+// External links (SECURITY L1): creators can write markdown (strategy pages, posts), so an off-site link could
+// phish ("re-approve your agent here"). Every external link shows its destination HOST next to the text, carries
+// rel="ugc nofollow noopener noreferrer", and opens only after a "you are leaving aijalon.trade" interstitial.
+// A link whose TEXT looks like a URL/domain different from its target is not linked at all (rendered as text).
+import { confirmDialog, h } from "../../core/ui.js";
+import { siteDomain } from "../../core/config.js";
+
 const SAFE_LINK = /^(https?:\/\/[^\s]+|#\/[^\s]*)$/i;
+const DOMAINISH = /(?:https?:\/\/)?((?:[a-z0-9-]+\.)+[a-z]{2,})(?:[/:?#]|$)/i;
 
 export function isSafeHref(href: string): boolean {
   return SAFE_LINK.test(href.trim());
+}
+
+/** Host of an external http(s) href (lower-case), or null for app routes / malformed URLs. */
+export function externalHost(href: string): string | null {
+  if (!/^https?:/i.test(href)) return null;
+  try {
+    return new URL(href).host.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+/** True when the visible text names a domain other than the link's real host (classic phishing shape). */
+export function misleadingLabel(label: string, host: string): boolean {
+  const m = DOMAINISH.exec(label.trim());
+  if (!m) return false;
+  const shown = m[1]!.toLowerCase();
+  return !(shown === host || host.endsWith("." + shown) || shown.endsWith("." + host));
+}
+
+function isOwnHost(host: string): boolean {
+  const own = siteDomain().toLowerCase();
+  return host === own || host.endsWith("." + own);
+}
+
+async function leaveSite(href: string, host: string): Promise<void> {
+  const ok = await confirmDialog({
+    title: "You are leaving aijalon.trade",
+    message: h(
+      "div",
+      { class: "stack" },
+      h("p", null, "This link was written by a strategy creator, not by aijalon.trade. It opens:"),
+      h("p", null, h("b", { class: "mono break" }, host)),
+      h("p", { class: "small muted" }, "aijalon.trade will never ask you to re-approve an agent, sign a message, connect a wallet or enter a seed phrase on another website."),
+    ),
+    confirmLabel: `Open ${host}`,
+  });
+  if (ok) window.open(href, "_blank", "noopener,noreferrer");
 }
 
 /** Render inline markdown into `parent` using text nodes and a small set of elements. */
@@ -76,15 +122,28 @@ export function renderInline(parent: Node, text: string): void {
           const label = text.slice(i + 1, close);
           const href = text.slice(close + 2, paren).trim();
           flush();
-          if (isSafeHref(href)) {
+          const host = externalHost(href);
+          if (isSafeHref(href) && (host === null || !misleadingLabel(label, host))) {
             const a = document.createElement("a");
             a.href = href; // property assignment of a validated http(s)/#/ URL
-            if (/^https?:/i.test(href)) {
+            if (host !== null) {
               a.target = "_blank";
-              a.rel = "noopener noreferrer";
+              a.rel = "ugc nofollow noopener noreferrer";
+              a.referrerPolicy = "no-referrer";
+              if (!isOwnHost(host)) {
+                a.addEventListener("click", (ev) => {
+                  ev.preventDefault();
+                  void leaveSite(href, host);
+                });
+              }
             }
             renderInline(a, label);
             parent.appendChild(a);
+            if (host !== null && !isOwnHost(host)) parent.appendChild(h("span", { class: "ext-host small muted" }, ` ↗ ${host}`));
+          } else if (host !== null && isSafeHref(href)) {
+            // misleading text: show both, link neither
+            renderInline(parent, label);
+            parent.appendChild(h("span", { class: "ext-host small muted" }, ` (link to ${host} removed: its text names a different site)`));
           } else {
             // unsafe scheme: render label as plain text, drop the URL
             renderInline(parent, label);

@@ -194,6 +194,9 @@ class Settings:
     economics: Economics = field(default_factory=Economics)
     risk: RiskLimits = field(default_factory=RiskLimits)
     hl_limits: HlLimits = field(default_factory=HlLimits)
+    # REVIEW_TRADING_KEYS F2 / SECURITY §3.4: creator strategy code is sealed under its OWN KMS key (api encrypt-only,
+    # executor decrypt-only), never under agent-keys. Empty outside prod → local dev KEK with a separate KMS-level AAD.
+    creator_code_kms_key_name: str = ""             # projects/…/locations/…/keyRings/…/cryptoKeys/creator-code
 
     @property
     def is_prod(self) -> bool:
@@ -307,6 +310,7 @@ def get_settings() -> Settings:
             egress_key=os.environ.get("HL_EGRESS_KEY", "default").strip().lower() or "default",
             shared_budget=_b("HL_SHARED_BUDGET", "true"),
         ),
+        creator_code_kms_key_name=os.environ.get("CREATOR_CODE_KMS_KEY_NAME", ""),
     )
     if s.is_prod:
         required = ["builder_address", "treasury_address", "kms_key_name", "firebase_project_id", "signals_pubkey_b64",
@@ -318,11 +322,15 @@ def get_settings() -> Settings:
             required += ["scheduler_sa_email", "internal_audience"]
         if s.service_role == "executor":
             required += ["sandbox_url", "sandbox_shared_secret"]
+        if s.service_role in ("api", "executor"):
+            required += ["creator_code_kms_key_name"]
         missing = [k for k in required if not getattr(s, k)]
         if missing:
             raise RuntimeError(f"prod config missing: {missing}")
         if s.local_dev_kek_b64:
             raise RuntimeError("LOCAL_DEV_KEK_B64 must not be set in prod")
+        if s.creator_code_kms_key_name and s.creator_code_kms_key_name == s.kms_key_name:
+            raise RuntimeError("CREATOR_CODE_KMS_KEY_NAME must be a different KMS key than KMS_KEY_NAME (agent-keys)")
         if s.launch_phase not in ("internal", "public"):
             raise RuntimeError("LAUNCH_PHASE must be internal|public")
         if s.launch_phase == "internal" and not s.allowlist_emails:

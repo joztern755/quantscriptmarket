@@ -13,7 +13,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request
 from starlette.concurrency import run_in_threadpool
 
-from app.api import ledger_ops
+from app.api import billing_ops, ledger_ops
 from app.api.deps import Services, get_services, ip_limit
 from app.errors import ValidationFailed
 from app.logging import get_logger
@@ -26,7 +26,12 @@ ACTOR = "stripe:webhook"
 def _apply(svc: Services, outcome: Any) -> dict[str, Any]:
     with svc.db.begin() as conn:
         credited = [ledger_ops.apply_credit(conn, svc, c, actor=ACTOR) for c in outcome.credits]
-        debited = [ledger_ops.apply_debit(conn, svc, d, actor=ACTOR) for d in outcome.debits]
+        debited = []
+        for d in outcome.debits:
+            debited.append(ledger_ops.apply_debit(conn, svc, d, actor=ACTOR))
+            # REVIEW_MONEY M6 / L1: a chargeback/refund that leaves the balance negative restricts trading NOW
+            # (reduce_only), and a full reversal marks the deposit 'reversed'
+            billing_ops.after_payment_reversal(conn, svc, d)
         for alert in outcome.alerts:
             svc.notifier.notify_alert(conn, alert)
         svc.audit.write(conn, actor=ACTOR, action="stripe.event", target=f"stripe_event:{outcome.event_id}",

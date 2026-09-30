@@ -11,6 +11,9 @@ import { fmtUsd, fmtBps, fmtDateTime, fmtRelative, shortAddr, microToDecimal } f
 import type { CreatorVersion, Page, Alert } from "./_shared/types.js";
 import { backtestPanel } from "./_shared/backtest.js";
 import { ensurePageCss, listOf, isAbortError, pageHead, panel, isAddress, usdInput, isRec, errMessage } from "./_shared/util.js";
+import { trustAnchors } from "../core/config.js";
+import { addressCheck } from "../core/addr.js";
+import { destinationBlock, fetchAndCheckProof } from "./_shared/walletproof.js";
 
 export const title = "Admin";
 
@@ -20,6 +23,7 @@ const TABS = [
   { key: "payouts", label: "Payouts" },
   { key: "held", label: "Held deposits" },
   { key: "strategies", label: "Strategies" },
+  { key: "dexes", label: "Trusted dexes" },
   { key: "alerts", label: "Alerts" },
   { key: "recon", label: "Reconciliation" },
   { key: "users", label: "Users" },
@@ -47,7 +51,7 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
       body,
     ),
   );
-  const fn = { flags: flagsTab, approvals: approvalsTab, payouts: payoutsTab, held: heldTab, strategies: strategiesTab, alerts: alertsTab, recon: reconTab, users: usersTab }[tab as "flags"] ?? flagsTab;
+  const fn = { flags: flagsTab, approvals: approvalsTab, payouts: payoutsTab, held: heldTab, strategies: strategiesTab, dexes: dexesTab, alerts: alertsTab, recon: reconTab, users: usersTab }[tab as "flags"] ?? flagsTab;
   await fn(body, ctx);
 }
 
@@ -298,17 +302,22 @@ async function payoutsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
         toast("Sent and recorded.", "good");
         reload();
       };
+      const proofPath = (p: Payout): string => `${base(p)}/wallet-proof`;
       const signAndSend = async (p: Payout): Promise<void> => {
         if (!isAddress(p.to_address)) throw new Error("Invalid destination address.");
-        const treasury = cfg.treasury_address;
-        if (cfg._fallback || !isAddress(treasury)) throw new Error("The treasury address is not configured / config unavailable. Nothing was signed.");
+        const treasury = trustAnchors().treasuryAddress; // PINNED (app-config.json), never the API's value
+        if (cfg._fallback || !isAddress(treasury)) throw new Error("The treasury address is not pinned in this site build / config unavailable. Nothing was signed.");
+        if (cfg.treasury_address !== treasury) throw new Error("The server's treasury address does not match the pinned treasury. Nothing was signed.");
+        // SECURITY H1: the beneficiary's own signature over the destination, re-verified in THIS browser.
+        const proof = await fetchAndCheckProof(proofPath(p), p.to_address, p.beneficiary, ctx.signal);
+        if (!proof.ok) throw new Error(`Wallet proof failed: ${proof.reason} Nothing was signed.`);
         const w = getConnectedWallet() ?? (await connectWallet());
         if (!w) return;
         // The treasury key never touches a server: only the treasury hardware wallet may sign this usdSend.
         if (w.address.toLowerCase() !== treasury.toLowerCase()) {
           throw new Error(`The connected wallet ${shortAddr(w.address)} is not the treasury ${shortAddr(treasury)}. Connect the treasury hardware wallet; nothing was signed.`);
         }
-        if (!(await confirmDialog({ title: "Send USDC from treasury?", message: kv([["Amount", fmtUsd(p.amount_micro)], ["To", h("span", { class: "mono break" }, p.to_address)], ["From (treasury)", h("span", { class: "mono break" }, treasury)]]), confirmLabel: "Sign in wallet", danger: true }))) return;
+        if (!(await confirmDialog({ title: "Send USDC from treasury?", message: h("div", { class: "stack" }, kv([["Amount", fmtUsd(p.amount_micro)], ["Beneficiary", h("span", { class: "mono" }, p.beneficiary)]]), destinationBlock(p.to_address, proof), addressCheck(treasury, { label: "From (pinned treasury)" })), confirmLabel: "Sign in wallet", danger: true }))) return;
         const td = await api.post<{ payout: Payout; payload: { typed_data?: unknown }; exchange_url: string }>(`${base(p)}/typed-data`, { signature_chain_id: await w.chainIdHex() }, { signal: ctx.signal });
         if (td.payout.to_address.toLowerCase() !== p.to_address.toLowerCase() || td.payout.amount_micro !== p.amount_micro) throw new Error("The payout changed on the server. Reload and check again.");
         const r = await usdSend(w, { destination: p.to_address, amountMicro: p.amount_micro, serverTypedData: td.payload.typed_data, expectDestination: p.to_address });
@@ -330,7 +339,12 @@ async function payoutsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
             button(p.status === "requested" ? "Approve (1st)" : "Approve (2nd)", {
               kind: "primary",
               onClick: async () => {
-                if (!(await confirmDialog({ title: "Approve payout?", message: kv([["Kind", p.kind], ["Amount", fmtUsd(p.amount_micro)], ["To", h("span", { class: "mono break" }, p.to_address)], ["Beneficiary", h("span", { class: "mono" }, p.beneficiary)]]), confirmLabel: "Approve" }))) return;
+                const proof = await fetchAndCheckProof(proofPath(p), p.to_address, p.beneficiary, ctx.signal);
+                if (!proof.ok) {
+                  await confirmDialog({ title: "Cannot approve", message: h("div", { class: "stack" }, destinationBlock(p.to_address, proof), note("Reject this request, or ask the beneficiary to request again: they must sign the ownership proof with the destination wallet.", "warn")), confirmLabel: "OK" });
+                  return;
+                }
+                if (!(await confirmDialog({ title: "Approve payout?", message: h("div", { class: "stack" }, kv([["Kind", p.kind], ["Amount", fmtUsd(p.amount_micro)], ["Beneficiary", h("span", { class: "mono" }, p.beneficiary)]]), destinationBlock(p.to_address, proof)), confirmLabel: "Approve" }))) return;
                 await api.post(`${base(p)}/approve`, {}, { signal: ctx.signal });
                 toast("Approved.", "good");
                 reload();
@@ -375,7 +389,7 @@ async function payoutsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
       mount(
         box,
         cfg.features.payouts ? null : note("Payouts are disabled in this launch phase (PAYOUTS_ENABLED=false): approvals and sending are refused by the server.", "warn"),
-        note(`Two different admins must approve before sending. The final UsdSend is signed here with the treasury hardware wallet (${cfg.treasury_address ? shortAddr(cfg.treasury_address) : "not configured"}); any other connected wallet is refused.`, "info"),
+        note(`Two different admins must approve before sending. Each approval and the final send re-verify, in this browser, the beneficiary's signature proving control of the destination. The final UsdSend is signed here with the treasury hardware wallet (${trustAnchors().treasuryAddress || "not pinned in this build"}); any other connected wallet is refused.`, "info"),
         panel("Queue", table({ columns: cols, rows: open, rowKey: (p) => p.id, empty: "Queue is empty." })),
         panel("Recent", table({ columns: cols.filter((c) => c.key !== "a").concat([{ key: "tx", label: "Tx", value: (p) => (p.tx_hash ? h("span", { class: "mono" }, shortAddr(p.tx_hash, 10, 6)) : "—") }]), rows: done.slice(0, 50), rowKey: (p) => p.id, empty: "Nothing yet." })),
       );
@@ -895,4 +909,75 @@ async function usersTab(body: HTMLElement, ctx: PageContext): Promise<void> {
   });
   mount(body, h("div", { class: "filters", role: "search" }, h("div", { class: "field" }, h("span", { class: "fl" }, "Search"), q), h("div", null, button("Search", { onClick: () => search() }))), box);
   await search();
+}
+
+// ------------------------------------------------------------------------------------------ trusted builder dexes
+// SPEC §12 (owner, 30 Sep 2026): strategies may trade validator perps and HIP-3 perps only on allowlisted dexes.
+// ONE admin adds a dex (step-up, audit-logged); removing one immediately stops new entries on its markets (the
+// executor re-reads the list every tick; exits keep running). Server: /admin/dexes (backend/app/api/routers/admin.py).
+interface TrustedDex {
+  dex: string;
+  active: boolean;
+  added_by: string;
+  reason: string;
+  created_at: string;
+  removed_at: string | null;
+  removed_by: string | null;
+  removal_reason: string | null;
+}
+
+const DEX_NAME = /^[a-z][a-z0-9]{0,15}$/;
+
+async function dexesTab(body: HTMLElement, ctx: PageContext): Promise<void> {
+  const box = h("div", { class: "stack" });
+  mount(body, box);
+  await loadInto(
+    box,
+    ctx,
+    () => api.get<unknown>("/admin/dexes", { signal: ctx.signal }).then((r) => listOf<TrustedDex>(r)),
+    (rows, reload) => {
+      const builder = rows.filter((d) => d.dex !== "");
+      const add = async (): Promise<void> => {
+        const raw = await promptDialog({ title: "Trust a builder dex", label: "Dex name (as in the coin prefix, e.g. xyz for xyz:SILVER)", placeholder: "xyz", pattern: DEX_NAME });
+        const dex = raw?.trim() ?? "";
+        if (!DEX_NAME.test(dex)) return;
+        if (!(await confirmDialog({ title: `Trust dex "${dex}"?`, message: "Its deployer controls the oracle, mark price, volume and open interest our guards read. Strategies will be able to list and trade its markets. Confirm you know who operates it.", confirmLabel: "Trust dex", danger: true, requireText: dex }))) return;
+        const reason = await askReason(`Why is "${dex}" trusted?`, "operator, due diligence done, …");
+        if (!reason) return;
+        await api.post("/admin/dexes", { dex, reason }, { signal: ctx.signal });
+        toast(`Dex "${dex}" trusted.`, "good");
+        reload();
+      };
+      const remove = async (d: TrustedDex): Promise<void> => {
+        if (!(await confirmDialog({ title: `Remove dex "${d.dex}"?`, message: "New entries on every market of this dex stop at the next executor tick (exits keep running). Creators can no longer create, upload or list strategies on it.", confirmLabel: "Remove", danger: true, requireText: d.dex }))) return;
+        const reason = await askReason(`Remove "${d.dex}"`, "e.g. oracle manipulation suspected");
+        if (!reason) return;
+        const r = await api.post<{ affected_strategies?: string[]; markets_entries_paused?: string[] }>(`/admin/dexes/${encodeURIComponent(d.dex)}/remove`, { reason }, { signal: ctx.signal });
+        const n = (r.affected_strategies ?? []).length;
+        toast(`Removed. ${n} strateg${n === 1 ? "y" : "ies"} affected; new entries paused on ${(r.markets_entries_paused ?? []).length} market(s).`, "good");
+        reload();
+      };
+      mount(
+        box,
+        note("Validator perps (BTC, SOL, …) are always allowed. A builder (HIP-3) dex must be on this list before any strategy can list or trade its markets: its deployer controls the prices and liquidity data our thin-market guards rely on.", "info"),
+        panel(
+          "Builder dexes",
+          builder.length
+            ? table<TrustedDex>({
+                columns: [
+                  { key: "d", label: "Dex", value: (d) => h("span", { class: "mono" }, d.dex), primary: true },
+                  { key: "s", label: "Status", value: (d) => (d.active ? badge("trusted", "good") : badge("removed", "bad")) },
+                  { key: "r", label: "Reason", value: (d) => h("span", { class: "small break" }, d.active ? d.reason : d.removal_reason ?? "") },
+                  { key: "by", label: "By", value: (d) => h("span", { class: "small muted" }, `${d.active ? d.added_by : d.removed_by ?? ""} · ${fmtDateTime(d.active ? d.created_at : d.removed_at ?? d.created_at)}`) },
+                  { key: "a", label: "", value: (d) => (d.active ? button("Remove", { kind: "danger", onClick: () => remove(d) }) : button("Trust again", { kind: "ghost", onClick: () => void add() })) },
+                ],
+                rows: builder,
+                rowKey: (d) => d.dex,
+              })
+            : h("p", { class: "small muted" }, "No builder dexes trusted — only validator perps can trade."),
+          h("div", { class: "btns" }, button("Trust a dex…", { kind: "primary", onClick: () => add() })),
+        ),
+      );
+    },
+  );
 }

@@ -9,6 +9,14 @@ Design (docs/SPEC.md §2, §2.1, §5.3)
     - prod: Cloud KMS key ``agent-keys`` (HSM protection) via ``CloudKmsKeyWrapper``;
     - dev/test only: a local AES-256-GCM KEK from ``settings.local_dev_kek_b64`` via ``LocalAesKeyWrapper``,
       which refuses to construct when ``settings.is_prod``.
+* Two secret classes, two KMS keys (REVIEW_TRADING_KEYS F2 / SECURITY §3.4): agent private keys are wrapped under
+  ``agent-keys`` (``settings.kms_key_name``, KMS-level AAD ``AGENT_KEY_KMS_AAD``) by ``make_encryptor`` /
+  ``make_decryptor``; creator strategy code under the dedicated ``creator-code`` key
+  (``settings.creator_code_kms_key_name``, KMS-level AAD ``CREATOR_CODE_KMS_AAD``) by ``make_code_encryptor`` /
+  ``make_code_decryptor``. Each key has its own IAM (api encrypt-only, executor decrypt-only), rotation and blast
+  radius; the per-class wrap AAD means a DEK wrapped for one class cannot be unwrapped as the other even if a key
+  name were misconfigured, and in dev (one local KEK) the AAD alone separates them. Creator code record AAD =
+  ``creator_code_aad(strategy_id, code_hash)`` (namespace ``aijalon/creator_code/v1``).
 * Segregation mirrors IAM (§2.1): the ``api`` service holds only ``cloudkms.cryptoKeyVersions.useToEncrypt``
   and the ``executor`` only ``useToDecrypt``. In code, the API builds an ``EnvelopeEncryptor`` (no decrypt
   method at all) over a wrapper constructed with ``allow_unwrap=False`` (``unwrap`` raises ``Forbidden``).
@@ -58,13 +66,16 @@ except Exception:  # noqa: BLE001
     _gkms = None
 
 __all__ = [
-    "AGENT_KEY_KMS_AAD", "FORMAT_VERSION", "WRAPPER_KIND_CLOUD_KMS", "WRAPPER_KIND_LOCAL_DEV",
+    "AGENT_KEY_KMS_AAD", "CREATOR_CODE_KMS_AAD", "creator_code_aad", "make_code_encryptor", "make_code_decryptor",
+    "FORMAT_VERSION", "WRAPPER_KIND_CLOUD_KMS", "WRAPPER_KIND_LOCAL_DEV",
     "DecryptionFailed", "KeyWrapper", "CloudKmsKeyWrapper", "LocalAesKeyWrapper",
     "SealedBlob", "EnvelopeEncryptor", "EnvelopeDecryptor", "make_encryptor", "make_decryptor",
     "crc32c", "zeroize",
 ]
 
-AGENT_KEY_KMS_AAD = b"aijalon-agent-key-v1"   # AAD on the KMS wrap/unwrap call
+AGENT_KEY_KMS_AAD = b"aijalon-agent-key-v1"   # AAD on the KMS wrap/unwrap call (agent-keys)
+CREATOR_CODE_KMS_AAD = b"aijalon-creator-code-v1"   # AAD on the KMS wrap/unwrap call (creator-code)
+_CREATOR_CODE_RECORD_NS = "aijalon/creator_code/v1"
 FORMAT_VERSION = 0x01
 WRAPPER_KIND_CLOUD_KMS = 0x01
 WRAPPER_KIND_LOCAL_DEV = 0x02
@@ -260,7 +271,8 @@ class LocalAesKeyWrapper(KeyWrapper):
         self._version = "local-dev:" + hashlib.sha256(b"aijalon-kek-fingerprint\x00" + bytes(kek)).hexdigest()[:16]
 
     @classmethod
-    def from_settings(cls, settings: Any, *, allow_unwrap: bool = False) -> "LocalAesKeyWrapper":
+    def from_settings(cls, settings: Any, *, allow_unwrap: bool = False,
+                      aad: bytes = AGENT_KEY_KMS_AAD) -> "LocalAesKeyWrapper":
         if settings.is_prod:
             raise RuntimeError("LocalAesKeyWrapper must never be used in prod")
         raw = getattr(settings, "local_dev_kek_b64", "") or ""
@@ -269,7 +281,7 @@ class LocalAesKeyWrapper(KeyWrapper):
                                "print(base64.b64encode(os.urandom(32)).decode())')")
         kek = bytearray(base64.b64decode(raw, validate=True))
         try:
-            return cls(kek, is_prod=settings.is_prod, allow_unwrap=allow_unwrap)
+            return cls(kek, is_prod=settings.is_prod, allow_unwrap=allow_unwrap, aad=aad)
         finally:
             zeroize(kek)
 
@@ -376,12 +388,49 @@ def _settings(settings: Any) -> Any:
     return get_settings()
 
 
-def _build_wrapper(s: Any, *, allow_unwrap: bool, kms_client: Any) -> KeyWrapper:
-    if s.kms_key_name:
-        return CloudKmsKeyWrapper(s.kms_key_name, client=kms_client, allow_unwrap=allow_unwrap, require_hsm=s.is_prod)
+def creator_code_aad(strategy_id: str, code_hash: str) -> bytes:
+    """Record AAD for creator strategy code (API seals, executor opens with exactly this)."""
+    return f"{_CREATOR_CODE_RECORD_NS}\x00strategy_code:{strategy_id}:{code_hash}".encode()
+
+
+def _build_wrapper(s: Any, *, allow_unwrap: bool, kms_client: Any, key_name: str | None = None,
+                   aad: bytes = AGENT_KEY_KMS_AAD, env_name: str = "KMS_KEY_NAME") -> KeyWrapper:
+    name = s.kms_key_name if key_name is None else key_name
+    if name:
+        return CloudKmsKeyWrapper(name, client=kms_client, allow_unwrap=allow_unwrap, require_hsm=s.is_prod, aad=aad)
     if s.is_prod:
-        raise RuntimeError("KMS_KEY_NAME is required in prod")
-    return LocalAesKeyWrapper.from_settings(s, allow_unwrap=allow_unwrap)
+        raise RuntimeError(f"{env_name} is required in prod")
+    # one dev KEK, but a per-class wrap AAD: agent-key and code blobs never cross-open
+    return LocalAesKeyWrapper.from_settings(s, allow_unwrap=allow_unwrap, aad=aad)
+
+
+def _code_key_name(s: Any) -> str:
+    name = getattr(s, "creator_code_kms_key_name", "") or ""
+    if name and name == (s.kms_key_name or ""):
+        raise RuntimeError("the creator-code KMS key must differ from the agent-keys KMS key")
+    return name
+
+
+def make_code_encryptor(settings: Any = None, *, kms_client: Any = None) -> EnvelopeEncryptor:
+    """Creator strategy code (API upload): encrypt-only envelope under the dedicated creator-code KMS key."""
+    s = _settings(settings)
+    return EnvelopeEncryptor(_build_wrapper(s, allow_unwrap=False, kms_client=kms_client, key_name=_code_key_name(s),
+                                            aad=CREATOR_CODE_KMS_AAD, env_name="CREATOR_CODE_KMS_KEY_NAME"))
+
+
+def make_code_decryptor(settings: Any = None, *, kms_client: Any = None) -> EnvelopeDecryptor:
+    """Creator strategy code (executor ONLY, same role rule as ``make_decryptor``)."""
+    s = _settings(settings)
+    _require_decrypt_role(s)
+    return EnvelopeDecryptor(_build_wrapper(s, allow_unwrap=True, kms_client=kms_client, key_name=_code_key_name(s),
+                                            aad=CREATOR_CODE_KMS_AAD, env_name="CREATOR_CODE_KMS_KEY_NAME"))
+
+
+def _require_decrypt_role(s: Any) -> None:
+    role = getattr(s, "service_role", None)
+    allowed = _DECRYPT_ROLES_PROD if s.is_prod else _DECRYPT_ROLES_NONPROD
+    if role not in allowed:
+        raise Forbidden("secret decryption is only available to the executor service", service_role=role)
 
 
 def make_encryptor(settings: Any = None, *, kms_client: Any = None) -> EnvelopeEncryptor:
@@ -393,8 +442,5 @@ def make_encryptor(settings: Any = None, *, kms_client: Any = None) -> EnvelopeE
 def make_decryptor(settings: Any = None, *, kms_client: Any = None) -> EnvelopeDecryptor:
     """For the executor ONLY. Requires settings.service_role == "executor" ("all" allowed outside prod)."""
     s = _settings(settings)
-    role = getattr(s, "service_role", None)
-    allowed = _DECRYPT_ROLES_PROD if s.is_prod else _DECRYPT_ROLES_NONPROD
-    if role not in allowed:
-        raise Forbidden("secret decryption is only available to the executor service", service_role=role)
+    _require_decrypt_role(s)
     return EnvelopeDecryptor(_build_wrapper(s, allow_unwrap=True, kms_client=kms_client))

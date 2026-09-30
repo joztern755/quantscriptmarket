@@ -124,6 +124,11 @@ step_network() {
     gcloud compute networks subnets create "${RUN_SUBNET}" --network="${VPC}" --region="${REGION}" \
       --range="${RUN_SUBNET_RANGE}" --enable-private-ip-google-access \
       --enable-flow-logs --logging-aggregation-interval=interval-5-sec --logging-flow-sampling=0.5
+  # executor-only subnet (own NAT + static IP below; REVIEW_AUTH_API F1)
+  exists gcloud compute networks subnets describe "${EXEC_SUBNET}" --region="${REGION}" || \
+    gcloud compute networks subnets create "${EXEC_SUBNET}" --network="${VPC}" --region="${REGION}" \
+      --range="${EXEC_SUBNET_RANGE}" --enable-private-ip-google-access \
+      --enable-flow-logs --logging-aggregation-interval=interval-5-sec --logging-flow-sampling=0.5
   # Private Service Access for Cloud SQL private IP
   exists gcloud compute addresses describe "${PSA_RANGE_NAME}" --global || \
     gcloud compute addresses create "${PSA_RANGE_NAME}" --global --purpose=VPC_PEERING \
@@ -132,8 +137,11 @@ step_network() {
     gcloud services vpc-peerings connect --service=servicenetworking.googleapis.com \
       --ranges="${PSA_RANGE_NAME}" --network="${VPC}"
   fi
-  # Cloud NAT with a reserved static IP: api/executor route ALL egress through the VPC (needed so that calls
-  # to the internal-ingress sandbox count as internal) and reach Hyperliquid/Stripe/Telegram via this NAT.
+  # Cloud NAT with reserved static IPs: api/executor route ALL egress through the VPC (needed so that calls
+  # to the internal-ingress sandbox count as internal) and reach Hyperliquid/Stripe/Telegram via NAT.
+  # TWO NATs on one router, one per subnet: api + migrate leave through ${NAT_IP_NAME}, the executor through its
+  # own ${EXEC_NAT_IP_NAME}. Hyperliquid meters weight per IP, so a user flooding API routes cannot 429 the executor's
+  # orders / exits (REVIEW_AUTH_API F1). Each service charges its own HL_EGRESS_KEY in hl_rate_budget.
   exists gcloud compute routers describe "${ROUTER}" --region="${REGION}" || \
     gcloud compute routers create "${ROUTER}" --network="${VPC}" --region="${REGION}"
   exists gcloud compute addresses describe "${NAT_IP_NAME}" --region="${REGION}" || \
@@ -141,6 +149,12 @@ step_network() {
   exists gcloud compute routers nats describe "${NAT}" --router="${ROUTER}" --region="${REGION}" || \
     gcloud compute routers nats create "${NAT}" --router="${ROUTER}" --region="${REGION}" \
       --nat-custom-subnet-ip-ranges="${RUN_SUBNET}" --nat-external-ip-pool="${NAT_IP_NAME}" \
+      --enable-logging --log-filter=ERRORS_ONLY
+  exists gcloud compute addresses describe "${EXEC_NAT_IP_NAME}" --region="${REGION}" || \
+    gcloud compute addresses create "${EXEC_NAT_IP_NAME}" --region="${REGION}"
+  exists gcloud compute routers nats describe "${EXEC_NAT}" --router="${ROUTER}" --region="${REGION}" || \
+    gcloud compute routers nats create "${EXEC_NAT}" --router="${ROUTER}" --region="${REGION}" \
+      --nat-custom-subnet-ip-ranges="${EXEC_SUBNET}" --nat-external-ip-pool="${EXEC_NAT_IP_NAME}" \
       --enable-logging --log-filter=ERRORS_ONLY
   # Egress firewall for workloads tagged ${RUN_NET_TAG}: HTTPS anywhere, Postgres only to the PSA range.
   local psa="${PSA_RANGE_ADDR}/${PSA_RANGE_PREFIX}"
@@ -171,6 +185,21 @@ step_network() {
   for r in $(gcloud compute routes list --filter="network~/${SANDBOX_VPC}\$ AND destRange=0.0.0.0/0" --format='value(name)'); do
     log "deleting internet route ${r} from ${SANDBOX_VPC}"; gcloud compute routes delete "${r}" --quiet
   done
+  # DNS (REVIEW_WEB_INFRA M5a): Cloud Run resolves through the metadata server → the VPC's Cloud DNS, which would
+  # recurse to public authoritative servers, so `<data>.attacker.tld` lookups could exfiltrate data although no
+  # packet leaves the VPC. A response policy on the sandbox VPC answers EVERY name locally (wildcard `*.`, local data
+  # 0.0.0.0 — a sinkhole; queries never recurse) and DNS query logging records every attempt (the sandbox makes no
+  # legitimate lookups: alert on any log entry). [VERIFY at go-live: from a sandbox probe, `getaddrinfo` of a random
+  # name under a domain we control returns no public answer AND our authoritative server sees no query.]
+  exists gcloud dns response-policies describe "${SANDBOX_DNS_POLICY}" || \
+    gcloud dns response-policies create "${SANDBOX_DNS_POLICY}" --networks="${SANDBOX_VPC}" \
+      --description="sandbox: answer every name locally (no recursion, no DNS exfiltration)"
+  exists gcloud dns response-policies rules describe deny-all --response-policy="${SANDBOX_DNS_POLICY}" || \
+    gcloud dns response-policies rules create deny-all --response-policy="${SANDBOX_DNS_POLICY}" --dns-name="*." \
+      --local-data="name=*.,type=A,ttl=300,rrdatas=0.0.0.0"
+  exists gcloud dns policies describe "${SANDBOX_DNS_LOG_POLICY}" || \
+    gcloud dns policies create "${SANDBOX_DNS_LOG_POLICY}" --networks="${SANDBOX_VPC}" --enable-logging \
+      --description="sandbox: log every DNS query (there should be none)"
   if [[ "${SANDBOX_EGRESS_MODE}" == "connector" ]]; then
     exists gcloud compute networks vpc-access connectors describe "${SANDBOX_CONNECTOR}" --region="${REGION}" || \
       gcloud compute networks vpc-access connectors create "${SANDBOX_CONNECTOR}" --region="${REGION}" \
@@ -187,6 +216,12 @@ step_kms() {
     gcloud kms keys create "${KMS_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" \
       --purpose=encryption --protection-level=hsm --rotation-period=90d \
       --next-rotation-time="$(utc_in_days 90)" --destroy-scheduled-duration=90d --labels=app=aijalon,data=agent-keys
+  # Dedicated creator-code key (REVIEW_TRADING_KEYS F2 / SECURITY §3.4): creator strategy code never shares a KEK,
+  # IAM grant or rotation with agent private keys.
+  exists gcloud kms keys describe "${KMS_CODE_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" || \
+    gcloud kms keys create "${KMS_CODE_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" \
+      --purpose=encryption --protection-level=hsm --rotation-period=90d \
+      --next-rotation-time="$(utc_in_days 90)" --destroy-scheduled-duration=90d --labels=app=aijalon,data=creator-code
   if [[ "${SQL_ENABLE_CMEK}" == "1" ]]; then
     exists gcloud kms keys describe "${KMS_SQL_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" || \
       gcloud kms keys create "${KMS_SQL_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" \
@@ -215,11 +250,15 @@ step_sa() {
       gcloud iam service-accounts create "${id}" --display-name="aijalon ${id#aijalon-}"
   done
   local kf=(--keyring="${KMS_KEYRING}" --location="${REGION}")
-  # api: KMS ENCRYPT only, on agent-keys only.  executor: KMS DECRYPT only, on agent-keys only.
-  gcloud kms keys add-iam-policy-binding "${KMS_KEY}" "${kf[@]}" \
-    --member="serviceAccount:${SA_API}" --role=roles/cloudkms.cryptoKeyEncrypter >/dev/null
-  gcloud kms keys add-iam-policy-binding "${KMS_KEY}" "${kf[@]}" \
-    --member="serviceAccount:${SA_EXECUTOR}" --role=roles/cloudkms.cryptoKeyDecrypter >/dev/null
+  # api: KMS ENCRYPT only, executor: KMS DECRYPT only — on agent-keys and, separately, on creator-code. No other
+  # principal gets either role; no SA gets encrypt AND decrypt on the same key.
+  local key
+  for key in "${KMS_KEY}" "${KMS_CODE_KEY}"; do
+    gcloud kms keys add-iam-policy-binding "${key}" "${kf[@]}" \
+      --member="serviceAccount:${SA_API}" --role=roles/cloudkms.cryptoKeyEncrypter >/dev/null
+    gcloud kms keys add-iam-policy-binding "${key}" "${kf[@]}" \
+      --member="serviceAccount:${SA_EXECUTOR}" --role=roles/cloudkms.cryptoKeyDecrypter >/dev/null
+  done
   # api + executor: Cloud SQL client + IAM database login, scoped to our instance
   local cond="resource.name == 'projects/${PROJECT_ID}/instances/${SQL_INSTANCE}' && resource.type == 'sqladmin.googleapis.com/Instance'"
   local sa
@@ -509,7 +548,7 @@ step_harden() {
 
 step_outputs() {
   log "outputs"
-  local num lb_ip dns_name dns_data exec_url sbx_url db_ip nat_ip
+  local num lb_ip dns_name dns_data exec_url sbx_url db_ip nat_ip exec_nat_ip
   num="$(project_number)"
   lb_ip="$(gcloud compute addresses describe "${LB_IP_NAME}" --global --format='value(address)' 2>/dev/null || true)"
   dns_name="$(gcloud certificate-manager dns-authorizations describe "${CERT_DNS_AUTH}" --format='value(dnsResourceRecord.name)' 2>/dev/null || true)"
@@ -518,6 +557,7 @@ step_outputs() {
   sbx_url="$(gcloud run services describe "${SANDBOX_SERVICE}" --region="${REGION}" --format='value(status.url)' 2>/dev/null || true)"
   db_ip="$(gcloud sql instances describe "${SQL_INSTANCE}" --format='value(ipAddresses[0].ipAddress)' 2>/dev/null || true)"
   nat_ip="$(gcloud compute addresses describe "${NAT_IP_NAME}" --region="${REGION}" --format='value(address)' 2>/dev/null || true)"
+  exec_nat_ip="$(gcloud compute addresses describe "${EXEC_NAT_IP_NAME}" --region="${REGION}" --format='value(address)' 2>/dev/null || true)"
   cat > "${OUT_DIR}/outputs.env" <<EOF
 # generated by infra/gcp/bootstrap.sh $(date -u +%FT%TZ) — no secrets in this file
 GCP_PROJECT_ID=${PROJECT_ID}
@@ -533,6 +573,7 @@ API_LB_IP=${lb_ip}
 API_CERT_DNS_AUTH_NAME=${dns_name}
 API_CERT_DNS_AUTH_VALUE=${dns_data}
 NAT_EGRESS_IP=${nat_ip}
+EXECUTOR_NAT_EGRESS_IP=${exec_nat_ip}
 EOF
   cat "${OUT_DIR}/outputs.env"
   echo

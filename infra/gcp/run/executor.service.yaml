@@ -25,7 +25,7 @@ spec:
         run.googleapis.com/cpu-throttling: "true"
         run.googleapis.com/startup-cpu-boost: "true"
         # Direct VPC egress, ALL traffic: Cloud SQL private IP, internal sandbox, and internet via Cloud NAT
-        run.googleapis.com/network-interfaces: '[{"network":"${VPC}","subnetwork":"${RUN_SUBNET}","tags":["${RUN_NET_TAG}"]}]'
+        run.googleapis.com/network-interfaces: '[{"network":"${VPC}","subnetwork":"${EXEC_SUBNET}","tags":["${RUN_NET_TAG}"]}]'
         run.googleapis.com/vpc-access-egress: all-traffic
         # app starts only after the Cloud SQL Auth Proxy sidecar passes its startup probe
         run.googleapis.com/container-dependencies: '{"app":["cloud-sql-proxy"]}'
@@ -56,6 +56,8 @@ spec:
             - {name: FIREBASE_AUTH_DOMAIN, value: "${WEB_DOMAIN}"}
             - {name: EMAIL_FROM, value: "alerts@${WEB_DOMAIN}"}
             - {name: KMS_KEY_NAME, value: "${KMS_KEY_NAME}"}
+            - {name: CREATOR_CODE_KMS_KEY_NAME, value: "${KMS_CODE_KEY_NAME}"}   # decrypt-only (IAM)
+            - {name: HL_EGRESS_KEY, value: "executor"}          # own NAT IP (EXEC_NAT) → own HL budget
             # IAM database auth through the sidecar: no password; the proxy injects the SA's OAuth token
             - {name: DATABASE_URL, value: "postgresql://${DB_IAM_USER_EXECUTOR_URLENC}@127.0.0.1:5432/${DB_NAME}?sslmode=disable&application_name=executor&options=-c%20statement_timeout%3D300s%20-c%20lock_timeout%3D10s%20-c%20idle_in_transaction_session_timeout%3D120s"}
             - {name: WEB_ORIGIN, value: "https://${WEB_DOMAIN}"}

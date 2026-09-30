@@ -1,7 +1,12 @@
 """/me: profile, first-touch referral binding, platform plan changes.
 
 GET/PATCH /me need only a valid MFA session (no consent gate) so the web app can load the profile and bind the
-referral captured before sign-in. Plan changes move money → consent gate + Idempotency-Key.
+referral captured before sign-in. Plan changes move money → consent gate + STEP-UP (REVIEW_AUTH_API F2: a stolen
+session must not be able to spend the balance) + Idempotency-Key.
+
+Self-referral (F7/M2): the referrer and the referee are compared on verified wallets, device hashes (user_devices +
+the signup device) and recent sign-in networks (/24 IPv4, /64 IPv6). A shared wallet or device refuses the binding;
+a shared network binds but flags the referee (no referral reward until ops clears it).
 """
 from __future__ import annotations
 
@@ -20,6 +25,7 @@ from app.api.deps import (
     idempotency_key,
     missing_consents,
     run_idempotent,
+    step_up_user,
     user_limit,
 )
 from app.errors import Conflict, Forbidden, NotFound, ValidationFailed
@@ -74,22 +80,25 @@ def _bind_referral(conn, svc: Services, ctx: AuthCtx, user: dict, raw_code: str)
     if referrer is None or referrer.get("status") != "active":
         raise NotFound("unknown referral code")
     rid = str(referrer["id"])
-    reasons = svc.domain.self_referral_reasons(
-        referrer=(rid, [w["address"] for w in svc.store.list_wallets(conn, rid)], [referrer.get("device_fp_hash")]),
-        referee=(ctx.user_id, [w["address"] for w in svc.store.list_wallets(conn, ctx.user_id)],
-                 [user.get("device_fp_hash")]))
-    if reasons:
+    from app.api.referral_guard import self_referral_check
+
+    blocked, reasons = self_referral_check(conn, svc, referrer=referrer, referee=user)
+    if blocked:
         svc.audit.write(conn, actor=ctx.actor, action="referral.self_referral_blocked", target=f"user:{ctx.user_id}",
                         payload={"referrer": rid, "reasons": list(reasons)}, ip_hash=ctx.ip_hash)
         raise Forbidden("self-referral is not allowed")
     if not svc.store.bind_referrer(conn, user_id=ctx.user_id, referrer_id=rid):
         raise Conflict("a referral is already bound to this account")
+    if reasons:
+        from app.api.referral_guard import flag_self_referral
+
+        flag_self_referral(conn, svc, referee_id=ctx.user_id, referrer_id=rid, reasons=reasons, where="bind")
     svc.audit.write(conn, actor=ctx.actor, action="referral.bind", target=f"user:{ctx.user_id}",
-                    payload={"referrer": rid}, ip_hash=ctx.ip_hash)
+                    payload={"referrer": rid, "flagged": list(reasons)}, ip_hash=ctx.ip_hash)
 
 
 @router.post("/me/plan", response_model=S.PlanChangeOut, dependencies=[user_limit("plan", 5, 3600)])
-def change_plan(body: S.PlanChangeIn, ctx: AuthCtx = Depends(consented_user),
+def change_plan(body: S.PlanChangeIn, ctx: AuthCtx = Depends(step_up_user),
                 key: str = Depends(idempotency_key), svc: Services = Depends(get_services)):
     """Switch plan now. Paid plans charge the first month immediately from the fee balance (no proration or
     refund on switching); renewals are the settlement job's (users.plan_period_end)."""
@@ -106,8 +115,10 @@ def change_plan(body: S.PlanChangeIn, ctx: AuthCtx = Depends(consented_user),
         price = svc.domain.plan_price(body.plan)
         if price > 0:
             ledger_ops.require_balance(conn, svc, ctx.user_id, price)
+            # F15/L2: the ledger key carries this request's Idempotency-Key, so max→free→max on one day is charged
+            # again (it was silently free while the response and the audit claimed a charge)
             charged, _ = ledger_ops.charge_plan(conn, svc, user_id=ctx.user_id, plan=body.plan, period_start=now,
-                                                actor=ctx.actor)
+                                                actor=ctx.actor, change_ref=key)
             period_end = svc.domain.add_months(now, 1)
         svc.store.set_plan(conn, ctx.user_id, body.plan, period_end)
         svc.audit.write(conn, actor=ctx.actor, action="plan.change", target=f"user:{ctx.user_id}",

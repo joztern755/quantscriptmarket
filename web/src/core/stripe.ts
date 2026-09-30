@@ -12,9 +12,20 @@ export interface StripeLike {
 }
 
 let loading: Promise<StripeLike> | null = null;
+let touched = false;
+
+/**
+ * SECURITY M2 (Stripe isolation): Stripe.js cannot carry SRI and, once loaded, stays in this document. Wallet signing
+ * (core/wallet.ts) and the admin console (core/router.ts) refuse to run in a document where it was ever loaded and
+ * reload the page first, so a tampered Stripe.js can never drive a signature prompt or an admin action.
+ */
+export function stripeWasLoaded(): boolean {
+  return touched || Boolean((window as unknown as { Stripe?: unknown }).Stripe);
+}
 
 export function loadStripe(): Promise<StripeLike> {
   if (loading) return loading;
+  touched = true;
   loading = (async () => {
     const cfg = await publicConfig();
     if (!cfg.stripe_publishable_key) throw new ApiError(0, "stripe_unavailable", "Card payments are not available right now.");
