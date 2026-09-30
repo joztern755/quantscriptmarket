@@ -38,7 +38,8 @@ class SubscriptionView:
     status: str                     # pending|active|past_due|reduce_only|paused_user|cancelled
     markets: tuple[str, ...]        # strategy market whitelist (e.g. ("xyz:SILVER",))
     consecutive_rejections: int = 0  # circuit-breaker counter
-    strategy_max_leverage_x100: int = 500
+    strategy_max_leverage_x100: int | None = None
+    past_due_since: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class MarketSnapshot:
     max_leverage: int
     sz_decimals: int
     as_of: datetime
+    is_delisted: bool = False
 
 
 @dataclass(frozen=True)
@@ -81,21 +83,33 @@ class PlanInput:
     weight_bps: int                 # target weight × 10000 (signed)
     position: Position
     snapshot: MarketSnapshot
+    flags: "Flags"
     reduce_only_mode: bool          # status reduce_only or new entries paused: exposure may only shrink
     now: datetime
 
 
 @dataclass(frozen=True)
+class OrderLeg:
+    is_buy: bool
+    sz: Decimal                     # already rounded to szDecimals
+    limit_px: Decimal               # already on the price grid, within the slippage cap
+    reduce_only: bool
+    close_position: bool = False    # full close: the executor sizes it from the exact on-chain |szi|
+    notional_micro: int = 0         # > 0, planned notional of this leg
+
+
+@dataclass(frozen=True)
 class OrderPlan:
-    """Result of planning one coin. ``action == "skip"`` means the position is already close enough to target."""
-    action: str                     # "order" | "skip"
+    """Planner output for one coin: zero legs = nothing to do (already at target within the rebalance threshold).
+    A flip is two legs: a reduce-only close, then the opening leg."""
     coin: str
-    target_notional_micro: int
-    is_buy: bool = False
-    sz: Decimal = Decimal(0)        # already rounded to szDecimals
-    limit_px: Decimal = Decimal(0)  # already formatted to tick / 5 sig figs
-    reduce_only: bool = False
-    reason: str = ""
+    target_notional_micro: int      # position notional the legs aim for (for reconcile)
+    legs: tuple[OrderLeg, ...] = ()
+    notes: tuple[str, ...] = ()
+
+    @property
+    def action(self) -> str:
+        return "order" if self.legs else "skip"
 
 
 @dataclass(frozen=True)
@@ -245,6 +259,7 @@ class PlanAccount:
     price_monthly_micro: int
     plan_period_end: datetime | None
     past_due_since: datetime | None
+    anchor: datetime | None = None  # plan start (renewals computed from it to avoid month-end drift)
 
 
 @dataclass(frozen=True)
@@ -346,14 +361,17 @@ class AlertSink(Protocol):
 
 class OrderPlanner(Protocol):
     def plan(self, inp: PlanInput) -> OrderPlan:
-        """Pure pre-trade planning (wraps ``app.domain.risk.plan_order``). Raises ``GuardRejected``; a rejection
-        whose ``details["scope"] == "market"`` is market-wide (stale data, oracle deviation) and does not count
-        towards the per-subscription circuit breaker."""
+        """Pure pre-trade planning (wraps ``app.domain.risk.plan_order``). Raises ``GuardRejected`` with
+        ``details={"reasons": (...), "scope": "market"|"subscription"}``. Guard rejections never count towards the
+        circuit breaker (only exchange rejections and unexpected errors do); ``scope`` only shapes alerts."""
 
 
 class Jitter(Protocol):
-    def delay_seconds(self, subscription_id: str, bar_close: datetime) -> int: ...
-    def fair_order(self, subscription_ids: Sequence[str], bar_close: datetime) -> list[str]: ...
+    def delay_seconds(self, user_id: str, bar_close: datetime) -> int:
+        """Per-user deterministic delay (seconds) after bar_close (domain.jitter.delay_seconds)."""
+
+    def fair_order(self, subscription_ids: Sequence[str], bar_close: datetime) -> list[str]:
+        """Deterministic per-bar shuffle (domain.jitter.fair_order)."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -406,6 +424,9 @@ class SettlementRepo(Protocol):
     def subscriptions_to_settle(self) -> Sequence[SettlementSubscription]:
         """Every subscription that may carry PnL (incl. cancelled with an unsettled cursor)."""
 
+    def is_settled(self, subscription_id: str, settle_date: date) -> bool:
+        """True when the (subscription, settle_date) settlement row exists."""
+
     def pnl_since(self, subscription_id: str, since: datetime | None, until: datetime) -> PnlDelta:
         """Attributed fills (closedPnl − fee) + funding in (since, until]."""
 
@@ -420,7 +441,8 @@ class SettlementRepo(Protocol):
 
     def mark_builder_fee_recognised(self, tid: str, ledger_tx_id: str) -> None: ...
 
-    def plans_due(self, now: datetime) -> Sequence[PlanAccount]: ...
+    def plans_due(self, now: datetime) -> Sequence[PlanAccount]:
+        """Paid plans (pro/max) whose plan_period_end ≤ now."""
 
     def set_plan_period(self, user_id: str, plan_period_end: datetime | None, past_due_since: datetime | None) -> None: ...
 
@@ -438,15 +460,21 @@ class ProfitShareCalculator(Protocol):
 
 
 class FeeSplitter(Protocol):
-    def split_builder_fee(self, fee_micro: int, *, has_creator: bool, referrer_share_bps: int | None) -> BuilderFeeSplit: ...
+    def split_builder_fee(self, fee_micro: int, *, in_house: bool, referrer_share_bps: int | None) -> BuilderFeeSplit:
+        """Exact split of a collected builder fee (domain.fees.split_builder_fee)."""
 
     def split_subscription(self, price_micro: int) -> tuple[int, int]:
         """(creator_micro, platform_micro); sums exactly to price."""
 
 
 class BillingPolicy(Protocol):
-    def next_status(self, *, status: str, balance_micro: int, past_due_since: datetime | None,
+    def next_status(self, *, status: str, balance_micro: int, amount_due_micro: int, past_due_since: datetime | None,
                     now: datetime) -> tuple[str, datetime | None]:
-        """Fee-balance state machine: returns (status, past_due_since)."""
+        """Fee-balance state machine (domain.billing.next_status): returns (status, past_due_since). ``active``
+        with amount_due > 0 means the balance covers it and the caller deducts it."""
 
-    def next_period_end(self, period_end: datetime) -> datetime: ...
+    def next_period_end(self, anchor: datetime, now: datetime) -> datetime:
+        """First monthly renewal instant from ``anchor`` strictly after ``now`` (domain.billing.next_renewal_after)."""
+
+    @property
+    def grace_hours(self) -> int: ...

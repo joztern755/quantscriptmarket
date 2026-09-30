@@ -1,7 +1,10 @@
 // Fee math for UI previews. Integer micro-USD and bps only; mirrors SPEC §1 and
 // backend/app/domain/fees.py rounding: user charges floor; splits give the remainder to the platform.
-// Values always come from GET /v1/public/config (normalised here); defaults = SPEC §1 only as a fallback
-// so a partially-populated config never renders NaN.
+// Rates always come from publicConfig().economics (core/api.ts).
+
+import type { PublicConfig } from "../../core/api.js";
+
+export type EconomicsCfg = PublicConfig["economics"];
 
 export interface ReferralTierCfg {
   name: string;
@@ -10,117 +13,14 @@ export interface ReferralTierCfg {
   share_of_pool_bps: number;
 }
 
-export interface PlanCfg {
-  key: string;
-  price_monthly_micro: number;
-  max_active_strategies: number | null;
-  features: string[];
-}
-
-export interface EconomicsCfg {
-  builder_fee_tenths_bp: number;
-  builder_split_creator_bps: number;
-  builder_split_platform_bps: number;
-  builder_split_referral_pool_bps: number;
-  profit_share_creator_cap_bps: number;
-  platform_profit_share_bps: number;
-  platform_profit_share_mode: "on_top" | "carved_out";
-  subscription_platform_bps: number;
-  post_platform_fee_micro: number;
-  post_min_price_micro: number;
-  min_topup_micro: number;
-  past_due_grace_hours: number;
-  referral_tiers: ReferralTierCfg[];
-}
-
-export interface NormalizedConfig {
-  economics: EconomicsCfg;
-  plans: PlanCfg[];
-  restricted_countries: string[];
-  builder_address: string;
-  treasury_address: string;
-  agent_name: string;
-  feature_creator_uploads: boolean;
-  platform_max_leverage: number;
-  min_subscribers_for_public_stats: number;
-  raw: unknown;
-}
-
 const USD = 1_000_000;
 
-export const DEFAULT_ECONOMICS: EconomicsCfg = {
-  builder_fee_tenths_bp: 100,
-  builder_split_creator_bps: 5000,
-  builder_split_platform_bps: 3000,
-  builder_split_referral_pool_bps: 2000,
-  profit_share_creator_cap_bps: 1500,
-  platform_profit_share_bps: 150,
-  platform_profit_share_mode: "on_top",
-  subscription_platform_bps: 300,
-  post_platform_fee_micro: 1 * USD,
-  post_min_price_micro: 2 * USD,
-  min_topup_micro: 10 * USD,
-  past_due_grace_hours: 72,
-  referral_tiers: [
-    { name: "starter", min_active_users: 0, min_notional_30d_micro: 0, share_of_pool_bps: 5000 },
-    { name: "partner", min_active_users: 10, min_notional_30d_micro: 1_000_000 * USD, share_of_pool_bps: 7500 },
-    { name: "elite", min_active_users: 100, min_notional_30d_micro: 25_000_000 * USD, share_of_pool_bps: 10000 },
-  ],
-};
-
-type Rec = Record<string, unknown>;
-const isRec = (v: unknown): v is Rec => typeof v === "object" && v !== null && !Array.isArray(v);
-const num = (v: unknown, d: number): number => (typeof v === "number" && Number.isFinite(v) ? v : typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v)) ? Number(v) : d);
-const str = (v: unknown, d: string): string => (typeof v === "string" ? v : d);
-
-export function normalizeConfig(raw: unknown): NormalizedConfig {
-  const r: Rec = isRec(raw) ? raw : {};
-  const e: Rec = isRec(r.economics) ? r.economics : isRec(r.fees) ? r.fees : r;
-  const D = DEFAULT_ECONOMICS;
-  const tiersRaw = Array.isArray(e.referral_tiers) ? e.referral_tiers : null;
-  const economics: EconomicsCfg = {
-    builder_fee_tenths_bp: num(e.builder_fee_tenths_bp, D.builder_fee_tenths_bp),
-    builder_split_creator_bps: num(e.builder_split_creator_bps, D.builder_split_creator_bps),
-    builder_split_platform_bps: num(e.builder_split_platform_bps, D.builder_split_platform_bps),
-    builder_split_referral_pool_bps: num(e.builder_split_referral_pool_bps, D.builder_split_referral_pool_bps),
-    profit_share_creator_cap_bps: num(e.profit_share_creator_cap_bps, D.profit_share_creator_cap_bps),
-    platform_profit_share_bps: num(e.platform_profit_share_bps, D.platform_profit_share_bps),
-    platform_profit_share_mode: e.platform_profit_share_mode === "carved_out" ? "carved_out" : "on_top",
-    subscription_platform_bps: num(e.subscription_platform_bps, D.subscription_platform_bps),
-    post_platform_fee_micro: num(e.post_platform_fee_micro, D.post_platform_fee_micro),
-    post_min_price_micro: num(e.post_min_price_micro, D.post_min_price_micro),
-    min_topup_micro: num(e.min_topup_micro, D.min_topup_micro),
-    past_due_grace_hours: num(e.past_due_grace_hours, D.past_due_grace_hours),
-    referral_tiers: tiersRaw
-      ? tiersRaw.filter(isRec).map((t) => ({
-          name: str(t.name, "tier"),
-          min_active_users: num(t.min_active_users, 0),
-          min_notional_30d_micro: num(t.min_notional_30d_micro, 0),
-          share_of_pool_bps: num(t.share_of_pool_bps, 0),
-        }))
-      : D.referral_tiers,
-  };
-  const plansRaw = Array.isArray(r.plans) ? r.plans : Array.isArray(e.plans) ? (e.plans as unknown[]) : [];
-  const plans: PlanCfg[] = plansRaw.filter(isRec).map((p) => ({
-    key: str(p.key, "plan"),
-    price_monthly_micro: num(p.price_monthly_micro, 0),
-    max_active_strategies: p.max_active_strategies === null || p.max_active_strategies === undefined ? null : num(p.max_active_strategies, 0),
-    features: Array.isArray(p.features) ? p.features.filter((x): x is string => typeof x === "string") : [],
-  }));
-  const risk: Rec = isRec(r.risk) ? r.risk : {};
-  return {
-    economics,
-    plans,
-    restricted_countries: Array.isArray(r.restricted_countries) ? r.restricted_countries.filter((x): x is string => typeof x === "string") : [],
-    builder_address: str(r.builder_address, ""),
-    treasury_address: str(r.treasury_address, ""),
-    agent_name: str(r.agent_name, "aijalon"),
-    feature_creator_uploads: r.feature_creator_uploads === undefined ? true : r.feature_creator_uploads === true,
-    platform_max_leverage: num(risk.platform_max_leverage ?? r.platform_max_leverage, 5),
-    min_subscribers_for_public_stats: num(risk.min_subscribers_for_public_stats ?? r.min_subscribers_for_public_stats, 5),
-    raw,
-  };
-}
+/** SPEC §1.2 defaults; GET /v1/referrals may return `tiers` which then take precedence. */
+export const DEFAULT_REFERRAL_TIERS: ReferralTierCfg[] = [
+  { name: "starter", min_active_users: 0, min_notional_30d_micro: 0, share_of_pool_bps: 5000 },
+  { name: "partner", min_active_users: 10, min_notional_30d_micro: 1_000_000 * USD, share_of_pool_bps: 7500 },
+  { name: "elite", min_active_users: 100, min_notional_30d_micro: 25_000_000 * USD, share_of_pool_bps: 10000 },
+];
 
 /** floor(amount * bps / 10000) for non-negative integers. */
 export function bpsOf(amountMicro: number, bps: number): number {

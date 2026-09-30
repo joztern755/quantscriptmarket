@@ -1,0 +1,89 @@
+{
+ "marginSummary": {
+  "accountValue": "45786.571704",
+  "totalNtlPos": "83939.007748",
+  "totalRawUsd": "34167.628934",
+  "totalMarginUsed": "6125.734835"
+ },
+ "crossMarginSummary": {
+  "accountValue": "41646.032105",
+  "totalNtlPos": "39403.604724",
+  "totalRawUsd": "30897.594741",
+  "totalMarginUsed": "1985.195236"
+ },
+ "crossMaintenanceMarginUsed": "818.411801",
+ "withdrawable": "15663.642897",
+ "assetPositions": [
+  {
+   "type": "oneWay",
+   "position": {
+    "coin": "xyz:XYZ100",
+    "szi": "0.4043",
+    "leverage": {
+     "type": "cross",
+     "value": 20
+    },
+    "entryPx": "30325.0",
+    "positionValue": "12288.2942",
+    "unrealizedPnl": "27.8967",
+    "returnOnEquity": "0.0455070074",
+    "liquidationPx": null,
+    "marginUsed": "614.41471",
+    "maxLeverage": 30,
+    "cumFunding": {
+     "allTime": "6.168491",
+     "sinceOpen": "0.076597",
+     "sinceChange": "0.076597"
+    }
+   }
+  },
+  {
+   "type": "oneWay",
+   "position": {
+    "coin": "xyz:HOOD",
+    "szi": "111.683",
+    "leverage": {
+     "type": "isolated",
+     "value": 10,
+     "rawUsd": "-12002.301177"
+    },
+    "entryPx": "119.434",
+    "positionValue": "13351.70265",
+    "unrealizedPnl": "12.873141",
+    "returnOnEquity": "0.0096508775",
+    "liquidationPx": "113.1237631416",
+    "marginUsed": "1349.401473",
+    "maxLeverage": 10,
+    "cumFunding": {
+     "allTime": "-11.244601",
+     "sinceOpen": "0.156482",
+     "sinceChange": "0.0"
+    }
+   }
+  },
+  {
+   "type": "oneWay",
+   "position": {
+    "coin": "xyz:META",
+    "szi": "-10.405",
+    "leverage": {
+     "type": "cross",
+     "value": 20
+    },
+    "entryPx": "739.12",
+    "positionValue": "7698.2433",
+    "unrealizedPnl": "-7.69672",
+    "returnOnEquity": "-0.0200160546",
+    "liquidationPx": "4568.0026897012",
+    "marginUsed": "384.912165",
+    "maxLeverage": 20,
+    "cumFunding": {
+     "allTime": "2.495519",
+     "sinceOpen": "0.0",
+     "sinceChange": "0.0"
+    }
+   }
+  }
+ ],
+ "time": 1790752656865
+}

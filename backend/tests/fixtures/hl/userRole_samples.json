@@ -1,0 +1,23 @@
+{
+ "user": {
+  "role": "user"
+ },
+ "subAccount": {
+  "role": "subAccount",
+  "data": {
+   "master": "0x2222222222222222222222222222222222222222"
+  }
+ },
+ "agent": {
+  "role": "agent",
+  "data": {
+   "user": "0x1111111111111111111111111111111111111111"
+  }
+ },
+ "vault": {
+  "role": "vault"
+ },
+ "unknown_address": {
+  "role": "user"
+ }
+}

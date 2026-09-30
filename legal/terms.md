@@ -165,13 +165,13 @@ We may withhold or claw back rewards earned in breach of these Terms or the Acce
 |---|---|---|
 | Builder fee | 0.1% of the notional value of **every** order we place for you. This includes entries, exits, reduce-only and rebalancing orders, whether the trade wins or loses. | Collected on-chain by Hyperliquid when each order fills. It is on top of Hyperliquid's own trading fees. |
 | Strategy subscription | Monthly price set by the creator | Prepaid from your Fee Balance at the start of each period |
-| Profit share | Up to 15% (set by the creator) plus a 1.5% platform share, charged on **net realised profit above the high-water mark** for each subscription [CONFIRM: platform share charged "on top" of or "carved out" of the creator rate] | Calculated and deducted from your Fee Balance daily |
+| Profit share | Creator share of 0–12% (set by the creator) **plus** a 1.5% platform share charged on top, so **at most 13.5% in total**. Charged on **net realised profit above the high-water mark** for each subscription. | Calculated and deducted from your Fee Balance daily |
 | Paid posts | Price set by the creator | Deducted from your Fee Balance at purchase |
 | Platform plan | Free $0; Pro $20/month; Max $50/month | Deducted from your Fee Balance monthly |
 
 10.2 **How profit share is calculated.** For each subscription separately, we add up the realised PnL of fills we placed for that subscription, minus trading fees, plus funding while the subscription held a position. When that cumulative total goes above its previous high point (the "high-water mark"), profit share is charged on the increase. Losses are never refunded, but they must be recovered before any new profit share is charged. **Profit share on one subscription is not reduced by losses on another.** You may pay profit share even when your account overall is down. Settlement runs daily at about 00:30 UTC.
 
-10.3 **Fee Balance.** Your Fee Balance is a prepaid balance, recorded in US dollars, used only to pay Platform fees. You top it up with USDC sent on Hyperliquid, or by card or other methods through Stripe. The minimum top-up is $10. The Fee Balance:
+10.3 **Fee Balance.** Your Fee Balance is a prepaid balance, recorded in US dollars, used only to pay Platform fees. You top it up with USDC sent on Hyperliquid, or by card or other methods through Stripe. The minimum top-up is $10. **For card and other Stripe payments, the amount credited to your Fee Balance is the amount you pay minus the payment processor's fee for that payment.** Before you confirm, we show you the processor fee and the net amount to be credited [PRODUCT: the fee must be shown before confirmation; if the exact fee is only known after settlement, show an estimate and explain]. For USDC top-ups, the amount credited is the USDC received at our treasury address; any network or transfer fees are yours. The Fee Balance:
 - is **not** a deposit, savings account or investment;
 - earns no interest;
 - is not trading collateral;
@@ -194,7 +194,7 @@ We aim to alert you when your balance falls to about 50%, 20% and 0% of your est
 
 10.8 **Taxes.** Fees do not include any applicable taxes (for example, service tax), unless stated otherwise. You are responsible for your own taxes on trading results. [COUNSEL: whether SST or service tax applies to these fees, and how that must be shown to customers.]
 
-10.9 **Currency.** Fees are in US dollars. Your card issuer or payment provider may charge currency conversion and other fees. We are not responsible for those.
+10.9 **Currency.** Fees are in US dollars. Processor fees deducted from Stripe top-ups (clause 10.3) are not refundable, except where the law requires otherwise. Your card issuer or payment provider may charge currency conversion and other fees. We are not responsible for those.
 
 ## 11. Your conduct
 
@@ -373,5 +373,6 @@ Each party pays its own costs, unless the arbitrator decides otherwise. The arbi
 7. Anti-money-laundering: is the operator a reporting institution (for example, as a digital-asset-related business)? Is customer due diligence required for all users?
 8. SST or service tax on platform fees; tax treatment of creator and referral payouts; e-invoicing obligations.
 9. Is the referral programme compliant with the Direct Sales and Anti-Pyramid Scheme Act 1993 and advertising rules?
-10. What approval does Stripe need for this business category? (Stripe restricts investment and crypto-related businesses.) Could an account closure strand users' Fee Balances?
-11. Unilateral closing of positions on termination or kill switch (clauses 5.2(c) and 15.3(b)): is there any liability exposure, and should users give a specific election?
+10. **Passing processor fees to users.** Is it permitted, and on what terms, to credit the Fee Balance net of Stripe fees? Consider card-scheme and Stripe surcharging rules, consumer price-transparency rules, and the Consumer Protection (Electronic Trade Transactions) Regulations 2012 disclosure requirements. The fee must be shown before payment.
+11. What approval does Stripe need for this business category? (Stripe restricts investment and crypto-related businesses.) Could an account closure strand users' Fee Balances?
+12. Unilateral closing of positions on termination or kill switch (clauses 5.2(c) and 15.3(b)): is there any liability exposure, and should users give a specific election?

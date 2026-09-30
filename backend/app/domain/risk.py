@@ -7,7 +7,8 @@ Decisions (documented contract):
 - Hard blocks — NO order at all, not even reduce-only exits: global kill switch, market kill switch, circuit
   breaker open (consecutive_rejects ≥ limit), subscription status not in {active, past_due, reduce_only}
   (paused_user / cancelled / pending), market not whitelisted, delisted, stale or future-dated data,
-  mark/oracle (or mid/oracle) deviation above the cap, invalid inputs. Kill switches are emergency stops (e.g.
+  mark/oracle (or mid/oracle) deviation above the cap, invalid inputs (incl. |weight| > 100x = corrupt
+  signal; weights up to that are clamped by leverage, so lowering the platform cap never strands a strategy). Kill switches are emergency stops (e.g.
   suspected agent-key compromise or market manipulation), so any order is suspect; ops flatten manually.
 - Entry blocks — only exposure-reducing orders: status `reduce_only`, `past_due` after the grace period
   (or without a timestamp), `new_entries_paused` (global), market in `paused_markets` (auto-pause by a
@@ -35,7 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
-from typing import Collection
+from collections.abc import Collection
 
 from app.config import RiskLimits
 from app.money import BPS, MICRO
@@ -51,6 +52,7 @@ __all__ = [
     "Rejection",
     "PERP_MAX_PX_DECIMALS",
     "FUTURE_SKEW_SECONDS",
+    "MAX_WEIGHT_BPS",
     "round_px_toward_mid",
     "liquidity_cap_micro",
     "effective_max_leverage_x100",
@@ -59,6 +61,8 @@ __all__ = [
 
 PERP_MAX_PX_DECIMALS = 6
 FUTURE_SKEW_SECONDS = 5
+#: |weight| above 100x is treated as a corrupt signal and rejected; anything below is clamped by leverage.
+MAX_WEIGHT_BPS = 100 * BPS
 
 
 @dataclass(frozen=True)
@@ -140,7 +144,8 @@ def round_px_toward_mid(px: Decimal, sz_decimals: int, is_buy: bool) -> Decimal:
     decimals2 = max(0, min(max_dec, 4 - out.adjusted()))
     if decimals2 < decimals:
         out = out.quantize(Decimal(1).scaleb(-decimals2), rounding=ROUND_FLOOR if is_buy else ROUND_CEILING)
-    return out.normalize() if out == out.to_integral_value() else out
+    # canonical form without exponent: integers as '100500', others without trailing zeros
+    return out.quantize(Decimal(1)) if out == out.to_integral_value() else out.normalize()
 
 
 def liquidity_cap_micro(market: MarketSnapshot, limits: RiskLimits) -> int:
@@ -162,7 +167,7 @@ def _validate(target_weight_bps: object, ctx: SubscriptionContext, market: Marke
     bad: list[str] = []
     if not _is_int(target_weight_bps):
         bad.append("invalid_input:target_weight_bps")
-    elif abs(target_weight_bps) > limits.platform_max_leverage * BPS:  # type: ignore[arg-type]
+    elif abs(target_weight_bps) > MAX_WEIGHT_BPS:  # type: ignore[arg-type]
         bad.append("weight_out_of_range")
     for name in ("allocation_micro", "consecutive_rejects"):
         v = getattr(ctx, name)

@@ -1,0 +1,114 @@
+{
+ "recorded_at": "2026-09-30",
+ "source": "POST https://api.hyperliquid.xyz/info (mainnet, read-only)",
+ "privacy": "Third-party wallet addresses and tx hashes are replaced by deterministic pseudonyms (sha256). HLP vault address, dex deployer metadata, market data are verbatim. Numeric fields are verbatim.",
+ "roles": {
+  "0x1111111111111111111111111111111111111111": "trader_with_builder_fills",
+  "0x2222222222222222222222222222222222222222": "master_with_subaccounts",
+  "0x3333333333333333333333333333333333333333": "subaccount",
+  "0x4444444444444444444444444444444444444444": "agent_of_trader"
+ },
+ "requests": {
+  "perpDexs": {
+   "type": "perpDexs"
+  },
+  "meta": {
+   "type": "meta"
+  },
+  "meta_xyz": {
+   "type": "meta",
+   "dex": "xyz"
+  },
+  "metaAndAssetCtxs": {
+   "type": "metaAndAssetCtxs"
+  },
+  "metaAndAssetCtxs_xyz": {
+   "type": "metaAndAssetCtxs",
+   "dex": "xyz"
+  },
+  "candleSnapshot_*": {
+   "type": "candleSnapshot",
+   "req": {
+    "coin": "...",
+    "interval": "1d",
+    "startTime": "ms",
+    "endTime": "ms"
+   }
+  },
+  "l2Book_*": {
+   "type": "l2Book",
+   "coin": "..."
+  },
+  "userFills_sample": {
+   "type": "userFills",
+   "user": "..."
+  },
+  "userFillsByTime_sample": {
+   "type": "userFillsByTime",
+   "user": "...",
+   "startTime": "ms",
+   "endTime": "ms",
+   "aggregateByTime": false
+  },
+  "userFunding_sample": {
+   "type": "userFunding",
+   "user": "...",
+   "startTime": "ms",
+   "endTime": "ms"
+  },
+  "userNonFundingLedgerUpdates_sample": {
+   "type": "userNonFundingLedgerUpdates",
+   "user": "...",
+   "startTime": 0
+  },
+  "clearinghouseState": {
+   "type": "clearinghouseState",
+   "user": "..."
+  },
+  "clearinghouseState_xyz": {
+   "type": "clearinghouseState",
+   "user": "...",
+   "dex": "xyz"
+  },
+  "extraAgents": {
+   "type": "extraAgents",
+   "user": "..."
+  },
+  "userRole_samples": {
+   "type": "userRole",
+   "user": "..."
+  },
+  "maxBuilderFee": {
+   "type": "maxBuilderFee",
+   "user": "...",
+   "builder": "0x..."
+  },
+  "subAccounts_sample": {
+   "type": "subAccounts",
+   "user": "..."
+  },
+  "frontendOpenOrders_sample": {
+   "type": "frontendOpenOrders",
+   "user": "..."
+  },
+  "clearinghouseState_xyz_positions": {
+   "type": "clearinghouseState",
+   "user": "...",
+   "dex": "xyz"
+  },
+  "orderStatus_*": {
+   "type": "orderStatus",
+   "user": "...",
+   "oid": "cloid hex or int oid"
+  },
+  "historicalOrders_sample": {
+   "type": "historicalOrders",
+   "user": "..."
+  }
+ },
+ "trimmed": [
+  "perpDexs: per-dex list fields cut to 3 entries",
+  "l2Book: 5 levels per side",
+  "userFills/userFunding/ledger/subAccounts/frontendOpenOrders: selected subsets"
+ ]
+}

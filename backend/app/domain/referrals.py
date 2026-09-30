@@ -4,7 +4,7 @@ from __future__ import annotations
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Iterable, Sequence
+from collections.abc import Iterable, Sequence
 
 from app.config import Economics, ReferralTier
 from app.money import BPS

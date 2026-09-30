@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "name": "EMA cross with RSI filter (HYPE, 4h)",
+  "markets": ["HYPE"],
+  "timeframe": "4h",
+  "lookback": 200,
+  "max_leverage": 1,
+  "indicators": {
+    "fast": {"type": "ema", "source": "close", "period": 21},
+    "slow": {"type": "ema", "source": "close", "period": 55},
+    "rsi14": {"type": "rsi", "source": "close", "period": 14},
+    "atr14": {"type": "atr", "period": 14},
+    "low20": {"type": "lowest", "source": "low", "period": 20, "shift": 1}
+  },
+  "rules": [
+    {"when": {"any": [{"left": "close", "op": "<", "right": "low20"},
+                      {"left": "fast", "op": "crosses_below", "right": "slow"}]}, "weight": 0},
+    {"when": {"all": [{"left": "fast", "op": ">", "right": "slow"},
+                      {"left": "rsi14", "op": "<", "right": 75}]}, "weight": 1},
+    {"when": {"all": [{"left": "fast", "op": ">", "right": "slow"}]}, "weight": 0.5}
+  ],
+  "default_weight": 0
+}

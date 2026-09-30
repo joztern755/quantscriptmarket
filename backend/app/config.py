@@ -99,6 +99,10 @@ class Settings:
     restricted_countries: tuple[str, ...]
     feature_creator_uploads: bool
     in_house_listed: tuple[str, ...]
+    service_role: str                               # "api" | "executor" | "sandbox" | "all" (dev only)
+    audit_pepper_b64: str                           # ≥32 random bytes, Secret Manager; hashes IPs / user agents
+    firebase_auth_domain: str                       # e.g. aijalon.trade (recommended) or <project>.firebaseapp.com
+    edge_auth_secret: str                           # shared secret header set by Cloudflare Transform Rule
     economics: Economics = field(default_factory=Economics)
     risk: RiskLimits = field(default_factory=RiskLimits)
 
@@ -143,11 +147,18 @@ def get_settings() -> Settings:
         ),
         feature_creator_uploads=_b("FEATURE_CREATOR_UPLOADS", "true"),
         in_house_listed=tuple(x for x in os.environ.get("IN_HOUSE_LISTED", "silver").split(",") if x),
+        service_role=os.environ.get("SERVICE_ROLE", "all" if env != "prod" else ""),
+        audit_pepper_b64=os.environ.get("AUDIT_PEPPER_B64", ""),
+        firebase_auth_domain=os.environ.get("FIREBASE_AUTH_DOMAIN", ""),
+        edge_auth_secret=os.environ.get("EDGE_AUTH_SECRET", ""),
     )
     if s.is_prod:
-        missing = [k for k in ("builder_address", "treasury_address", "kms_key_name", "firebase_project_id", "signals_pubkey_b64") if not getattr(s, k)]
+        missing = [k for k in ("builder_address", "treasury_address", "kms_key_name", "firebase_project_id", "signals_pubkey_b64",
+                                "audit_pepper_b64", "edge_auth_secret", "service_role") if not getattr(s, k)]
         if missing:
             raise RuntimeError(f"prod config missing: {missing}")
         if s.local_dev_kek_b64:
             raise RuntimeError("LOCAL_DEV_KEK_B64 must not be set in prod")
+        if s.service_role not in ("api", "executor", "sandbox"):
+            raise RuntimeError("SERVICE_ROLE must be api|executor|sandbox in prod")
     return s

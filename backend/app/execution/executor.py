@@ -21,9 +21,10 @@ Per subscription:
   outcome is resolved (never re-sent blindly) on the next tick.
 - Partial fills: the residual is re-planned from the actual position on a later tick, up to
   ``max_attempts_per_bar`` submitted orders per (subscription, bar, coin). Then the bar is closed as "residual".
-- Circuit breaker: ``consecutive_reject_breaker`` consecutive rejections (guard, exchange, unexpected exception) stop
-  the subscription until an admin resets the counter. Market-scope guard failures and exchange/info outages do not
-  count (they are not the subscription's fault and would otherwise trip every subscriber at once).
+- Circuit breaker: ``consecutive_reject_breaker`` consecutive exchange rejections or unexpected exceptions stop the
+  subscription until an admin resets the counter (any fill resets it). Pre-trade guard rejections and
+  exchange/info outages (``ExternalServiceError``) do not count: they are market-wide or not the subscription's
+  fault and would otherwise trip every subscriber at once (same contract as ``domain.risk``).
 """
 from __future__ import annotations
 
@@ -58,6 +59,7 @@ from .ports import (
     LockProvider,
     MarketData,
     MarketSnapshot,
+    OrderLeg,
     OrderPlan,
     OrderPlanner,
     OrderRecord,
@@ -99,7 +101,7 @@ def is_our_cloid(cloid: str | None) -> bool:
 
 @dataclass(frozen=True)
 class ExecutorConfig:
-    max_attempts_per_bar: int = 3            # submitted orders per (subscription, bar, coin)
+    max_attempts_per_bar: int = 4            # submitted orders per (subscription, bar, coin); a flip uses 2
     time_budget_seconds: float = 45.0        # stop starting new subscriptions after this (tick runs every 60s)
     max_subscriptions_per_tick: int = 200
     max_due_fetch_per_version: int = 2000
@@ -163,7 +165,7 @@ class _Tick:
 @dataclass(frozen=True)
 class _PendingOrder:
     coin: str
-    plan: OrderPlan
+    leg: OrderLeg
     attempt: int
 
 
@@ -254,7 +256,7 @@ class Executor:
         age = (now - sig.bar_close).total_seconds()
         if age > self.cfg.signal_max_age_seconds:
             report.stale_signals += 1
-            self._alert("warn", "stale_signal", {
+            self._alert("critical", "stale_signal", {
                 "strategy_version_id": sig.strategy_version_id, "bar_close": sig.bar_close.isoformat(),
                 "age_hours": round(age / 3600, 1)}, dedup=f"stale_signal:{sig.strategy_version_id}:{sig.bar_close.isoformat()}")
             return []
@@ -263,7 +265,7 @@ class Executor:
         out = []
         for sid in self.jitter.fair_order(list(by_id), sig.bar_close):
             sub = by_id[sid]
-            delay = int(self.jitter.delay_seconds(sid, sig.bar_close))
+            delay = int(self.jitter.delay_seconds(sub.user_id, sig.bar_close))
             if now < sig.bar_close + timedelta(seconds=delay):
                 report.not_due += 1
                 continue
@@ -294,12 +296,12 @@ class Executor:
 
             all_done = True
             residual = False
-            to_place: list[_PendingOrder] = []
+            to_place: list[list[_PendingOrder]] = []
             try:
                 for coin in coins:
                     state, pending = self._prepare_coin(sub, sig, coin, positions.get(coin) or Position.flat(coin),
                                                         reduce_only_sub, tick)
-                    if pending is not None:
+                    if pending:
                         to_place.append(pending)
                     elif state == "residual":
                         residual = True
@@ -307,8 +309,8 @@ class Executor:
                         all_done = False
 
                 if to_place:
-                    for placed_done in self._place_all(sub, sig, delay, to_place, tick):
-                        if not placed_done:
+                    for coin_done in self._place_all(sub, sig, delay, to_place, tick):
+                        if not coin_done:
                             all_done = False
             except _BreakerTripped:
                 return
@@ -318,8 +320,8 @@ class Executor:
                 report.bars_completed += 1
 
     def _prepare_coin(self, sub: SubscriptionView, sig: BarSignal, coin: str, pos: Position, reduce_only_sub: bool,
-                      tick: _Tick) -> tuple[str, _PendingOrder | None]:
-        """Returns (state, order_to_place). state: done | residual | wait."""
+                      tick: _Tick) -> tuple[str, list[_PendingOrder]]:
+        """Returns (state, orders_to_place). state: done | residual | wait."""
         report, flags = tick.report, tick.flags
         weight = int(sig.weights_bps[coin])
 
@@ -328,10 +330,10 @@ class Executor:
             self._alert("critical", "signal_market_not_whitelisted", {
                 "strategy_version_id": sig.strategy_version_id, "coin": coin, "bar_close": sig.bar_close.isoformat()},
                 dedup=f"not_whitelisted:{sig.strategy_version_id}:{sig.bar_close.isoformat()}:{coin}")
-            return "done", None
+            return "done", []
         if coin in flags.killed_markets:
             report.market_killed += 1
-            return "wait", None
+            return "wait", []
 
         orders = list(self.subs.orders_for_bar(sub.id, sig.bar_close, coin))
         if any(o.status in _UNRESOLVED for o in orders):
@@ -341,79 +343,93 @@ class Executor:
             orders = list(self.subs.orders_for_bar(sub.id, sig.bar_close, coin))
             if any(o.status in _UNRESOLVED for o in orders):
                 report.unresolved_orders += 1
-                return "wait", None
+                return "wait", []
 
         submitted = [o for o in orders if o.status != ORDER_NOT_SUBMITTED]
         if len(submitted) >= self.cfg.max_attempts_per_bar or len(orders) >= 2 * self.cfg.max_attempts_per_bar:
             last = orders[-1] if orders else None
             if last is not None and last.status != ORDER_FILLED:
-                self._alert("warn", "execution_residual", {
+                self._alert("info", "execution_residual", {
                     "subscription_id": sub.id, "coin": coin, "bar_close": sig.bar_close.isoformat(),
                     "attempts": len(submitted), "last_status": last.status},
                     user_id=sub.user_id, dedup=f"residual:{sub.id}:{sig.bar_close.isoformat()}:{coin}")
-                return "residual", None
-            return "done", None
+                return "residual", []
+            return "done", []
 
         snap = self._snapshot(coin, tick)
         if snap is None:
             report.no_market_data += 1
-            return "wait", None
+            return "wait", []
 
         reduce_only = reduce_only_sub or coin in flags.paused_entry_markets
         try:
             plan = self.planner.plan(PlanInput(subscription=sub, coin=coin, weight_bps=weight, position=pos,
-                                               snapshot=snap, reduce_only_mode=reduce_only, now=tick.now))
+                                               snapshot=snap, flags=flags, reduce_only_mode=reduce_only,
+                                               now=tick.now))
         except GuardRejected as exc:
-            if (exc.details or {}).get("scope") == "market":
+            # Guard rejections do not count towards the breaker (risk.py contract): market-wide conditions such
+            # as stale data would otherwise trip every subscription at once. Retried next tick.
+            details = exc.details or {}
+            if details.get("scope") == "market":
                 report.market_rejections += 1
                 self._alert("warn", "guard_rejected_market", {"coin": coin, "reason": exc.message},
                             dedup=f"guard_market:{coin}:{sig.bar_close.isoformat()}:{exc.message}")
-                return "wait", None
-            report.guard_rejections += 1
-            self._count_rejection(sub, f"guard:{exc.message}", coin, tick)
-            return "wait", None
+            else:
+                report.guard_rejections += 1
+                self._alert("info", "guard_rejected", {"subscription_id": sub.id, "coin": coin,
+                                                       "reason": exc.message}, user_id=sub.user_id,
+                            dedup=f"guard:{sub.id}:{coin}:{sig.bar_close.isoformat()}:{exc.message}")
+            log.info("guard_rejected", extra={"fields": {"subscription_id": sub.id, "coin": coin,
+                                                         "reason": exc.message, "scope": details.get("scope")}})
+            return "wait", []
 
-        if reduce_only:
-            plan = _enforce_reduce_only(plan, pos)
-            if plan.action == "skip" and plan.reason == "reduce_only_blocks_increase":
-                report.reduce_only_skips += 1
         self.subs.record_target(sub.id, coin, sig.bar_close, plan.target_notional_micro, weight)
-
-        if plan.action != "order" or plan.sz <= 0:
-            return "done", None
-        return "wait", _PendingOrder(coin=coin, plan=plan, attempt=len(orders))
+        legs = _sanitize_legs(plan, pos, reduce_only)
+        if len(legs) < len(plan.legs):
+            report.reduce_only_skips += len(plan.legs) - len(legs)
+            log.warning("legs_dropped", extra={"fields": {"subscription_id": sub.id, "coin": coin,
+                                                          "planned": len(plan.legs), "kept": len(legs)}})
+        if not legs:
+            return "done", []
+        return "wait", [_PendingOrder(coin=coin, leg=leg, attempt=len(orders) + i) for i, leg in enumerate(legs)]
 
     # ------------------------------------------------------------------------------------------------------ placement
 
-    def _place_all(self, sub: SubscriptionView, sig: BarSignal, delay: int, orders: list[_PendingOrder],
+    def _place_all(self, sub: SubscriptionView, sig: BarSignal, delay: int, per_coin: list[list[_PendingOrder]],
                    tick: _Tick) -> list[bool]:
+        """Places every coin's legs with one decrypted key. Returns, per coin, whether it is done for the bar."""
         vault = sub.trading_address if sub.trading_address.lower() != sub.master_address.lower() else None
         results: list[bool] = []
         with self.keys.agent_key(sub.user_id, sub.master_address) as key:
             gw = self.gateways.create(key, sub.master_address, vault)
-            for p in orders:
-                results.append(self._place_one(gw, sub, sig, delay, p, tick))
+            for legs in per_coin:
+                done = True
+                for p in legs:
+                    if not self._place_one(gw, sub, sig, delay, p, tick):
+                        done = False
+                        break  # never send a flip's opening leg unless its close leg filled completely
+                results.append(done)
         return results
 
     def _place_one(self, gw: Any, sub: SubscriptionView, sig: BarSignal, delay: int, p: _PendingOrder,
                    tick: _Tick) -> bool:
-        """Returns True when the coin is done for this bar."""
-        report, plan = tick.report, p.plan
+        """Returns True when the leg filled completely."""
+        report, leg = tick.report, p.leg
         cloid = make_cloid(sub.id, sig.bar_close, p.coin, p.attempt)
         if self.subs.get_order(cloid) is not None:
             return False  # already recorded (concurrent/previous attempt) — resolved next tick, never re-sent
         rec = OrderRecord(
             subscription_id=sub.id, strategy_version_id=sig.strategy_version_id, bar_close=sig.bar_close,
-            attempt=p.attempt, cloid=cloid, coin=p.coin, is_buy=plan.is_buy, sz=plan.sz, limit_px=plan.limit_px,
-            reduce_only=plan.reduce_only, status=ORDER_SUBMITTING, jitter_seconds=delay, submitted_at=tick.now)
+            attempt=p.attempt, cloid=cloid, coin=p.coin, is_buy=leg.is_buy, sz=leg.sz, limit_px=leg.limit_px,
+            reduce_only=leg.reduce_only, status=ORDER_SUBMITTING, jitter_seconds=delay, submitted_at=tick.now)
         if not self.subs.insert_order(rec):
             return False
         fields = {"subscription_id": sub.id, "coin": p.coin, "cloid": cloid, "attempt": p.attempt,
-                  "is_buy": plan.is_buy, "sz": str(plan.sz), "limit_px": str(plan.limit_px),
-                  "reduce_only": plan.reduce_only, "bar_close": sig.bar_close.isoformat()}
+                  "is_buy": leg.is_buy, "sz": str(leg.sz), "limit_px": str(leg.limit_px),
+                  "reduce_only": leg.reduce_only, "bar_close": sig.bar_close.isoformat()}
         try:
-            res = gw.place_ioc(coin=p.coin, is_buy=plan.is_buy, sz=plan.sz, limit_px=plan.limit_px,
-                               reduce_only=plan.reduce_only, cloid=cloid)
+            res = gw.place_ioc(coin=p.coin, is_buy=leg.is_buy, sz=leg.sz, limit_px=leg.limit_px,
+                               reduce_only=leg.reduce_only, cloid=cloid)
         except Exception as exc:  # outcome unknown: keep the row pending; next tick queries by cloid
             report.orders_unknown += 1
             self.subs.update_order(cloid, status=ORDER_UNKNOWN, filled_sz=Decimal(0), avg_px=None, oid=None,
@@ -421,7 +437,7 @@ class Executor:
             log.warning("order_outcome_unknown", extra={"fields": {**fields, "error": type(exc).__name__}})
             return False
         report.orders_placed += 1
-        return self._apply_result(sub, cloid, p.coin, plan.sz, res, tick, fields)
+        return self._apply_result(sub, cloid, p.coin, leg.sz, res, tick, fields)
 
     def _apply_result(self, sub: SubscriptionView, cloid: str, coin: str, sz: Decimal, res: PlaceResult, tick: _Tick,
                       fields: dict[str, Any]) -> bool:
@@ -459,7 +475,7 @@ class Executor:
                 log.info("order_resolved_not_submitted", extra={"fields": {"subscription_id": sub.id, "cloid": o.cloid}})
             elif age >= 10 * self.cfg.unknown_order_grace_seconds:
                 self._alert("warn", "order_unresolved", {"subscription_id": sub.id, "cloid": o.cloid, "coin": o.coin},
-                            user_id=sub.user_id, dedup=f"unresolved:{o.cloid}")
+                            dedup=f"unresolved:{o.cloid}")
             return
         if res.status == "resting":
             self._alert("warn", "ioc_order_resting", {"subscription_id": sub.id, "cloid": o.cloid, "coin": o.coin},
@@ -481,12 +497,13 @@ class Executor:
 
     def _count_rejection(self, sub: SubscriptionView, reason: str, coin: str | None, tick: _Tick) -> None:
         count = self.subs.record_rejection(sub.id, reason)
-        self._alert("warn", "order_rejected", {"subscription_id": sub.id, "coin": coin, "reason": reason,
+        self._alert("info", "order_rejected", {"subscription_id": sub.id, "coin": coin, "reason": reason,
                                                "consecutive": count}, user_id=sub.user_id)
         if count >= self.cfg.breaker_threshold:
             tick.report.breaker_open += 1
-            self._alert("critical", "circuit_breaker_open", {"subscription_id": sub.id, "consecutive": count,
-                                                             "last_reason": reason},
+            # notifier template "order_rejections_burst"; critical → ops paged. No coin: never auto-pauses a market.
+            self._alert("critical", "order_rejections_burst", {"subscription": sub.id, "count": count,
+                                                               "coin": coin or "-", "last_reason": reason},
                         user_id=sub.user_id, dedup=f"breaker:{sub.id}")
             log.warning("circuit_breaker_open", extra={"fields": {"subscription_id": sub.id, "consecutive": count}})
             raise _BreakerTripped()
@@ -499,7 +516,7 @@ class Executor:
             "subscription_id": sub.id, "strategy_version_id": sig.strategy_version_id, "error": type(exc).__name__}})
         try:
             self._alert("warn", "execution_error", {"subscription_id": sub.id, "error": type(exc).__name__},
-                        user_id=sub.user_id, dedup=f"exec_error:{sub.id}:{sig.bar_close.isoformat()}")
+                        dedup=f"exec_error:{sub.id}:{sig.bar_close.isoformat()}")
             if not isinstance(exc, ExternalServiceError):
                 try:
                     self._count_rejection(sub, f"exception:{type(exc).__name__}", None, tick)
@@ -517,24 +534,27 @@ class Executor:
             log.error("alert_emit_failed", exc_info=True, extra={"fields": {"kind": kind}})
 
 
-def _enforce_reduce_only(plan: OrderPlan, pos: Position) -> OrderPlan:
-    """Defence in depth on top of the planner: in reduce-only mode exposure may only shrink, never flip."""
-    n, t = pos.notional_micro, plan.target_notional_micro
-    if n == 0:
-        eff_target = 0
-    elif (n > 0 and 0 <= t <= n) or (n < 0 and n <= t <= 0):
-        eff_target = t
-    elif (n > 0 and t < 0) or (n < 0 and t > 0):
-        eff_target = 0
-    else:
-        eff_target = n
-    if plan.action != "order":
-        return replace(plan, target_notional_micro=eff_target)
-    increases = (plan.is_buy and pos.szi >= 0) or ((not plan.is_buy) and pos.szi <= 0)
-    if increases:
-        return replace(plan, action="skip", sz=Decimal(0), target_notional_micro=eff_target,
-                       reason="reduce_only_blocks_increase")
-    return replace(plan, sz=min(plan.sz, abs(pos.szi)), reduce_only=True, target_notional_micro=eff_target)
+def _sanitize_legs(plan: OrderPlan, pos: Position, reduce_only_mode: bool) -> list[OrderLeg]:
+    """Defence in depth on top of the planner (fail closed):
+    - a full close is sized from the exact on-chain |szi| and forced reduce-only;
+    - in reduce-only mode every non-reduce-only leg is dropped;
+    - a reduce-only leg must oppose the position and never exceed it (cannot flip or add)."""
+    out: list[OrderLeg] = []
+    for leg in plan.legs:
+        if leg.close_position:
+            if pos.szi == 0:
+                continue
+            leg = replace(leg, sz=abs(pos.szi), reduce_only=True)
+        if reduce_only_mode and not leg.reduce_only:
+            continue
+        if leg.reduce_only:
+            if pos.szi == 0 or leg.is_buy != (pos.szi < 0):
+                continue
+            leg = replace(leg, sz=min(leg.sz, abs(pos.szi)))
+        if leg.sz <= 0 or leg.limit_px <= 0:
+            continue
+        out.append(leg)
+    return out
 
 
 def _round_robin(queues: list[list[Any]]) -> list[Any]:

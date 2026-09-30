@@ -123,7 +123,7 @@ class Reconciler:
                         "subscription_id": e.subscription_id, "coin": e.coin,
                         "expected_micro": e.target_notional_micro, "actual_micro": actual_micro,
                         "bar_close": e.bar_close.isoformat()},
-                        user_id=e.user_id, dedup=f"drift:{e.subscription_id}:{e.coin}:{date_key}")
+                        dedup=f"drift:{e.subscription_id}:{e.coin}:{date_key}")
 
     # (b) -------------------------------------------------------------------------------------------------------------
     def check_builder_fees(self, report: ReconcileReport, date_key: str) -> None:
@@ -132,8 +132,8 @@ class Reconciler:
         report.builder_db_micro, report.builder_chain_micro = db, chain
         if abs(db - chain) > self.cfg.mismatch_threshold_micro:
             report.builder_mismatch = True
-            self._alert("critical", "builder_fee_mismatch", {"db_micro": db, "chain_micro": chain,
-                                                             "diff_micro": chain - db},
+            self._alert("critical", "reconciliation_mismatch", {"scope": "builder fees", "ledger_micro": db,
+                                                                "onchain_micro": chain, "diff_micro": chain - db},
                         dedup=f"builder_mismatch:{date_key}")
 
     # (c) -------------------------------------------------------------------------------------------------------------
@@ -143,8 +143,8 @@ class Reconciler:
         report.treasury_ledger_micro, report.treasury_chain_micro = ledger, chain
         if abs(ledger - chain) > self.cfg.mismatch_threshold_micro:
             report.treasury_mismatch = True
-            self._alert("critical", "treasury_mismatch", {"ledger_micro": ledger, "chain_micro": chain,
-                                                          "diff_micro": chain - ledger},
+            self._alert("critical", "reconciliation_mismatch", {"scope": "treasury USDC", "ledger_micro": ledger,
+                                                                "onchain_micro": chain, "diff_micro": chain - ledger},
                         dedup=f"treasury_mismatch:{date_key}")
 
     def _alert(self, severity: str, kind: str, payload: dict[str, Any], *, user_id: str | None = None,
