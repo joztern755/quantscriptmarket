@@ -154,22 +154,69 @@ class SqlDatabase:
 # =============================================================================================================
 # Auth
 # =============================================================================================================
+class VerifiedTokenCache:
+    """REVIEW_AUTH_API F19: the prod verifier makes one Firebase Auth backend call per request (revocation check).
+    A token that verified is remembered for at most ``ttl`` seconds (never past its own ``exp``), keyed by its
+    SHA-256, so a busy session costs ~1 backend call per minute instead of one per request. Trade-off (documented):
+    a token revoked meanwhile keeps working for ≤ ttl seconds; step-up freshness is still checked on every request
+    from ``auth_time``. Only successes are cached (a bad token is re-checked every time)."""
+
+    def __init__(self, ttl: float = 60.0, size: int = 20_000, clock: Callable[[], float] = time.time) -> None:
+        self._ttl, self._size, self._clock = float(ttl), int(size), clock
+        self._d: "OrderedDict[str, tuple[float, Any]]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def key(token: str) -> str:
+        import hashlib
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def get(self, token: str) -> Any:
+        k, now = self.key(token), self._clock()
+        with self._lock:
+            hit = self._d.get(k)
+            if hit is None:
+                return None
+            if hit[0] <= now:
+                self._d.pop(k, None)
+                return None
+            self._d.move_to_end(k)
+            return hit[1]
+
+    def put(self, token: str, value: Any, exp: Any) -> None:
+        now = self._clock()
+        until = now + self._ttl
+        if isinstance(exp, (int, float)) and not isinstance(exp, bool):
+            until = min(until, float(exp))
+        if until <= now:
+            return
+        with self._lock:
+            self._d[self.key(token)] = (until, value)
+            self._d.move_to_end(self.key(token))
+            while len(self._d) > self._size:
+                self._d.popitem(last=False)
+
+
 class FirebaseAuthAdapter:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._verifier: Any = None
         self._lock = threading.Lock()
+        self._cache = VerifiedTokenCache(ttl=float(getattr(settings, "auth_revocation_cache_seconds", 60) or 60))
 
     def _mod(self) -> Any:
         return _require("app.security.auth")
 
     def verify(self, token: str) -> dict[str, Any]:
         mod = self._mod()
-        if self._verifier is None:
-            with self._lock:
-                if self._verifier is None:
-                    self._verifier = mod.build_verifier(self._settings)
-        ctx = self._verifier.verify(token)
+        ctx = self._cache.get(token)
+        if ctx is None:
+            if self._verifier is None:
+                with self._lock:
+                    if self._verifier is None:
+                        self._verifier = mod.build_verifier(self._settings)
+            ctx = self._verifier.verify(token)
+            self._cache.put(token, ctx, dict(ctx.claims).get("exp"))
         claims = dict(ctx.claims)
         claims["uid"] = ctx.uid
         claims["_ctx"] = ctx
@@ -445,10 +492,12 @@ class UsdcAdapter:
             updates, treasury_address=self._s.treasury_address, verified_wallets=senders, since_ms=start)
         return list(scan.deposits)
 
-    def credit_from_detection(self, detection: Any, user_for_address: Callable[[str], Optional[str]]) -> Any:
+    def credit_from_detection(self, detection: Any, user_for_address: Callable[[str], Optional[str]],
+                              verified_at_for_address: Optional[Callable[[str], Any]] = None) -> Any:
         return _require("app.payments.usdc").credit_from_detection(
             detection, treasury_address=self._s.treasury_address,
-            min_topup_micro=self._s.economics.min_topup_micro, user_for_address=user_for_address)
+            min_topup_micro=self._s.economics.min_topup_micro, user_for_address=user_for_address,
+            verified_at_for_address=verified_at_for_address)
 
 
 # =============================================================================================================
@@ -603,6 +652,7 @@ JOB_ENTRYPOINTS: dict[str, tuple[tuple[str, str], ...]] = {
     "fills-ingest": (("app.jobs_data", "fills_ingest"),),
     "funding-scan": (("app.jobs_data", "funding_scan"),),
     "agent-expiry-scan": (("app.jobs_data", "agent_expiry_scan"),),
+    "verify-chain": (("app.execution.jobs", "verify_chain"),),     # REVIEW_MONEY M7(a): daily chain check + anchor
 }
 
 

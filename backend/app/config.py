@@ -197,6 +197,10 @@ class Settings:
     # REVIEW_TRADING_KEYS F2 / SECURITY §3.4: creator strategy code is sealed under its OWN KMS key (api encrypt-only,
     # executor decrypt-only), never under agent-keys. Empty outside prod → local dev KEK with a separate KMS-level AAD.
     creator_code_kms_key_name: str = ""             # projects/…/locations/…/keyRings/…/cryptoKeys/creator-code
+    # REVIEW_MONEY H2: HMAC key of our order cloids (app.hl.client.make_cloid) — a user must not be able to compute
+    # the cloids of our orders. Secret Manager CLOID_SECRET; required in prod for the executor. Never rotate while
+    # orders may be unresolved (a retry recomputes the cloid of the same bar/attempt).
+    cloid_secret: str = ""
 
     @property
     def is_prod(self) -> bool:
@@ -311,6 +315,7 @@ def get_settings() -> Settings:
             shared_budget=_b("HL_SHARED_BUDGET", "true"),
         ),
         creator_code_kms_key_name=os.environ.get("CREATOR_CODE_KMS_KEY_NAME", ""),
+        cloid_secret=os.environ.get("CLOID_SECRET", ""),
     )
     if s.is_prod:
         required = ["builder_address", "treasury_address", "kms_key_name", "firebase_project_id", "signals_pubkey_b64",
@@ -324,6 +329,8 @@ def get_settings() -> Settings:
             required += ["sandbox_url", "sandbox_shared_secret"]
         if s.service_role in ("api", "executor"):
             required += ["creator_code_kms_key_name"]
+        if s.service_role == "executor":
+            required += ["cloid_secret"]
         missing = [k for k in required if not getattr(s, k)]
         if missing:
             raise RuntimeError(f"prod config missing: {missing}")

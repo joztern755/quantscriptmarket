@@ -196,10 +196,49 @@ def strategy_reviews(slug: str = Path(..., pattern=SLUG_PATTERN, max_length=64),
 _PERIODS = {"30d": timedelta(days=30), "90d": timedelta(days=90), "all": None}
 
 
+class _TtlCache:
+    """REVIEW_AUTH_API F10: per-instance cache of the leaderboard (60 s), single-flight per key so a burst of
+    anonymous requests computes it once (Cloudflare does not cache the API host)."""
+
+    def __init__(self, ttl_seconds: float = 60.0) -> None:
+        import threading
+        self.ttl = ttl_seconds
+        self._d: dict[Any, tuple[float, Any]] = {}
+        self._locks: dict[Any, Any] = {}
+        self._guard = threading.Lock()
+
+    def get_or_compute(self, key: Any, compute: Any) -> Any:
+        import threading
+        import time
+        now = time.monotonic()
+        hit = self._d.get(key)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+        with self._guard:
+            lock = self._locks.setdefault(key, threading.Lock())
+        with lock:
+            hit = self._d.get(key)
+            if hit is not None and hit[0] > time.monotonic():
+                return hit[1]
+            value = compute()
+            self._d[key] = (time.monotonic() + self.ttl, value)
+            return value
+
+    def clear(self) -> None:
+        self._d.clear()
+
+
+LEADERBOARD_CACHE = _TtlCache(60.0)
+
+
 @router.get("/leaderboard", response_model=S.LeaderboardOut)
 def leaderboard(by: Literal["roi", "pnl", "subscribers"] = Query("roi"),
                 period: Literal["30d", "90d", "all"] = Query("30d"),
                 svc: Services = Depends(get_services)) -> S.LeaderboardOut:
+    return LEADERBOARD_CACHE.get_or_compute((id(svc), by, period), lambda: _leaderboard(svc, by, period))
+
+
+def _leaderboard(svc: Services, by: str, period: str) -> S.LeaderboardOut:
     now = svc.now()
     delta = _PERIODS[period]
     period_start = now - delta if delta else None

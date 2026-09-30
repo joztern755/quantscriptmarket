@@ -250,7 +250,8 @@ class ResourceTests(unittest.TestCase):
 class BadOutputTests(unittest.TestCase):
     def test_bad_outputs(self):
         cases = {
-            "nan": 'return {"BTC": float("nan")}', "inf": 'return {"BTC": float("inf")}',
+            # a NaN literal is rejected statically now (REVIEW_TRADING_KEYS F3); a computed NaN still reaches the output
+            "nan": 'return {"BTC": float("inf") - float("inf")}', "inf": 'return {"BTC": float("inf")}',
             "neg_inf": 'return {"BTC": -float("inf")}', "huge": 'return {"BTC": 1e300}',
             "huge_int": 'return {"BTC": 10 ** 400}', "too_much": 'return {"BTC": 2.0001}',
             "extra_key": 'return {"BTC": 1.0, "ETH": 0.0}', "bool": 'return {"BTC": True}',

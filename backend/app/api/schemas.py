@@ -846,6 +846,11 @@ class DecisionIn(In):
     reason: Reason
 
 
+class SecurityEventOut(Out):
+    action: str            # auth.new_device | auth.new_country | auth.mfa_changed | alerts.email_* | wallet.verify …
+    at: datetime
+
+
 class AdminPayoutOut(Out):
     id: UUID
     kind: str
@@ -857,6 +862,13 @@ class AdminPayoutOut(Out):
     checker_admin: Optional[UUID] = None
     tx_hash: Optional[str] = None
     created_at: datetime
+    # REVIEW_AUTH_API F5 — context for the approving admins (open requests only)
+    to_address_verified_at: Optional[datetime] = None
+    wallet_age_hours: Optional[int] = None
+    security_hold_until: Optional[datetime] = None
+    hold_reasons: list[str] = Field(default_factory=list)       # payout_address_hold | security_hold → blocks approve_2
+    recent_security_events: list[SecurityEventOut] = Field(default_factory=list)
+    send_issued_at: Optional[datetime] = None                  # M4: typed data issued (no reject for 72 h)
 
 
 class PayoutTypedDataIn(In):

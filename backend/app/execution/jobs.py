@@ -21,6 +21,11 @@ Scheduler cadence (Cloud Scheduler → OIDC → executor service; source of trut
                                            ``settlement_deferred``); the retry slots settle it (app.execution.settlement).
   /internal/reconcile       0 * * * *      ``reconcile`` (hourly) — positions vs targets, builder fees DB vs on-chain,
                                            treasury; alert dedup keys are per day, every run's report is stored.
+  /internal/verify-chain    40 3 * * *     ``verify_chain`` (REVIEW_MONEY M7(a), L4, L5) — verify_chain() over the ledger
+                                           transactions, audit log and ledger accounts chains plus the running
+                                           balances, verify_chain_anchors() (anchored heads unchanged), then stores
+                                           today's heads (ledger_chain_anchors) and sends them to ops (Telegram +
+                                           email) as the external anchor. Any problem → critical ops alert.
   /internal/referral-tiers  15 1 * * *     ``referral_tiers`` — re-evaluates users.referral_tier (SPEC §1.2). Runs
                                            AFTER the 00:30 settlement on purpose: the NEXT day's settlement uses the
                                            new tier for its builder-fee referral split.
@@ -61,12 +66,14 @@ from app.money import BPS, parse_decimal, to_micro
 from .executor import Executor, ExecutorConfig
 from .pg import (
     PgAlertRepo,
+    PgChainVerifier,
     PgCreatorSignalRepo,
     PgDatabase,
     PgFlagRepo,
     PgLedger,
     PgLockProvider,
     PgMarketPauseFlags,
+    PgPendingReleaser,
     PgReconcileRepo,
     PgReconciliationStore,
     PgReferralLookup,
@@ -94,6 +101,7 @@ from .wiring import (
 
 __all__ = [
     "run_tick", "run_creator_signals", "settle_daily", "reconcile", "referral_tiers", "latest_reconciliation",
+    "verify_chain", "OpsAnchorPublisher",
     "Runtime", "get_runtime", "set_runtime", "SandboxClient", "HlBuilderRewardsReader", "HlTreasuryReader",
     "build_notifier", "jitter_salt", "INTERVAL_MS", "weight_to_bps",
 ]
@@ -309,7 +317,8 @@ class Runtime:
                  executor_config: ExecutorConfig | None = None, sandbox: Any = None, builder_rewards: Any = None,
                  treasury: Any = None, economics: Economics | None = None,
                  reconcile_config: ReconcileConfig | None = None, bar_settle_seconds: int = 30,
-                 missing_bar_grace_seconds: int = 600, creator_signal_budget_seconds: float = 20.0) -> None:
+                 missing_bar_grace_seconds: int = 600, creator_signal_budget_seconds: float = 20.0,
+                 anchor_publisher: Any = None, stripe_clearing: Any = None) -> None:
         self.settings = settings or get_settings()
         s = self.settings
         self.economics = economics or getattr(s, "economics", None) or Economics()
@@ -337,6 +346,13 @@ class Runtime:
         self._agent_decryptor: Any = None
         self._lock = threading.RLock()
         self._rate_budget: Any = None
+        self._anchor_publisher = anchor_publisher
+        self.stripe_clearing = stripe_clearing       # StripeClearingReader (REVIEW_MONEY M7(c) stub; None = not wired)
+
+    def anchor_publisher(self) -> Any:
+        if self._anchor_publisher is None:
+            self._anchor_publisher = OpsAnchorPublisher(self.settings)
+        return self._anchor_publisher
 
     def bind_db(self, db: PgDatabase) -> None:
         """Give the shared Hyperliquid rate budget its database (first job call; all jobs share one database)."""
@@ -490,12 +506,14 @@ class Runtime:
             repo=PgSettlementRepo(db, self.economics), ledger=PgLedger(db), uow=PgUnitOfWork(db),
             profit_share=DomainProfitShare(self.economics), fees=DomainFees(self.economics),
             billing=DomainBilling(grace), referrals=PgReferralLookup(db, self.economics),
-            alerts=alerts or self.alerts(db), clock=self.clock, events=PgUserEvents(db))
+            alerts=alerts or self.alerts(db), clock=self.clock, events=PgUserEvents(db),
+            pending=PgPendingReleaser(db))
 
     def reconciler(self, db: PgDatabase, *, alerts: Any = None) -> Reconciler:
-        return Reconciler(repo=PgReconcileRepo(db), positions=self.positions, builder_rewards=self.builder_rewards,
+        repo = PgReconcileRepo(db)
+        return Reconciler(repo=repo, positions=self.positions, builder_rewards=self.builder_rewards,
                           treasury=self.treasury, ledger=PgLedger(db), alerts=alerts or self.alerts(db),
-                          config=self.reconcile_config)
+                          config=self.reconcile_config, solvency=repo, stripe=self.stripe_clearing)
 
 
 _RUNTIME: Runtime | None = None
@@ -593,6 +611,70 @@ def reconcile(*, db: Any, now: datetime, runtime: Runtime | None = None) -> dict
             report = rt.reconciler(pdb).run(date_key).as_dict()
         PgReconciliationStore(pdb).save(date_key, report, now)
     return {"date_key": date_key, **report}
+
+
+class OpsAnchorPublisher:
+    """Sends the daily chain heads OFF the database (REVIEW_MONEY M7(a)): the ops Telegram chat (plain text, the heads
+    are not secret) — the ops email copy goes through the notifier (warn alert ``ledger_chain_anchor``). Whoever can
+    rewrite the database cannot rewrite those messages, so a truncated or re-hashed chain is detectable later."""
+
+    def __init__(self, settings: Any) -> None:
+        self.settings = settings
+
+    def publish(self, text: str) -> dict[str, Any]:
+        out: dict[str, Any] = {"telegram": False}
+        token = getattr(self.settings, "telegram_bot_token", "")
+        chat = getattr(self.settings, "telegram_ops_chat_id", "")
+        if token and chat:
+            from app.alerts.notifier import TelegramSink
+
+            try:
+                TelegramSink(token, chat).send_text(text)
+                out["telegram"] = True
+            except Exception as e:  # noqa: BLE001 - the anchor row is still stored; the email copy still goes out
+                out["telegram_error"] = type(e).__name__
+        return out
+
+
+def verify_chain(*, db: Any, now: datetime, runtime: Runtime | None = None) -> dict[str, Any]:
+    """/internal/verify-chain (daily 03:40 UTC; REVIEW_MONEY M7(a), L4, L5). Verifies every hash chain (ledger
+    transactions, audit log, ledger accounts), the running balances against the full Σ of entries, and that every
+    previously anchored head is still there unchanged; then anchors today's heads (DB row + ops Telegram/email).
+    Problems → one critical ops alert per day (``ledger_chain_broken``). Idempotent per UTC day."""
+    rt = runtime or get_runtime()
+    now = _aware(now)
+    pdb = _db(db)
+    alerts = rt.alerts(pdb)
+    verifier = PgChainVerifier(pdb)
+    day = now.date()
+    with PgLockProvider(pdb).try_lock("job:verify-chain") as held:
+        if not held:
+            return {"skipped": "another chain verification is running"}
+        problems = verifier.problems()
+        anchor_problems = verifier.anchor_problems()
+        heads = verifier.heads()
+        text = "aijalon ledger anchor " + day.isoformat() + "\n" + "\n".join(
+            f"{h['chain']} seq={h['seq']} hash={h['hash']}" for h in heads)
+        if problems or anchor_problems:
+            text += f"\nVERIFY FAILED: {len(problems)} chain problem(s), {len(anchor_problems)} anchor problem(s)"
+        published: dict[str, Any] = {}
+        try:
+            published = dict(rt.anchor_publisher().publish(text))
+        except Exception as e:  # noqa: BLE001
+            published = {"error": type(e).__name__}
+        _emit(alerts, "warn", "ledger_chain_anchor", {"date": day.isoformat(), "heads": heads,
+                                                      "ok": not (problems or anchor_problems)},
+              dedup=f"ledger_chain_anchor:{day.isoformat()}")
+        published["email"] = "ops_alert"
+        stored = verifier.store_anchor(day, heads, published)
+        if problems or anchor_problems:
+            _emit(alerts, "critical", "ledger_chain_broken", {"problems": problems[:20],
+                                                              "anchor_problems": anchor_problems[:20]},
+                  dedup=f"ledger_chain_broken:{day.isoformat()}")
+    log.info("verify_chain_done", extra={"fields": {"problems": len(problems), "anchor_problems": len(anchor_problems),
+                                                    "stored": stored}})
+    return {"ok": not (problems or anchor_problems), "problems": problems[:50], "anchor_problems": anchor_problems[:50],
+            "heads": heads, "anchors_stored": stored, "published": published, "date": day.isoformat()}
 
 
 def latest_reconciliation(conn: Any = None, *, db: Any = None, now: datetime | None = None) -> dict[str, Any] | None:

@@ -23,12 +23,13 @@ settling the ledger hold against treasury:hl_usdc.
 """
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any, Literal, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Path, Query
 
-from app.api import ledger_ops
+from app.api import billing_ops, ledger_ops
 from app.api import schemas as S
 from app.api.deps import (
     AuthCtx,
@@ -51,6 +52,12 @@ from app.errors import Conflict, Forbidden, NotFound, ValidationFailed
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[user_limit("admin", 120, 60)])
 
 PayoutKind = Literal["withdrawal", "payout"]
+SEND_REJECT_AFTER = timedelta(hours=72)   # HL usdSend nonce window: after it a signed payload can no longer execute
+
+
+def deps_hash(value: str) -> str:
+    import hashlib
+    return hashlib.sha256(value.strip().lower().encode()).hexdigest()
 
 
 def _flag_key(key: str) -> str:
@@ -141,7 +148,7 @@ def reject_flag(body: S.DecisionIn, key: str = Path(..., max_length=80), ctx: Au
 
 # ============================================================================================ generic change queue
 @router.get("/changes", response_model=S.Page[S.ChangeOut])
-def list_changes(status: Optional[Literal["pending", "approved", "rejected"]] = Query("pending"),
+def list_changes(status: Optional[Literal["pending", "approved", "rejected", "cancelled"]] = Query("pending"),
                  limit: int = Query(50, ge=1, le=100), cursor: Optional[str] = Query(None, max_length=200),
                  ctx: AuthCtx = Depends(admin_user), svc: Services = Depends(get_services)) -> S.Page[S.ChangeOut]:
     cur = decode_cursor_or_422(cursor)
@@ -158,7 +165,17 @@ def _require_trusted_or_conflict(conn: Any, svc: Services, markets: list[str]) -
         raise Conflict(e.message, **(e.details if isinstance(e.details, dict) else {})) from None
 
 
+_LIST_SNAPSHOT = ("price_monthly_micro", "profit_share_bps", "owner_user_id")
+
+
+def _strategy_snapshot(st: dict) -> dict:
+    """The terms a listing proposal was reviewed with (pinned in the immutable admin_changes payload; F6)."""
+    return {k: (str(st[k]) if k == "owner_user_id" and st.get(k) is not None else st.get(k)) for k in _LIST_SNAPSHOT}
+
+
 def _apply_change(conn: Any, svc: Services, ctx: AuthCtx, ch: dict) -> None:
+    """Re-validates the CURRENT state at approval time (REVIEW_AUTH_API F6): a change reviewed against a state that no
+    longer exists is refused with 409 (reject it and propose again)."""
     kind, payload = ch["kind"], ch.get("payload") or {}
     if kind == "strategy_list":
         sid, vid = ch["target"].split(":", 1)[1], str(payload["version_id"])
@@ -166,6 +183,13 @@ def _apply_change(conn: Any, svc: Services, ctx: AuthCtx, ch: dict) -> None:
         ver = svc.store.get_version(conn, vid)
         if st is None or ver is None or str(ver["strategy_id"]) != sid:
             raise Conflict("strategy or version no longer exists")
+        if st["status"] not in ("review", "listed", "paused"):
+            raise Conflict("the strategy is no longer reviewable (delisted or back to draft)", status=st["status"],
+                           reason="stale_change")
+        pinned = payload.get("terms")
+        if not isinstance(pinned, dict) or _strategy_snapshot(st) != pinned:
+            raise Conflict("the strategy's terms changed since this listing was proposed; propose again",
+                           reason="terms_changed", proposed=pinned, current=_strategy_snapshot(st))
         if st["price_monthly_micro"] is None or st["profit_share_bps"] is None:
             raise Conflict("set a price and profit share before listing")
         _require_trusted_or_conflict(conn, svc, list(ver.get("markets") or st["markets"] or []))
@@ -189,9 +213,27 @@ def _apply_change(conn: Any, svc: Services, ctx: AuthCtx, ch: dict) -> None:
         svc.store.set_strategy_status(conn, sid, "listed")
     elif kind == "strategy_price":
         sid = ch["target"].split(":", 1)[1]
+        st = svc.store.get_strategy(conn, sid, for_update=True)
+        if st is None or st["status"] == "delisted":
+            raise Conflict("the strategy no longer exists or is delisted", reason="stale_change")
+        if st.get("price_monthly_micro") != payload.get("previous_micro"):
+            raise Conflict("the price changed since this was proposed; propose again", reason="stale_change")
+        # applies to NEW subscriptions only: existing ones keep the price pinned at subscribe (M8)
         svc.store.set_strategy_price(conn, sid, int(payload["price_monthly_micro"]))
     elif kind == "user_unsuspend":
-        svc.store.set_user_status(conn, ch["target"].split(":", 1)[1], "active")
+        uid = ch["target"].split(":", 1)[1]
+        user = svc.store.get_user(conn, uid)
+        if user is None or user["status"] != "suspended":
+            raise Conflict("the user is not suspended any more", reason="stale_change")
+        svc.store.set_user_status(conn, uid, "active")
+    elif kind == "user_suspend":   # suspending another ADMIN (F12): second admin required
+        uid = ch["target"].split(":", 1)[1]
+        if uid == ctx.user_id:
+            raise Forbidden("an admin cannot approve their own suspension")
+        user = svc.store.get_user(conn, uid)
+        if user is None or user["status"] != "active":
+            raise Conflict("the user is not active any more", reason="stale_change")
+        svc.store.set_user_status(conn, uid, "suspended")
     elif kind == "kyc_approve":   # legacy queue entries: KYC is a single-admin decision now (POST /users/{id}/kyc)
         raise Conflict("KYC approval no longer uses the change queue; reject this entry and use the KYC decision")
     else:
@@ -237,11 +279,23 @@ def reject_change(change_id: UUID, body: S.DecisionIn, ctx: AuthCtx = Depends(ad
 
 
 # ============================================================================================ payouts / withdrawals
-def _admin_payout_out(r: dict) -> S.AdminPayoutOut:
+def _admin_payout_out(r: dict, conn: Any = None, svc: Optional[Services] = None) -> S.AdminPayoutOut:
+    """With (conn, svc): what the approving admins must see (REVIEW_AUTH_API F5) — destination wallet age, the
+    beneficiary's security hold and recent security events, and the hold reasons that block the second approval."""
+    extra: dict[str, Any] = {}
+    if conn is not None and svc is not None and r.get("status") in ("requested", "approved_1", "approved_2"):
+        reasons, pctx = billing_ops.payout_holds(conn, svc, user_id=str(r["beneficiary"]), to_address=r["to_address"])
+        verified = pctx.get("to_address_verified_at")
+        extra = dict(to_address_verified_at=verified,
+                     wallet_age_hours=int((svc.now() - verified).total_seconds() // 3600) if verified else None,
+                     security_hold_until=pctx.get("security_hold_until"), hold_reasons=reasons,
+                     recent_security_events=[S.SecurityEventOut(action=e["action"], at=e["created_at"])
+                                             for e in pctx.get("events") or []])
     return S.AdminPayoutOut(id=r["id"], kind=r["kind"], beneficiary=r["beneficiary"],
                             amount_micro=int(r["amount_micro"]), to_address=r["to_address"], status=r["status"],
                             maker_admin=r.get("maker_admin"), checker_admin=r.get("checker_admin"),
-                            tx_hash=r.get("tx_hash"), created_at=r["created_at"])
+                            tx_hash=r.get("tx_hash"), created_at=r["created_at"],
+                            send_issued_at=r.get("send_issued_at"), **extra)
 
 
 def _source_account(conn: Any, svc: Services, kind: str, row: dict) -> str:
@@ -262,7 +316,10 @@ def list_payouts(kind: PayoutKind = Query("withdrawal"),
     with svc.db.begin() as conn:
         rows, nxt = next_cursor(svc.store.admin_list_payouts(conn, kind=kind, status=status, limit=limit, cursor=cur),
                                 limit)
-    return S.Page[S.AdminPayoutOut](items=[_admin_payout_out(r) for r in rows], next_cursor=nxt)
+        items = [_admin_payout_out(r, conn, svc) for r in rows]
+        svc.audit.write(conn, actor=ctx.actor, action="admin.read.payouts", target="",
+                        payload={"kind": kind, "status": status, "n": len(items)}, ip_hash=ctx.ip_hash)
+    return S.Page[S.AdminPayoutOut](items=items, next_cursor=nxt)
 
 
 @router.post("/payouts/{kind}/{payout_id}/approve", response_model=S.AdminPayoutOut)
@@ -281,6 +338,12 @@ def approve_payout(kind: PayoutKind, payout_id: UUID, ctx: AuthCtx = Depends(adm
         elif row["status"] == "approved_1":
             if str(row.get("maker_admin")) == ctx.user_id:
                 raise Forbidden("the second approval must come from a different admin")
+            # F5: never release money to a fresh wallet or an account on a security hold
+            reasons, _ = billing_ops.payout_holds(conn, svc, user_id=str(row["beneficiary"]),
+                                                  to_address=row["to_address"])
+            if reasons:
+                raise Conflict("the beneficiary is on a security hold; approve after it ends", reason=reasons[0],
+                               hold_reasons=reasons)
             ok, step = svc.store.payout_approve_2(conn, kind, str(payout_id), ctx.user_id, now), "approve_2"
         else:
             raise Conflict("nothing to approve in this state", status=row["status"])
@@ -289,7 +352,7 @@ def approve_payout(kind: PayoutKind, payout_id: UUID, ctx: AuthCtx = Depends(adm
         svc.audit.write(conn, actor=ctx.actor, action=f"{kind}.{step}", target=f"{kind}:{payout_id}",
                         payload={"amount_micro": int(row["amount_micro"])}, ip_hash=ctx.ip_hash)
         row = svc.store.get_payout(conn, kind, str(payout_id), for_update=False)
-    return _admin_payout_out(row)
+        return _admin_payout_out(row, conn, svc)
 
 
 @router.post("/payouts/{kind}/{payout_id}/reject", response_model=S.AdminPayoutOut)
@@ -301,6 +364,11 @@ def reject_payout(kind: PayoutKind, payout_id: UUID, body: S.DecisionIn, ctx: Au
             raise NotFound("not found")
         if row["status"] not in ("requested", "approved_1", "approved_2"):
             raise Conflict("cannot reject in this state", status=row["status"])
+        issued = row.get("send_issued_at")
+        if issued is not None and svc.now() - issued < SEND_REJECT_AFTER:
+            # M4: the signed usdSend may still execute on Hyperliquid — rejecting now could pay twice
+            raise Conflict("the transfer was prepared for signing; record it as sent, or reject after 72 h",
+                           reason="send_in_progress", reject_after=(issued + SEND_REJECT_AFTER).isoformat())
         source = _source_account(conn, svc, kind, row)
         tx = ledger_ops.release_hold(conn, svc, kind=kind, row=row, source_account=source, actor=ctx.actor)
         if not svc.store.payout_reject(conn, kind, str(payout_id), ctx.user_id, body.reason):
@@ -317,17 +385,25 @@ def reject_payout(kind: PayoutKind, payout_id: UUID, body: S.DecisionIn, ctx: Au
 def payout_typed_data(kind: PayoutKind, payout_id: UUID, body: S.PayoutTypedDataIn,
                       ctx: AuthCtx = Depends(admin_step_up), svc: Services = Depends(get_services)) -> S.PayoutTypedDataOut:
     require_payouts_enabled(svc)
+    """Issued ONCE per payout (M4): the usdSend nonce (= time ms) is pinned on the row at the first call and every
+    later call returns the same payload, so two signatures can never become two transfers (Hyperliquid refuses a
+    reused nonce). A payout with issued typed data cannot be rejected for 72 h."""
     with svc.db.begin() as conn:
-        row = svc.store.get_payout(conn, kind, str(payout_id), for_update=False)
+        row = svc.store.get_payout(conn, kind, str(payout_id))
         if row is None:
             raise NotFound("not found")
         if row["status"] != "approved_2":
             raise Conflict("needs two approvals first", status=row["status"])
+        sent = svc.store.set_payout_send(conn, kind, str(payout_id), nonce=int(svc.now().timestamp() * 1000),
+                                         admin_id=ctx.user_id, now=svc.now())
+        if sent is None:
+            raise Conflict("state changed; reload")
+        nonce = int(sent["send_nonce"])
         svc.audit.write(conn, actor=ctx.actor, action=f"{kind}.typed_data", target=f"{kind}:{payout_id}",
-                        payload={}, ip_hash=ctx.ip_hash)
+                        payload={"nonce": nonce, "first_issue": row.get("send_nonce") is None}, ip_hash=ctx.ip_hash)
+        row = svc.store.get_payout(conn, kind, str(payout_id), for_update=False)
     payload = svc.typed_data.usd_send(destination=row["to_address"], amount=micro_to_usd_string(int(row["amount_micro"])),
-                                      time_ms=int(svc.now().timestamp() * 1000),
-                                      signature_chain_id=body.signature_chain_id)
+                                      time_ms=nonce, signature_chain_id=body.signature_chain_id)
     return S.PayoutTypedDataOut(payout=_admin_payout_out(row), payload=payload,
                                 exchange_url=svc.settings.hl_api_url.rstrip("/") + "/exchange")
 
@@ -352,6 +428,10 @@ def payout_sent(kind: PayoutKind, payout_id: UUID, body: S.PayoutSentIn, ctx: Au
         row = svc.store.get_payout(conn, kind, str(payout_id))
         if row is None or row["status"] != "approved_2":
             raise Conflict("state changed; reload")
+        # F9/M4: one on-chain transfer settles ONE row, re-checked inside the settling transaction (PK + unique index)
+        if svc.store.tx_hash_used(conn, tx_hash) or not svc.store.claim_payout_tx_hash(conn, tx_hash, kind,
+                                                                                        str(payout_id)):
+            raise Conflict("this transaction hash is already recorded")
         tx = ledger_ops.settle_sent(conn, svc, kind=kind, row=row, tx_hash=tx_hash, actor=ctx.actor)
         if not svc.store.payout_mark_sent(conn, kind, str(payout_id), tx_hash, tx):
             raise Conflict("state changed; reload")
@@ -394,7 +474,8 @@ def list_strategy(strategy_id: UUID, body: S.StrategyListIn, ctx: AuthCtx = Depe
             raise Conflict("delisted strategies cannot be relisted")
         _require_trusted_or_conflict(conn, svc, list(ver.get("markets") or st["markets"] or []))
         return _propose(conn, svc, ctx, kind="strategy_list", target=f"strategy:{strategy_id}",
-                        payload={"version_id": str(body.version_id), "version": ver["version"]}, reason=body.reason)
+                        payload={"version_id": str(body.version_id), "version": ver["version"],
+                                 "terms": _strategy_snapshot(st)}, reason=body.reason)
 
 
 def _set_status_now(strategy_id: UUID, status: str, body: S.DecisionIn, ctx: AuthCtx, svc: Services,
@@ -406,13 +487,22 @@ def _set_status_now(strategy_id: UUID, status: str, body: S.DecisionIn, ctx: Aut
         if st["status"] not in allowed_from:
             raise Conflict("not allowed from this status", status=st["status"])
         svc.store.set_strategy_status(conn, str(strategy_id), status)
-        affected = 0
+        # F6: proposals reviewed against the previous state can never be approved later
+        cancelled = svc.store.cancel_pending_changes(conn, f"strategy:{strategy_id}",
+                                                     f"superseded: strategy {status} by admin", svc.now())
+        ended = {"closing": 0, "cancelled": 0}
         if status == "delisted":
-            affected = svc.store.pause_subscriptions_of_strategy(conn, str(strategy_id))
+            # H5: subscriptions END (closing → reduce-only exit; paused → cancelled); billing stops; users alerted
+            ended = billing_ops.end_strategy_subscriptions(conn, svc, strategy_id=str(strategy_id),
+                                                           strategy_name=st.get("name"))
         svc.notifier.notify(conn, user_id=None, severity="warn", kind=f"strategy_{status}",
-                            payload={"strategy_id": str(strategy_id), "subscriptions_reduce_only": affected})
+                            payload={"strategy_id": str(strategy_id), "subscriptions_closing": ended["closing"],
+                                     "subscriptions_cancelled": ended["cancelled"],
+                                     "changes_cancelled": len(cancelled)})
         svc.audit.write(conn, actor=ctx.actor, action=f"strategy.{status}", target=f"strategy:{strategy_id}",
-                        payload={"reason": body.reason, "from": st["status"], "subscriptions_reduce_only": affected},
+                        payload={"reason": body.reason, "from": st["status"], **{f"subscriptions_{k}": n
+                                                                                   for k, n in ended.items()},
+                                 "changes_cancelled": [str(c["id"]) for c in cancelled]},
                         ip_hash=ctx.ip_hash)
     return S.AdminActionOut(status="applied")
 
@@ -457,6 +547,9 @@ def search_users(q: Optional[str] = Query(None, min_length=3, max_length=120),
     cur = decode_cursor_or_422(cursor)
     with svc.db.begin() as conn:
         rows, nxt = next_cursor(svc.store.search_users(conn, q, limit, cur), limit)
+        # F12: PII reads are audited (the query is stored hashed, not in clear)
+        svc.audit.write(conn, actor=ctx.actor, action="admin.read.users", target="",
+                        payload={"q_sha256": deps_hash(q) if q else None, "n": len(rows)}, ip_hash=ctx.ip_hash)
     return S.Page[S.AdminUserOut](items=[S.AdminUserOut(**{k: r.get(k) for k in S.AdminUserOut.model_fields})
                                          for r in rows], next_cursor=nxt)
 
@@ -467,6 +560,13 @@ def suspend_user(user_id: UUID, body: S.DecisionIn, ctx: AuthCtx = Depends(admin
     if str(user_id) == ctx.user_id:
         raise Forbidden("you cannot suspend yourself")
     with svc.db.begin() as conn:
+        target = svc.store.get_user(conn, str(user_id))
+        if target is None:
+            raise NotFound("user not found")
+        if target.get("role") == "admin":
+            # F12: one admin must not lock the other out (maker-checker deadlock) → a second admin approves
+            return _propose(conn, svc, ctx, kind="user_suspend", target=f"user:{user_id}", payload={},
+                            reason=body.reason)
         if not svc.store.set_user_status(conn, str(user_id), "suspended"):
             raise NotFound("user not found")
         svc.audit.write(conn, actor=ctx.actor, action="user.suspend", target=f"user:{user_id}",
@@ -533,6 +633,8 @@ def admin_alerts(severity: Optional[Literal["info", "warn", "critical"]] = Query
     with svc.db.begin() as conn:
         rows, nxt = next_cursor(svc.store.admin_list_alerts(conn, severity=severity, unacked_only=unacked,
                                                             ops_only=ops_only, limit=limit, cursor=cur), limit)
+        svc.audit.write(conn, actor=ctx.actor, action="admin.read.alerts", target="",
+                        payload={"severity": severity, "ops_only": ops_only, "n": len(rows)}, ip_hash=ctx.ip_hash)
     return S.Page[S.AlertOut](items=[alert_out(r) for r in rows], next_cursor=nxt)
 
 

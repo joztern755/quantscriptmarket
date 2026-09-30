@@ -61,6 +61,12 @@ def referral_tiers(svc: Services = Depends(get_services)) -> S.JobOut:
     return _run(svc, "referral-tiers", {})
 
 
+@router.post("/verify-chain", response_model=S.JobOut)
+def verify_chain(svc: Services = Depends(get_services)) -> S.JobOut:
+    """Daily: verify every hash chain + running balances + anchored heads, then anchor today's heads (REVIEW_MONEY M7)."""
+    return _run(svc, "verify-chain", {})
+
+
 # ------------------------------------------------------------------------------------------------ data jobs
 # Owner: app/jobs_data (migrations/0006_data.sql). Each is fn(db=, now=, **params), idempotent, bounded per call and
 # resumable (job_cursors). Registered with the jobs adapter here so the routes work before

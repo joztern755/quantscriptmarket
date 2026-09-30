@@ -36,6 +36,14 @@ _ADDR_RE = re.compile(r"^0x[0-9a-f]{40}$")
 ACTIONS = ("attribute", "refund")
 
 
+def _require_refunds_enabled(svc: Any) -> None:
+    """Owner (30 Sep 2026): refunds of held deposits are gated with payouts — no USDC leaves the treasury until
+    PAYOUTS_ENABLED is on. Attribution to a verified user (no USDC leaves) stays available."""
+    # same check and error as deps.require_payouts_enabled (not imported: deps pulls in FastAPI)
+    if not svc.config.launch.payouts_enabled:
+        raise Forbidden("withdrawals and payouts are not enabled yet", reason="payouts_disabled")
+
+
 def norm_hash(tx_hash: str) -> str:
     h = str(tx_hash or "").strip().lower()
     if not _HASH_RE.fullmatch(h):
@@ -89,6 +97,8 @@ def propose(conn: Any, svc: Any, ctx: Any, *, tx_hash: str, action: str, user_id
     when the scan did not record one)."""
     if action not in ACTIONS:
         raise ValidationFailed("action must be attribute or refund")
+    if action == "refund":
+        _require_refunds_enabled(svc)
     h = norm_hash(tx_hash)
     held = held_or_404(conn, svc, h)
     if held.get("release_id") is not None:
@@ -169,6 +179,7 @@ def approve(conn: Any, svc: Any, ctx: Any, *, release_id: str, reason: str) -> d
         svc.notifier.notify(conn, user_id=uid, severity="info", kind="topup_credited",
                             payload={"amount_micro": amount, "method": "USDC (held deposit released)"})
     else:
+        _require_refunds_enabled(svc)
         tx = ledger_ops.release_suspense_to_refund(conn, svc, tx_hash=h, amount=amount, actor=ctx.actor)
     row = svc.store.approve_suspense_release(conn, release_id, checker=ctx.user_id, now=svc.now(), reason=reason,
                                              release_tx_id=tx)
@@ -203,6 +214,7 @@ def refund_typed_data(conn: Any, svc: Any, ctx: Any, *, release_id: str, signatu
     """(release, usdSend typed-data payload) for the hardware treasury wallet. Destination = the recorded sender."""
     from app.api.validation import micro_to_usd_string
 
+    _require_refunds_enabled(svc)
     rel = _approved_refund(conn, svc, release_id, for_update=False)
     svc.audit.write(conn, actor=ctx.actor, action="suspense.refund.typed_data", target=f"held_deposit:{rel['tx_hash']}",
                     payload={"release_id": str(rel["id"])}, ip_hash=ctx.ip_hash)
@@ -223,6 +235,7 @@ def check_refund_sendable(conn: Any, svc: Any, *, release_id: str, refund_tx_has
 def record_refund_sent(conn: Any, svc: Any, ctx: Any, *, release_id: str, refund_tx_hash: str,
                        time_ms: Optional[int] = None) -> dict:
     """The route has verified on-chain: treasury → recorded sender, this hash, exactly the held amount."""
+    _require_refunds_enabled(svc)
     rh = norm_hash(refund_tx_hash)
     rel = _approved_refund(conn, svc, release_id, for_update=True)
     if svc.store.tx_hash_used(conn, rh):

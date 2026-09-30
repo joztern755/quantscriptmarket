@@ -137,8 +137,14 @@ def deposits_scan(db: Any, now: datetime, *, info: Any = None, settings: Any = N
                                            WHERE master_address = :a AND verified_at IS NOT NULL""", a=addr)
                     return str(r["user_id"]) if r else None
 
+                def verified_at(addr: str, _conn: Any = conn) -> Any:
+                    # REVIEW_AUTH_API F8: only transfers made after the sender wallet was verified are credited
+                    r = _db.one(_conn, """SELECT verified_at FROM wallets
+                                           WHERE master_address = :a AND verified_at IS NOT NULL""", a=addr)
+                    return r["verified_at"] if r else None
+
                 outcome = credit_from_detection(det, treasury_address=treasury, min_topup_micro=min_topup,
-                                                user_for_address=lookup)
+                                                user_for_address=lookup, verified_at_for_address=verified_at)
                 if outcome.credit is not None:
                     _book_credit(conn, ledger, outcome.credit, report)
                 elif outcome.held is not None:

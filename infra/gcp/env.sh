@@ -147,6 +147,9 @@ SECRETS_SPEC=(
   # The ONLY grant the sandbox SA has: it protects nothing but the sandbox itself, and the sandbox has no
   # route to Google APIs (no Private Google Access / NAT), so it cannot be used from inside anyway.
   "SANDBOX_SHARED_SECRET|api executor sandbox|1"
+  # HMAC key of our order cloids (app/hl/client.make_cloid, REVIEW_MONEY H2): users must not be able to compute the
+  # cloids of our orders. Executor only (it places orders and runs fills-ingest). Never rotate while orders are open.
+  "CLOID_SECRET|executor|1"
   # comma-separated e-mail lists (app/config.py). ALLOWLIST_EMAILS: LAUNCH_PHASE=internal refuses to start
   # without it (every prod role). OPS_EMAILS: ops alert recipients (api + executor notifier).
   "ALLOWLIST_EMAILS|api executor|owner"
@@ -167,10 +170,12 @@ SECRETS_SPEC=(
 # Ordering around the daily settlement (00:30, settles yesterday; PnL = fills + funding with time <= 00:00):
 #   fills-ingest runs every 10 min (00:00, 00:10, 00:20 each finish by ~00:24) AND once more at 00:25
 #   (fills-ingest-presettle) so the last fills of the day are stored before 00:30 — a fill stored after its
-#   day was settled can no longer be counted and raises the critical ops event `fill_after_settlement`.
+#   day was settled is booked into the NEXT settlement (REVIEW_MONEY M3: settlement claims every unclaimed row).
 #   funding-scan runs at :07 (the 00:00 funding payment is stored at 00:07, before settlement).
 #   daily-pnl-summary (00:15) reads the previous day's fills after the 00:00/00:10 fills-ingest runs.
 #   referral-tiers (01:15) runs after settlement on purpose: the NEXT settlement uses the new tier.
+#   verify-chain (03:40) verifies every ledger/audit/account hash chain + running balances + earlier anchors, then
+#   anchors today's chain heads (DB row + ops Telegram/email) — REVIEW_MONEY M7(a).
 #   settle-daily DEFERS any subscription whose trading address fills-ingest / funding-scan have not synced past the
 #   cut-off (ops event `settlement_deferred`); settle-daily-retry (02:30 and 06:30, same route, body {} = yesterday)
 #   settles those once the data jobs have caught up. Re-running settle-daily is always a no-op for settled days.
@@ -193,6 +198,7 @@ SCHEDULER_SPEC=(
   "settle-daily|30 0 * * *|settle-daily|1800s|3"
   "settle-daily-retry|30 2,6 * * *|settle-daily|1800s|3"
   "referral-tiers|15 1 * * *|referral-tiers|900s|3"
+  "verify-chain|40 3 * * *|verify-chain|900s|3"
   "agent-expiry-scan|13 */6 * * *|agent-expiry-scan|300s|1"
 )
 

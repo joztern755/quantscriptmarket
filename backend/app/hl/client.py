@@ -16,8 +16,12 @@ POST body). ``account_address`` is only used by the SDK's info helpers (e.g. mar
 has no agents (VERIFIED: ``extraAgents`` of sub-accounts is ``[]``).
 
 Cloid: ``0x`` + ``CLOID_PREFIX`` (4 bytes, ``a17a1000`` — same constant as ``app.execution.executor``) + first 12
-bytes of ``HMAC-SHA256(key=subscription_id, msg="{bar_close_ms}|{leg}")``. Deterministic, so a retry after a crash
-reuses the same cloid and ``orderStatus`` by cloid tells whether the first attempt reached the exchange.
+bytes of ``HMAC-SHA256(key=CLOID_SECRET, msg="aijalon/cloid/v1|{subscription_id}|{bar_close_ms}|{leg}")``.
+Deterministic, so a retry after a crash reuses the same cloid and ``orderStatus`` by cloid tells whether the first
+attempt reached the exchange. The key is a SERVER secret (config ``cloid_secret`` ← env ``CLOID_SECRET``, required in
+prod for the executor): REVIEW_MONEY H2 — keyed with the subscription id, a user could compute our past and future
+cloids. The prefix only IDENTIFIES platform-looking orders; attribution never trusts it (fills-ingest attributes a
+fill only when its cloid AND exchange-assigned oid match an order we recorded, see ``app.hl.fills``).
 PRIVACY: the prefix makes our orders recognisable on-chain as platform orders (cloids are public in fills);
 the builder code already reveals that to anyone reading order actions. Disclosed in the risk disclosure (§5.8).
 """
@@ -41,7 +45,7 @@ from app.logging import get_logger
 
 __all__ = [
     "CLOID_PREFIX", "OrderResult", "LeverageResult", "BuilderCode", "ExchangeGateway",
-    "make_cloid", "is_platform_cloid", "normalize_order_response", "wire_float",
+    "make_cloid", "cloid_secret", "is_platform_cloid", "normalize_order_response", "wire_float",
     "SdkExchangeGateway", "SdkGatewayFactory", "sdk_available",
 ]
 
@@ -89,13 +93,34 @@ def _bar_close_ms(bar_close: datetime | int) -> int:
     return bar_close
 
 
-def make_cloid(subscription_id: str, bar_close: datetime | int, leg: str | int) -> str:
-    """Deterministic 16-byte client order id: ``0x`` + ``a17a1000`` + HMAC-SHA256(subscription_id, "ms|leg")[:12].
+_DEV_CLOID_SECRET = b"aijalon-dev-only-cloid-secret-not-for-prod"
+
+
+def cloid_secret(secret: str | bytes | None = None) -> bytes:
+    """The cloid HMAC key: explicit ``secret``, else config ``cloid_secret`` (env CLOID_SECRET). Outside prod a fixed,
+    clearly non-prod key is used when unset; in prod an empty key refuses to make cloids (fail closed)."""
+    if secret:
+        return secret if isinstance(secret, bytes) else str(secret).encode()
+    from app.config import get_settings
+
+    s = get_settings()
+    raw = getattr(s, "cloid_secret", "") or ""
+    if raw:
+        return raw.encode()
+    if getattr(s, "is_prod", False):
+        raise ValidationFailed("CLOID_SECRET is required in prod (cloids must not be computable by users)")
+    return _DEV_CLOID_SECRET
+
+
+def make_cloid(subscription_id: str, bar_close: datetime | int, leg: str | int, *,
+               secret: str | bytes | None = None) -> str:
+    """Deterministic 16-byte client order id: ``0x`` + ``a17a1000`` +
+    HMAC-SHA256(CLOID_SECRET, "aijalon/cloid/v1|{subscription_id}|{ms}|{leg}")[:12].
     ``leg`` should identify coin and attempt, e.g. ``"xyz:SILVER|0"``."""
     if not subscription_id:
         raise ValidationFailed("subscription_id required")
-    msg = f"{_bar_close_ms(bar_close)}|{leg}".encode()
-    mac = hmac.new(str(subscription_id).encode(), msg, hashlib.sha256).hexdigest()[:24]
+    msg = f"aijalon/cloid/v1|{subscription_id}|{_bar_close_ms(bar_close)}|{leg}".encode()
+    mac = hmac.new(cloid_secret(secret), msg, hashlib.sha256).hexdigest()[:24]
     return "0x" + CLOID_PREFIX + mac
 
 

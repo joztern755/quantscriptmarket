@@ -80,6 +80,7 @@ class SuspenseReleaseDbTest(unittest.TestCase):
         svc.typed_data = TypedData()
         svc.settings = SimpleNamespace(treasury_address=TREASURY, hl_api_url="https://api.hyperliquid.xyz")
         svc.now = lambda: datetime.now(timezone.utc)
+        svc.config = SimpleNamespace(launch=SimpleNamespace(payouts_enabled=True))
         cls.svc = svc
         tag = uuid.uuid4().hex[:8]
         cls.tag = tag
@@ -245,6 +246,20 @@ class SuspenseReleaseDbTest(unittest.TestCase):
             "suspense.propose.refund", "suspense.reject.refund", "suspense.propose.refund", "suspense.approve.refund",
             "suspense.refund.typed_data", "suspense.refund.sent"])
         self.assertEqual(self.db.fetchall("SELECT count(*) AS n FROM verify_chain()")[0]["n"], 0)
+
+    def test_refund_gated_until_payouts_enabled(self) -> None:
+        """Owner: no USDC leaves the treasury (refunds included) until PAYOUTS_ENABLED is on."""
+        from app.api import suspense
+
+        db, svc = self.db, self.svc
+        h = self.hold("gate", _addr(self.tag + "gated-stranger"), 12_000_000)
+        svc.config = SimpleNamespace(launch=SimpleNamespace(payouts_enabled=False))
+        try:
+            with self.assertRaises(Forbidden):
+                suspense.propose(db, svc, self.ctx(self.a), tx_hash=h, action="refund", user_id=None,
+                                 sender_address=None, evidence="refund while payouts are off")
+        finally:
+            svc.config = SimpleNamespace(launch=SimpleNamespace(payouts_enabled=True))
 
     def test_legacy_hold_without_recorded_sender_needs_onchain_verified_sender(self) -> None:
         from app.api import suspense

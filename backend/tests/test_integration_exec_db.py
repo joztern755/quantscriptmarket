@@ -479,10 +479,13 @@ class ExecIntegrationDbTest(unittest.TestCase):
                                                              profit_share_bps, status)
                                      VALUES (:s, :s, true, ARRAY['xyz:SILVER'], '1d', 0, 0, 'listed')
                                      RETURNING id::text AS id""", {"s": slug})[0]["id"]
-        vid = self.admin.fetchall("""INSERT INTO strategy_versions (strategy_id, version, code_hash, markets, timeframe,
-                                                                    max_leverage, published_at, live_since)
-                                     VALUES (CAST(:s AS uuid), 1, :h, ARRAY['xyz:SILVER'], '1d', 2, now(), now())
-                                     RETURNING id::text AS id""", {"s": sid, "h": "c" * 64})[0]["id"]
+        # in-house versions must pin params.script_sha256 (migration 0012, REVIEW_TRADING_KEYS F4)
+        vid = self.admin.fetchall("""INSERT INTO strategy_versions (strategy_id, version, code_hash, params, markets,
+                                                                    timeframe, max_leverage, published_at, live_since)
+                                     VALUES (CAST(:s AS uuid), 1, :h, CAST(:p AS jsonb), ARRAY['xyz:SILVER'], '1d', 2,
+                                             now(), now())
+                                     RETURNING id::text AS id""",
+                                  {"s": sid, "h": "c" * 64, "p": '{"script_sha256": "' + "d" * 64 + '"}'})[0]["id"]
         return sid, vid
 
     def subscribe(self, user_id: str, sid: str, vid: str, master: str, *, allocation: int = 1_000_000_000,

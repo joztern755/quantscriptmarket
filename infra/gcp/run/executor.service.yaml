@@ -92,6 +92,9 @@ spec:
             # the executor calls the sandbox (creator signals in the tick): X-Sandbox-Secret + Cloud Run IAM
             - name: SANDBOX_SHARED_SECRET
               valueFrom: {secretKeyRef: {name: SANDBOX_SHARED_SECRET, key: latest}}
+            # HMAC key of our order cloids (REVIEW_MONEY H2); required in prod for SERVICE_ROLE=executor
+            - name: CLOID_SECRET
+              valueFrom: {secretKeyRef: {name: CLOID_SECRET, key: latest}}
             - name: BUILDER_ADDRESS
               valueFrom: {secretKeyRef: {name: BUILDER_ADDRESS, key: latest}}
             - name: TREASURY_ADDRESS

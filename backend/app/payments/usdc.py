@@ -237,6 +237,8 @@ def credit_from_detection(
     treasury_address: str,
     min_topup_micro: int = usd(10),
     user_for_address: Callable[[str], str | None] | None = None,
+    verified_at_for_address: Callable[[str], Any] | None = None,
+    verification_skew_ms: int = 60_000,
 ) -> UsdcOutcome:
     """Turn one detected USDC transfer into a fee-balance credit.
 
@@ -245,6 +247,10 @@ def credit_from_detection(
       already set ``user_id``. Unknown sender -> held for manual review (funds arrived; we cannot credit anyone).
     * Below the minimum top-up -> held (the funds are on our treasury; ops credits or returns them by hand).
     * Idempotency key ``usdc_hl:{tx_hash}``; external_ref = tx hash.
+    * REVIEW_AUTH_API F8: with ``verified_at_for_address`` (sender -> when that wallet was FIRST verified by the user,
+      datetime or ms), a transfer older than the verification (− ``verification_skew_ms``) is held for manual review
+      instead of credited: a historical transfer from an address (e.g. an ops wallet that funded the treasury) must
+      never become withdrawable balance of whoever verifies that address later.
     """
     det = coerce_detection(detection)
     out = UsdcOutcome()
@@ -271,6 +277,13 @@ def credit_from_detection(
         out.held = "sender is not a verified user wallet"
         out.alerts.append(_held_alert(det, out.held, Severity.WARN if det.amount_micro >= min_topup_micro else Severity.INFO))
         return out
+    if verified_at_for_address is not None and not det.user_id:
+        va = verified_at_for_address(det.from_address)
+        va_ms = int(va.timestamp() * 1000) if hasattr(va, "timestamp") else (int(va) if va is not None else None)
+        if va_ms is None or int(det.time_ms or 0) < va_ms - int(verification_skew_ms):
+            out.held = "transfer predates the wallet's verification"
+            out.alerts.append(_held_alert(det, out.held, Severity.WARN))
+            return out
     if det.amount_micro < min_topup_micro:
         out.held = f"below minimum top-up {fmt_usd(min_topup_micro)}"
         out.alerts.append(_held_alert(det, out.held, Severity.WARN))
