@@ -468,7 +468,9 @@ class PgSignalRepo:
 
 class PgFlagRepo:
     """``FlagRepo``: one snapshot of system_flags per tick. FAIL CLOSED: any value other than JSON false/null
-    counts as engaged (a malformed switch stops trading rather than being ignored)."""
+    counts as engaged (a malformed switch stops trading rather than being ignored). The same snapshot carries the
+    trusted builder-dex allowlist (``trusted_dexes``, SPEC §12): if it cannot be read, ``trusted_dexes=None`` and the
+    pre-trade guard blocks entries on every builder-dex market (fail closed; exits keep running)."""
 
     def __init__(self, db: PgDatabase) -> None:
         self.db = db
@@ -482,7 +484,17 @@ class PgFlagRepo:
             kill_switch_global="kill_switch_global" in on,
             new_entries_paused="new_entries_paused" in on,
             killed_markets=frozenset(k.split(":", 1)[1] for k in on if k.startswith("kill_switch_market:")),
-            paused_entry_markets=frozenset(k.split(":", 1)[1] for k in on if k.startswith("new_entries_paused:")))
+            paused_entry_markets=frozenset(k.split(":", 1)[1] for k in on if k.startswith("new_entries_paused:")),
+            trusted_dexes=self._trusted_dexes())
+
+    def _trusted_dexes(self) -> frozenset[str] | None:
+        from app.strategies.dexes import load_trusted
+
+        try:
+            return load_trusted(self.db)
+        except Exception as e:  # noqa: BLE001 - fail closed (validator perps only), never fail open
+            log.error("trusted_dexes_unavailable", extra={"fields": {"error": type(e).__name__}})
+            return None
 
 
 # ---------------------------------------------------------------------------------------------------------- alerts

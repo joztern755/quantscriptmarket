@@ -26,6 +26,7 @@ from app.domain import profit_share as _ps
 from app.domain import risk as _risk
 from app.errors import GuardRejected, NotFound
 from app.logging import get_logger
+from app.strategies import dexes as _dexes
 
 from .ports import (
     CLOSING_STATUS,
@@ -112,6 +113,10 @@ class RiskPlanner:
         paused = set(flags.paused_entry_markets)
         if inp.reduce_only_mode:
             paused.add(inp.coin)  # executor-level reduce-only (status / flags) → entries blocked on this coin
+        if not _dexes.is_trusted_coin(inp.coin, getattr(flags, "trusted_dexes", None)):
+            # SPEC §12 trusted builder dexes (REVIEW_TRADING_KEYS F1): a dex outside the allowlist (never added,
+            # removed by an admin, or allowlist unreadable → None) may only be EXITED, never entered / increased.
+            paused.add(inp.coin)
         rflags = _risk.RiskFlags(global_kill=flags.kill_switch_global, killed_markets=frozenset(flags.killed_markets),
                                  new_entries_paused=flags.new_entries_paused, paused_markets=frozenset(paused))
         out = _risk.plan_order(inp.weight_bps, ctx, market, rflags, self.limits, inp.now, grace_hours=self.grace_hours)

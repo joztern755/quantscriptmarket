@@ -183,6 +183,10 @@ class Flags:
     new_entries_paused: bool = False
     killed_markets: frozenset[str] = frozenset()        # kill_switch_market:{coin}  → no orders on coin
     paused_entry_markets: frozenset[str] = frozenset()  # new_entries_paused:{coin} → reduce-only on coin
+    # SPEC §12 trusted builder dexes (active trusted_dexes rows, incl. ""). A coin on any other builder dex is
+    # reduce-only (entries blocked, exits allowed). None = allowlist not loaded → FAIL CLOSED: only validator perps
+    # (dex "") may open positions.
+    trusted_dexes: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)
