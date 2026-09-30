@@ -1,16 +1,17 @@
-# Cloud Run service "api" — public API behind Cloudflare -> Global HTTPS LB (Cloud Armor) -> this service.
+# Cloud Run service "executor" — same image as api, SERVICE_ROLE=executor. Never public: ingress internal,
+# invoked only by Cloud Scheduler (OIDC as aijalon-scheduler, the only principal with run.invoker).
+# Identity: aijalon-executor SA (KMS DECRYPT only on agent-keys, Cloud SQL IAM login, its own secrets).
 # Rendered by infra/gcp/render.py in deploy.yml, applied with `gcloud run services replace`.
-# Identity: aijalon-api SA (KMS ENCRYPT only on agent-keys, Cloud SQL IAM login, its own secrets).
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
-  name: api
+  name: executor
   labels:
     cloud.googleapis.com/location: ${REGION}
     app: aijalon
   annotations:
-    # only the external LB (and in-VPC callers) can reach the run.app origin; the LB admits only Cloudflare
-    run.googleapis.com/ingress: internal-and-cloud-load-balancing
+    # internal: only same-project VPC traffic and Google-internal sources (Cloud Scheduler) can reach it
+    run.googleapis.com/ingress: internal
 spec:
   template:
     metadata:
@@ -18,8 +19,8 @@ spec:
         app: aijalon
         commit: ${GIT_SHA_SHORT}
       annotations:
-        autoscaling.knative.dev/minScale: "1"
-        autoscaling.knative.dev/maxScale: "20"
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "3"
         run.googleapis.com/execution-environment: gen2
         run.googleapis.com/cpu-throttling: "true"
         run.googleapis.com/startup-cpu-boost: "true"
@@ -29,9 +30,9 @@ spec:
         # app starts only after the Cloud SQL Auth Proxy sidecar passes its startup probe
         run.googleapis.com/container-dependencies: '{"app":["cloud-sql-proxy"]}'
     spec:
-      serviceAccountName: ${SA_API}
-      containerConcurrency: 40
-      timeoutSeconds: 60
+      serviceAccountName: ${SA_EXECUTOR}
+      containerConcurrency: 4
+      timeoutSeconds: 1800
       containers:
         - name: app
           image: ${BACKEND_IMAGE}
@@ -41,15 +42,15 @@ spec:
           resources:
             limits:
               cpu: "1"
-              memory: 1Gi
+              memory: 2Gi
           env:
             - {name: APP_ENV, value: prod}
-            - {name: SERVICE_ROLE, value: api}
+            - {name: SERVICE_ROLE, value: executor}
             - {name: GOOGLE_CLOUD_PROJECT, value: "${PROJECT_ID}"}
             - {name: FIREBASE_PROJECT_ID, value: "${PROJECT_ID}"}
             - {name: KMS_KEY_NAME, value: "${KMS_KEY_NAME}"}
             # IAM database auth through the sidecar: no password; the proxy injects the SA's OAuth token
-            - {name: DATABASE_URL, value: "postgresql://${DB_IAM_USER_API_URLENC}@127.0.0.1:5432/${DB_NAME}?sslmode=disable"}
+            - {name: DATABASE_URL, value: "postgresql://${DB_IAM_USER_EXECUTOR_URLENC}@127.0.0.1:5432/${DB_NAME}?sslmode=disable"}
             - {name: WEB_ORIGIN, value: "https://${WEB_DOMAIN}"}
             - {name: API_ORIGIN, value: "https://${API_DOMAIN}"}
             - {name: HL_API_URL, value: "https://api.hyperliquid.xyz"}
@@ -57,11 +58,10 @@ spec:
             - {name: AGENT_NAME, value: aijalon}
             - {name: SANDBOX_URL, value: "${SANDBOX_URL}"}
             - {name: FEATURE_CREATOR_UPLOADS, value: "true"}
+            # internal endpoints must verify the OIDC token: audience = this service URL, email = scheduler SA
+            - {name: INTERNAL_AUDIENCE, value: "${EXECUTOR_URL}"}
+            - {name: SCHEDULER_SA_EMAIL, value: "${SA_SCHEDULER}"}
             - {name: IN_HOUSE_LISTED, value: silver}
-            - name: STRIPE_SECRET_KEY
-              valueFrom: {secretKeyRef: {name: STRIPE_SECRET_KEY, key: latest}}
-            - name: STRIPE_WEBHOOK_SECRET
-              valueFrom: {secretKeyRef: {name: STRIPE_WEBHOOK_SECRET, key: latest}}
             - name: TELEGRAM_BOT_TOKEN
               valueFrom: {secretKeyRef: {name: TELEGRAM_BOT_TOKEN, key: latest}}
             - name: TELEGRAM_OPS_CHAT_ID
@@ -72,8 +72,6 @@ spec:
               valueFrom: {secretKeyRef: {name: SIGNALS_PUBKEY_B64, key: latest}}
             - name: AUDIT_PEPPER_B64
               valueFrom: {secretKeyRef: {name: AUDIT_PEPPER, key: latest}}
-            - name: EDGE_AUTH_SECRET
-              valueFrom: {secretKeyRef: {name: EDGE_AUTH_SECRET, key: latest}}
             - name: BUILDER_ADDRESS
               valueFrom: {secretKeyRef: {name: BUILDER_ADDRESS, key: latest}}
             - name: TREASURY_ADDRESS

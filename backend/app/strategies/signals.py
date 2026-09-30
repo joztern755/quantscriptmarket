@@ -406,8 +406,11 @@ def verify_and_parse(
 
     if len(body) > MAX_BODY_BYTES:
         raise fail(SignalTooLarge, "signals.json too large", size=len(body))
-    key = _pubkey(pubkey_b64)
-    sig, sig_b64 = _signature(sig_text)
+    try:
+        key = _pubkey(pubkey_b64)
+        sig, sig_b64 = _signature(sig_text)
+    except SignalRejected as e:                             # re-raise with the listed markets (alerts pause them)
+        raise fail(type(e), e.message, **e.details) from None
     try:
         key.verify(sig, body)                               # 1. authenticate the exact bytes before parsing
     except InvalidSignature:

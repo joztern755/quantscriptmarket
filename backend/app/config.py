@@ -71,7 +71,8 @@ class RiskLimits:
     jitter_max_seconds: int = 600                   # per-user random delay 0–10 min (privacy)
     user_drawdown_alert_bps: int = 2000             # 20% of allocation in 24h
     oi_spike_alert_bps: int = 5000                  # +50% OI in 1h
-    signal_max_age_hours: int = 36
+    signal_max_age_hours: int = 36                  # applies to the feed's generated_at
+    signal_max_bar_age_days: int = 4                # as_of bar may be older (TradFi weekends: Monday's newest bar is Friday)
     min_subscribers_for_public_stats: int = 5
 
 

@@ -1,0 +1,53 @@
+# Cloud Run service "sandbox" — runs creator strategy code (SPEC §5.9, §10). Security boundary:
+#   * gen1 execution environment (gVisor kernel) — backend/app/sandbox/runner.py relies on it;
+#   * ALL egress forced into ${SANDBOX_VPC}: no Cloud NAT, no Private Google Access, no internet route,
+#     deny-all egress firewall => no network at all;
+#   * aijalon-sandbox SA with ZERO IAM roles; no secrets, no env credentials;
+#   * ingress internal + run.invoker only for the api and executor SAs (Cloud Run IAM authenticates callers);
+#   * one request per instance (containerConcurrency 1), capped instances, CPU/memory/time limits.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: sandbox
+  labels:
+    cloud.googleapis.com/location: ${REGION}
+    app: aijalon
+  annotations:
+    run.googleapis.com/ingress: internal
+spec:
+  template:
+    metadata:
+      labels:
+        app: aijalon
+        commit: ${GIT_SHA_SHORT}
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "10"
+        run.googleapis.com/execution-environment: ${SANDBOX_EXEC_ENV}
+        run.googleapis.com/cpu-throttling: "true"
+        run.googleapis.com/network-interfaces: '[{"network":"${SANDBOX_VPC}","subnetwork":"${SANDBOX_SUBNET}","tags":["${SANDBOX_NET_TAG}"]}]'
+        run.googleapis.com/vpc-access-egress: all-traffic
+    spec:
+      serviceAccountName: ${SA_SANDBOX}
+      containerConcurrency: 1
+      timeoutSeconds: 900
+      containers:
+        - name: sandbox
+          image: ${SANDBOX_IMAGE}
+          ports:
+            - name: http1
+              containerPort: 8080
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          env:
+            - {name: APP_ENV, value: prod}
+            - {name: SERVICE_ROLE, value: sandbox}
+          startupProbe:
+            tcpSocket: {port: 8080}
+            periodSeconds: 2
+            failureThreshold: 30
+  traffic:
+    - latestRevision: true
+      percent: 100

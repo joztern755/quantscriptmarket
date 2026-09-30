@@ -1,0 +1,47 @@
+# Cloud Run Job "migrate" — applies backend/migrations in order (scripts/migrate.py) BEFORE any service
+# revision is rolled out (deploy.yml). Identity: aijalon-migrator SA, whose only permission is reading the
+# DB_MIGRATOR_PASSWORD secret. Connects straight to the Cloud SQL private IP over TLS (sslmode=require;
+# the instance is ENCRYPTED_ONLY) as the built-in `migrator` user created by infra/gcp/db_bootstrap.sh.
+# `$DB_MIGRATOR_PASSWORD` (no braces) is expanded by the container shell at run time, not by render.py.
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: migrate
+  labels:
+    cloud.googleapis.com/location: ${REGION}
+    app: aijalon
+spec:
+  template:
+    metadata:
+      labels:
+        app: aijalon
+        commit: ${GIT_SHA_SHORT}
+      annotations:
+        run.googleapis.com/execution-environment: gen2
+        run.googleapis.com/network-interfaces: '[{"network":"${VPC}","subnetwork":"${RUN_SUBNET}","tags":["${RUN_NET_TAG}"]}]'
+        run.googleapis.com/vpc-access-egress: private-ranges-only
+    spec:
+      parallelism: 1
+      taskCount: 1
+      template:
+        spec:
+          serviceAccountName: ${SA_MIGRATOR}
+          timeoutSeconds: 900
+          maxRetries: 0
+          containers:
+            - name: migrate
+              image: ${BACKEND_IMAGE}
+              command: ["/bin/sh", "-c"]
+              args:
+                - >-
+                  export DATABASE_URL="postgresql://${DB_MIGRATOR_USER}:$DB_MIGRATOR_PASSWORD@${DB_PRIVATE_IP}:5432/${DB_NAME}?sslmode=require";
+                  unset DB_MIGRATOR_PASSWORD;
+                  exec ${MIGRATE_CMD}
+              env:
+                - {name: SERVICE_ROLE, value: migrate}
+                - name: DB_MIGRATOR_PASSWORD
+                  valueFrom: {secretKeyRef: {name: DB_MIGRATOR_PASSWORD, key: latest}}
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: 512Mi
