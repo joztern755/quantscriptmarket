@@ -1,16 +1,20 @@
 """Agent wallet + builder-fee approval (SPEC §0, §5.3, §6).
 
-POST /agents (step-up): generate a secp256k1 agent key and seal it with the ENCRYPT-ONLY KMS envelope
-(app.security.agent_keys.generate_sealed_agent_key; AAD binds user id + agent address). The plaintext never leaves
-that call; the API process cannot decrypt (no decryptor is ever built here; its KMS role lacks decrypt and its DB
-role cannot even SELECT key_ciphertext). Returns the agent address and the EIP-712 payloads the user's wallet
-signs; the BROWSER posts them to Hyperliquid /exchange — the API never relays user signatures.
+POST /agents (step-up): inserts an agent REQUEST row (user, master, status 'requested') and returns its id. The api
+has NO code path that generates or seals an agent key (migrations/0016; REVIEW_WEB_INFRA H1 residual): the EXECUTOR
+generates the secp256k1 key, seals it under the agent-keys KMS key (the api SA has no role on it; the api DB role
+cannot write agent_keys.agent_address / key_ciphertext), re-opens it to prove it derives the address, and KMS-signs
+the attestation "aijalon-agent-v2|user|agent" (app.execution.trust_jobs.generate_agents — every tick and every
+attest-agents run, i.e. within about a minute).
+GET /agents/{id}: the browser polls until ``ready`` (address + attestation); it verifies the attestation with the
+public key PINNED in app-config.json and builds the ApproveAgent typed data locally; the BROWSER posts it to
+Hyperliquid /exchange — the API never relays user signatures for this.
 POST /agents/{id}/confirm (step-up): verified on-chain via info.extraAgents → status active.
 POST /builder-approval/confirm: verified on-chain via info.maxBuilderFee → builder_approvals row.
 
-One live agent per master address (DB partial unique index). Rotation (rotate=true) marks the current active
-agent 'rotated' immediately: the replacement shares the agent NAME, so the user's approval replaces it on-chain
-and trading on that master pauses until the new agent is confirmed.
+One live agent (or request) per master address (DB partial unique index). Rotation (rotate=true) marks the current
+active agent 'rotated' immediately and follows the same request path: the replacement shares the agent NAME, so the
+user's approval replaces it on-chain and trading on that master pauses until the new agent is confirmed.
 """
 from __future__ import annotations
 
@@ -30,9 +34,10 @@ HL_EXCHANGE_URL_SUFFIX = "/exchange"
 
 
 def _agent_out(row: dict) -> S.AgentOut:
-    return S.AgentOut(id=row["id"], master_address=row["master_address"], agent_address=row["agent_address"],
-                      agent_name=row["agent_name"], status=row["status"], approved_at=row.get("approved_at"),
-                      created_at=row["created_at"])
+    addr = row.get("agent_address")
+    return S.AgentOut(id=row["id"], master_address=row["master_address"],
+                      agent_address=str(addr).lower() if addr else None, agent_name=row["agent_name"],
+                      status=row["status"], approved_at=row.get("approved_at"), created_at=row["created_at"])
 
 
 @router.get("/agents", response_model=list[S.AgentOut])
@@ -50,9 +55,6 @@ def create_agent(body: S.AgentCreateIn, ctx: AuthCtx = Depends(step_up_user),
     with svc.db.begin() as conn:
         if svc.store.verified_wallet(conn, ctx.user_id, master) is None:
             raise Forbidden("verify ownership of this wallet first")
-    # KMS encrypt (network) outside the DB transaction; the plaintext key is zeroised inside the helper.
-    sealed = svc.agent_keys.generate_sealed(ctx.user_id)
-    with svc.db.begin() as conn:
         svc.store.lock_user(conn, ctx.user_id)
         rotated: Optional[str] = None
         for live in svc.store.live_agents_for_master(conn, master):
@@ -63,25 +65,40 @@ def create_agent(body: S.AgentCreateIn, ctx: AuthCtx = Depends(step_up_user),
                     raise Conflict("an active agent already exists for this wallet; pass rotate=true to replace it")
                 svc.store.set_agent_status(conn, str(live["id"]), "rotated", svc.now())
                 rotated = str(live["id"])
-            else:  # stale pending approval: superseded by the new key
+            else:  # an older request / stale pending approval: superseded by the new request
                 svc.store.set_agent_status(conn, str(live["id"]), "revoked", svc.now())
-        row = svc.store.insert_agent(conn, user_id=ctx.user_id, master=master, agent_address=sealed.agent_address,
-                                     agent_name=s.agent_name, key_ciphertext=sealed.key_ciphertext,
-                                     kms_key_version=sealed.kms_key_version)
-        svc.audit.write(conn, actor=ctx.actor, action="agent.create", target=f"agent:{row['id']}",
-                        payload={"master": master, "agent_address": sealed.agent_address, "rotated": rotated,
-                                 "kms_key_version": sealed.kms_key_version}, ip_hash=ctx.ip_hash)
-    nonce = int(svc.now().timestamp() * 1000)
-    approve = svc.typed_data.approve_agent(agent_address=row["agent_address"], agent_name=s.agent_name, nonce=nonce,
-                                           signature_chain_id=body.signature_chain_id)
+        # a REQUEST only: no key material. The executor generates, seals and attests the key.
+        row = svc.store.insert_agent_request(conn, user_id=ctx.user_id, master=master, agent_name=s.agent_name)
+        svc.audit.write(conn, actor=ctx.actor, action="agent.request", target=f"agent:{row['id']}",
+                        payload={"master": master, "rotated": rotated}, ip_hash=ctx.ip_hash)
     builder = None
     if s.builder_address:
+        nonce = int(svc.now().timestamp() * 1000)
         builder = svc.typed_data.approve_builder_fee(builder=s.builder_address,
                                                      max_fee_tenths_bp=s.economics.builder_fee_tenths_bp,
                                                      nonce=nonce + 1, signature_chain_id=body.signature_chain_id)
-    return S.AgentCreateOut(agent=_agent_out(row), approve_agent=approve, approve_builder_fee=builder,
+    return S.AgentCreateOut(agent=_agent_out(row), approve_agent=None, approve_builder_fee=builder,
                             exchange_url=s.hl_api_url.rstrip("/") + HL_EXCHANGE_URL_SUFFIX,
                             required_builder_fee_tenths_bp=s.economics.builder_fee_tenths_bp)
+
+
+@router.get("/agents/{agent_id}", response_model=S.AgentDetailOut,
+            dependencies=[user_limit("agent_detail", 240, 3600)])
+def get_agent(agent_id: UUID, ctx: AuthCtx = Depends(consented_user),
+              svc: Services = Depends(get_services)) -> S.AgentDetailOut:
+    """Poll target after POST /agents: ``ready`` once the executor generated AND attested the key."""
+    with svc.db.begin() as conn:
+        row = svc.store.get_agent_detail(conn, str(agent_id), ctx.user_id)
+    if row is None:
+        raise NotFound("agent not found")
+    att = None
+    if row.get("attestation_sig") and row.get("attested_at") and row.get("agent_address"):
+        att = S.AgentKeyAttestationOut(signature_b64=str(row["attestation_sig"]),
+                                       key_version=str(row.get("attestation_key_version") or ""),
+                                       attested_at=row["attested_at"])
+    failed = row.get("attestation_failed_at") is not None
+    return S.AgentDetailOut(agent=_agent_out(row), user_id=row["user_id"], ready=att is not None and not failed,
+                            failed=failed, attestation=att)
 
 
 @router.post("/agents/{agent_id}/confirm", response_model=S.AgentOut,
@@ -94,6 +111,8 @@ def confirm_agent(agent_id: UUID, ctx: AuthCtx = Depends(step_up_user),
         raise NotFound("agent not found")
     if agent["status"] == "active":
         return _agent_out(agent)
+    if agent["status"] == "requested":
+        raise ValidationFailed("your agent is still being prepared; wait for it, approve it in your wallet, then retry")
     if agent["status"] != "pending_approval":
         raise Conflict("this agent was replaced or revoked; create a new one")
     on_chain = svc.hl.extra_agents(agent["master_address"])   # agents live on the MASTER account

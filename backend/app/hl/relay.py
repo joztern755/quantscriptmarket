@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -31,7 +32,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 from app.errors import ExternalServiceError, ValidationFailed
 
 __all__ = ["RELAYABLE", "RelayPolicy", "RelayRefused", "RelayCheck", "validate_relay", "forward_exchange",
-           "fee_rate_tenths_bp"]
+           "fee_rate_tenths_bp", "charge_relay_budget"]
 
 RELAYABLE = ("approveAgent", "approveBuilderFee", "usdSend")
 _FIELDS = {
@@ -190,6 +191,23 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 _OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def charge_relay_budget(budget: Any, limits: Any, *, max_wait_seconds: float,
+                        monotonic: Callable[[], float] = time.monotonic,
+                        sleep: Callable[[float], None] = time.sleep) -> None:
+    """Charge one relayed ``/exchange`` request to the SHARED per-egress-IP Hyperliquid budget BEFORE it is sent
+    (``app.hl.budget``; Hyperliquid counts /exchange against the same per-IP weight limit as /info). Low-priority
+    ``jobs`` pool, waiting at most ``max_wait_seconds``; no room → ``HlBudgetExhausted`` and nothing may be sent.
+    ``budget=None`` (no database / shared budget disabled) → no accounting."""
+    if budget is None or limits is None:
+        return
+    from app.hl.budget import POOL_JOBS, HlBudgetExhausted
+
+    weight = int(getattr(limits, "exchange_weight", 1))
+    if not budget.acquire_wait(weight, POOL_JOBS, deadline=monotonic() + float(max_wait_seconds),
+                               monotonic=monotonic, sleep=sleep):
+        raise HlBudgetExhausted("hyperliquid rate budget exhausted", type="exchange", pool=POOL_JOBS)
 
 
 def forward_exchange(url: str, body: Mapping[str, Any], *, timeout: float = 10.0, max_bytes: int = 64 * 1024,

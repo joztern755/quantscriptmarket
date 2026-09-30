@@ -976,7 +976,7 @@ class ExecIntegrationDbTest(unittest.TestCase):
         key = f"test-uow:{u}"
         with self.assertRaises(RuntimeError):
             with pdb.atomic():
-                led.post_transaction(idempotency_key=key, kind="adjustment", memo="x",
+                led.post_transaction(idempotency_key=key, kind="deposit", memo="x",
                                      lines=[("treasury:hl_usdc", 5), (f"user:{u}:fee_balance", -5)], created_by="t")
                 pdb.all("UPDATE users SET referral_tier = 'elite' WHERE id = CAST(:u AS uuid)", u=u)
                 raise RuntimeError("boom")
@@ -984,7 +984,7 @@ class ExecIntegrationDbTest(unittest.TestCase):
         self.assertEqual(self.admin.fetchall("SELECT referral_tier::text AS t FROM users WHERE id = CAST(:u AS uuid)",
                                              {"u": u})[0]["t"], "starter")
         with pdb.atomic():
-            led.post_transaction(idempotency_key=key, kind="adjustment", memo="x",
+            led.post_transaction(idempotency_key=key, kind="deposit", memo="x",
                                  lines=[("treasury:hl_usdc", 5), (f"user:{u}:fee_balance", -5)], created_by="t")
         self.assertTrue(led.has_transaction(key))
         self.ledger_ok()

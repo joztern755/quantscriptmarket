@@ -103,6 +103,7 @@ class HlLimits:
     light_types: tuple[str, ...] = ("l2Book", "allMids", "clearinghouseState", "orderStatus",
                                     "spotClearinghouseState", "exchangeStatus")
     type_weights: tuple[tuple[str, int], ...] = (("userRole", 60),)
+    exchange_weight: int = 1              # one unbatched /exchange action (the API's user-signed relay)
     # extra weight: +1 per N items returned
     items_per_extra_weight: tuple[tuple[str, int], ...] = (
         ("candleSnapshot", 60), ("userFills", 20), ("userFillsByTime", 20), ("userFunding", 20),

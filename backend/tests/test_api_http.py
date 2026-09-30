@@ -471,19 +471,33 @@ def test_stripe_webhook_signature_and_idempotent_credit():
 
 
 def test_agent_create_rotate_and_confirm():
+    """POST /v1/agents files a REQUEST (migrations/0016): the api never generates or seals a key; the executor does
+    (world.executor_keygen stands in for app.execution.trust_jobs.generate_agents)."""
     world, svc, c = build()
     u = world.add_user("fb-user")
     h = login(svc, world)
     body = {"master_address": W1, "signature_chain_id": "0xa4b1"}
     assert c.post("/v1/agents", headers=h, json=body).status_code == 403              # wallet not verified
     world.add_wallet(u["id"], W1)
+    assert not hasattr(svc, "agent_keys")                                             # no agent-key port at all
     r = c.post("/v1/agents", headers=h, json=body)
     assert r.status_code == 201, r.text
     out = r.json()
-    agent_id, agent_addr = out["agent"]["id"], out["agent"]["agent_address"]
-    assert out["approve_agent"]["typed_data"]["primaryType"] == "HyperliquidTransaction:ApproveAgent"
+    agent_id = out["agent"]["id"]
+    assert out["agent"]["status"] == "requested" and out["agent"]["agent_address"] is None
+    assert out["approve_agent"] is None
     assert out["approve_builder_fee"] is not None and out["required_builder_fee_tenths_bp"] == 100
     assert "key_ciphertext" not in r.text and "sealed" not in r.text
+    assert world.keygen_calls == 0
+    # the browser polls GET /v1/agents/{id}: not ready until the executor generated + attested the key
+    d = c.get(f"/v1/agents/{agent_id}", headers=h).json()
+    assert d["ready"] is False and d["attestation"] is None and d["agent"]["agent_address"] is None
+    assert c.post(f"/v1/agents/{agent_id}/confirm", headers=h).status_code == 422      # still being prepared
+    world.executor_keygen(agent_id)
+    d = c.get(f"/v1/agents/{agent_id}", headers=h).json()
+    agent_addr = d["agent"]["agent_address"]
+    assert d["ready"] is True and d["attestation"]["signature_b64"] and d["user_id"] == u["id"]
+    assert d["agent"]["status"] == "pending_approval"
     assert c.post(f"/v1/agents/{agent_id}/confirm", headers=h).status_code == 422      # not on-chain yet
     svc.hl.agents[W1] = [{"address": agent_addr, "name": "aijalon", "validUntil": None}]
     r = c.post(f"/v1/agents/{agent_id}/confirm", headers=h)
@@ -491,6 +505,15 @@ def test_agent_create_rotate_and_confirm():
     assert c.post("/v1/agents", headers=h, json=body).status_code == 409               # active exists
     r = c.post("/v1/agents", headers=h, json={**body, "rotate": True})
     assert r.status_code == 201 and world.agents[agent_id]["status"] == "rotated"
+    new_id = r.json()["agent"]["id"]
+    assert r.json()["agent"]["status"] == "requested" and r.json()["agent"]["agent_address"] is None
+    # a second request for the same master withdraws the first (one live request per master)
+    r2 = c.post("/v1/agents", headers=h, json=body)
+    assert r2.status_code == 201 and world.agents[new_id]["status"] == "revoked"
+    # another user cannot read the agent
+    other = world.add_user("fb-other")
+    assert c.get(f"/v1/agents/{agent_id}", headers=login(svc, world, "fb-other")).status_code == 404
+    assert other
 
 
 # ================================================================================================= admin

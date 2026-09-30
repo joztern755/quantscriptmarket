@@ -25,6 +25,7 @@ payments, API). Keys match what app/jobs_data emits; alternatives in brackets ar
                        app/api/login_events ; login_new_country / new_country_login: country
   mfa_changed / mfa_reset   optional change
   market_paused        scope (coin or "all markets"), optional cause ; strategy_paused: strategy
+  strategy_resumed     strategy, period_end (ISO) — admin unpause (app/api/billing_ops)
   signal_stale         optional strategy ; telegram_unreachable: reason, pause_at ; alert_email_changed: email
 Missing fields render as "—"; unknown kinds fall back to app.alerts.notifier.render (its TEMPLATES, then a
 generic "key: value" body). Every value is sanitised (secrets redacted, 0x addresses shortened, emails masked),
@@ -347,6 +348,9 @@ USER_TEMPLATES: dict[str, Tmpl] = {
     "strategy_paused": lambda p, o: ("Strategy paused",
                                      f"{p.s('strategy')} is paused: it will not open new positions until it resumes. "
                                      "Exits still run."),
+    "strategy_resumed": lambda p, o: ("Strategy resumed",
+                                      f"{p.s('strategy')} is active again and may open new positions. The paused "
+                                      f"time was added to your paid period (now ends {p.s('period_end')})."),
     "signal_stale": lambda p, o: ("Strategy signal stale" + (f" ({p.s('coin')})" if p.d.get("coin") else ""),
                                   f"The latest signal for {p.s('strategy', 'your strategy')} is late or was rejected, "
                                   "so no new entries are placed until a fresh, verified signal arrives. Exits still "

@@ -104,10 +104,12 @@ def request_payout(body: S.PayoutRequestIn, ctx: AuthCtx = Depends(step_up_user)
 
     def work(conn: Any) -> S.PayoutOut:
         svc.store.lock_user(conn, ctx.user_id)
-        if body.source == "creator":
-            kyc = svc.store.get_kyc(conn, ctx.user_id)
-            if not kyc or kyc["status"] != "approved":
-                raise Forbidden("complete creator KYC before requesting a payout", reason="kyc_required")
+        # creator AND referrer earnings (REVIEW_MONEY M2): KYC approved by one admin, same flow for both
+        kyc = svc.store.get_kyc(conn, ctx.user_id)
+        if not kyc or kyc["status"] != "approved":
+            raise Forbidden("complete identity verification (KYC) before requesting a payout" if body.source ==
+                            "referrer" else "complete creator KYC before requesting a payout",
+                            reason="kyc_required", kyc_status=(kyc or {}).get("status") or "none")
         if svc.store.verified_wallet(conn, ctx.user_id, body.to_address) is None:
             raise Forbidden("payouts go only to one of your verified wallets")
         billing_ops.require_no_payout_hold(conn, svc, user_id=ctx.user_id, to_address=body.to_address)

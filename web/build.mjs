@@ -165,7 +165,7 @@ if (existsSync(sriPath)) {
   log("WARN: web/sri.json absent — Firebase modules load WITHOUT SRI (dev build only; production builds refuse)");
 }
 
-// The policy is the SAME as backend/app/security/csp.py web_csp(api_origin=, firebase_auth_domain=) — same
+// The policy matches backend/app/security/csp.py web_csp(api_origin=, firebase_auth_domain=) — same
 // directives, sources and order; the host-by-host rationale lives there. Change both together (and re-run
 // `make csp-sync`). Only addition: the import map's hash when web/sri.json exists (inline <script type=importmap>).
 //   * gstatic is path-scoped to /firebasejs/ (the pinned SDK), not all of www.gstatic.com

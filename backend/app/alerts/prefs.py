@@ -90,6 +90,7 @@ _SPECS: tuple[KindSpec, ...] = (
     # markets / strategies
     KindSpec("market_paused", "Kill switch / pause on a market you trade", "markets", mandatory=True, email=True),
     KindSpec("strategy_paused", "Strategy paused", "markets", mandatory=True, email=True),
+    KindSpec("strategy_resumed", "Strategy resumed after a pause", "markets", email=True),
     KindSpec("signal_stale", "Strategy signal stale", "markets"),
     # system
     # sent inline by POST /v1/alerts/test (both channels); the worker never re-sends it

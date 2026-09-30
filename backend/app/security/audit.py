@@ -4,17 +4,17 @@ Chain: hash_n = sha256( prev_hash_n || 0x0A || canonical_json(body_n) ), hex, wi
 body = {actor, action, target, payload, ip_hash, created_at}. `verify_chain` recomputes it end to end.
 
 IPs are never stored raw: ip_hash = HMAC-SHA256(pepper, normalised_ip). The pepper is a secret (Secret
-Manager), passed in by the caller — this module does not read config.
-TODO(lead): add `audit_pepper_b64` (env AUDIT_PEPPER_B64, >= 32 random bytes, Secret Manager, required in prod)
-to app/config.py; the same pepper can hash consents.ip_hash / user_agent_hash via `pepper_hash`.
+Manager), passed in by the caller — this module does not read config. The pepper is ``Settings.audit_pepper_b64``
+(env AUDIT_PEPPER_B64, >= 32 random bytes, Secret Manager; ``get_settings`` refuses to start in prod without it);
+the same pepper hashes consents.ip_hash / user_agent_hash via `pepper_hash`.
 
 Canonical JSON (`canonical_json`): UTF-8, sorted keys, no whitespace, str keys only, and NO floats (money is
 integer micro-USD; floats are not deterministic across encoders). Allowed: dict, list/tuple, str, int, bool, None.
 Postgres jsonb round-trips these losslessly, so the hash can be recomputed from the stored row.
 
-Postgres sink contract (`DbApiAuditSink`): the audit_log table needs a total order for the chain.
-TODO(lead/db owner): add `seq bigint generated always as identity unique` to audit_log (uuid + created_at
-cannot order ties). Appends serialise on a transaction-scoped advisory lock.
+Postgres sink contract (`DbApiAuditSink`): the audit_log table has a total order for the chain — ``audit_log.seq``
+(0001: set to last + 1 by the insert trigger under a transaction-scoped advisory lock, UNIQUE; verify_chain() walks
+it and reports gaps). Appends serialise on that lock.
 """
 from __future__ import annotations
 

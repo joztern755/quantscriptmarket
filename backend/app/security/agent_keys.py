@@ -1,10 +1,14 @@
-"""Hyperliquid agent (API) wallet keys: generate, seal (API process), open (executor only). SPEC §5.3.
+"""Hyperliquid agent (API) wallet keys: generate, seal and open — ALL IN THE EXECUTOR. SPEC §5.3, migrations/0016.
 
 * Keys come from the OS CSPRNG (`secrets`), are validated to lie in [1, n-1] for secp256k1, and the address is
   derived as the last 20 bytes of keccak256(uncompressed_pubkey[1:]), returned lower-case.
 * Keys are sealed with envelope encryption (`app.security.kms`) bound to (user_id, agent_address) before they
-  ever reach the DB. Only the executor can open them; `open_agent_key` returns a bytearray which the caller
-  must `zeroize()` as soon as the order is signed (use `opened_agent_key` context manager).
+  ever reach the DB. Generation + sealing run ONLY in the executor (`app.execution.trust_jobs.generate_agents`):
+  `kms.make_encryptor` refuses any other service role, the api SA has no KMS role on agent-keys, and the api DB role
+  cannot write agent_keys.agent_address / key_ciphertext. The api only inserts an agent REQUEST row. (Before 0016 the
+  api generated + sealed keys with an encrypt-only role; a compromised api could therefore plant a key it knew.)
+* `open_agent_key` returns a bytearray which the caller must `zeroize()` as soon as the order is signed (use the
+  `opened_agent_key` context manager).
 * Nothing in this module logs key material, and every holder's __repr__ hides it.
 """
 from __future__ import annotations
@@ -104,7 +108,8 @@ def seal_agent_key(priv: bytes | bytearray, encryptor: EnvelopeEncryptor, *, use
 
 
 def generate_sealed_agent_key(encryptor: EnvelopeEncryptor, *, user_id: str) -> SealedKey:
-    """Generate + seal without exposing the plaintext key to the caller (API path for POST /agents)."""
+    """Generate + seal without exposing the plaintext key to the caller (executor keygen job; the encryptor comes from
+    ``kms.make_encryptor``, which only the executor role can build)."""
     while True:
         buf = bytearray(secrets.token_bytes(32))
         if 1 <= int.from_bytes(buf, "big") < SECP256K1_N:

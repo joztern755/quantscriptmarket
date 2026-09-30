@@ -164,6 +164,7 @@ class SettlementReport:
     renewals_charged_micro: int = 0
     renewals_failed: int = 0
     renewals_skipped_stale: int = 0            # M8: cancelled / paused after the list was loaded
+    renewals_skipped_paused: int = 0           # 0014: strategy paused by an admin — no renewal while paused
     status_changes: list[tuple[str, str, str]] = field(default_factory=list)   # (subscription_id, from, to)
     plans_renewed: int = 0
     plans_past_due: int = 0
@@ -405,6 +406,12 @@ class Settlement:
             return
         available = -self.ledger.balance(fee_balance_account(sub.user_id))
         renewal_due = sub.current_period_end is not None and sub.current_period_end <= now
+        if renewal_due and sub.strategy_status == "paused":
+            # admin-paused strategy (0014): no renewal and no billing-status change while paused (a due renewal
+            # must never flip the subscription as if it were paid, nor push it to past_due); resumes on unpause at
+            # the pinned price, with the paused time credited back to the period (app.api.billing_ops)
+            report.renewals_skipped_paused += 1
+            return
         due = sub.price_monthly_micro if renewal_due else 0
         status, since = self.billing.next_status(status=sub.status, balance_micro=available, amount_due_micro=due,
                                                  past_due_since=sub.past_due_since, now=now)
@@ -418,7 +425,8 @@ class Settlement:
                 lock = getattr(self.repo, "lock_for_billing", None)
                 cur = lock(sub.id) if lock is not None else None
                 if lock is not None and (cur is None or cur["status"] not in BILLABLE or cur["cancelled_at"] is not None
-                                         or cur["current_period_end"] != sub.current_period_end):
+                                         or cur["current_period_end"] != sub.current_period_end
+                                         or cur.get("strategy_status") == "paused"):
                     report.renewals_skipped_stale += 1
                     log.info("renewal_skipped_stale", extra={"fields": {"subscription_id": sub.id}})
                     return

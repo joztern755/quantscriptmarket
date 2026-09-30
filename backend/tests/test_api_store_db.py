@@ -250,11 +250,21 @@ class ApiStoreDbTest(unittest.TestCase):
         self.assertEqual(s.user_for_verified_wallet(db, w), uid)
         self.assertEqual(len(s.list_wallets(db, uid)), 1)
         self.assertEqual(str(s.get_wallet(db, w)["user_id"]), uid)
-        agent = s.insert_agent(db, user_id=uid, master=w, agent_address=_addr(self.seed * 10 + 2), agent_name="aijalon",
-                               key_ciphertext=b"\x01\x02sealed", kms_key_version="v1")
-        self.assertEqual(agent["status"], "pending_approval")
+        # POST /v1/agents files a REQUEST only (migrations/0016): no address, no key material
+        agent = s.insert_agent_request(db, user_id=uid, master=w, agent_name="aijalon")
+        self.assertEqual(agent["status"], "requested")
+        self.assertIsNone(agent["agent_address"])
         self.assertNotIn("key_ciphertext", agent)
         self.assertEqual(len(s.live_agents_for_master(db, w)), 1)
+        with self.assertRaises(DbError):   # a request can never be activated by the api
+            s.set_agent_status(db, str(agent["id"]), "active", self.now)
+        # ... the EXECUTOR generates the key and writes it once (trust_jobs.generate_agents)
+        ApiRoleRunner(DB_URL, "app_executor").fetchall("""
+            UPDATE agent_keys SET agent_address = :a, key_ciphertext = :c, kms_key_version = 'v1', keygen_at = now(),
+                                  status = 'pending_approval'
+             WHERE id = CAST(:id AS uuid) RETURNING id""", {"a": _addr(self.seed * 10 + 2), "c": b"\x01\x02sealed",
+                                                            "id": str(agent["id"])})
+        self.assertEqual(s.get_agent_detail(db, str(agent["id"]), uid)["agent_address"], _addr(self.seed * 10 + 2))
         s.set_agent_status(db, str(agent["id"]), "active", self.now)
         self.assertIsNotNone(s.active_agent_for_master(db, uid, w))
         self.assertEqual(s.get_agent(db, str(agent["id"]), uid, for_update=True)["status"], "active")

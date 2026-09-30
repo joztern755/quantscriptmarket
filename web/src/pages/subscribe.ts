@@ -5,14 +5,15 @@
 // Progress is kept per user+strategy in localStorage (no secrets: addresses and server ids only) and every
 // on-chain/server step is re-checkable, so the wizard can be resumed after a reload or a top-up.
 import type { PageContext } from "../core/router.js";
-import { h, mount, skeleton, errorState, emptyState, note, kv, button, toast, checkbox, field, badge, confirmDialog, type Child } from "../core/ui.js";
+import { h, mount, skeleton, errorState, emptyState, note, kv, button, toast, checkbox, field, badge, confirmDialog, spinner, type Child } from "../core/ui.js";
 import { api, publicConfig, newIdempotencyKey, type PublicConfig } from "../core/api.js";
 import { storage } from "../core/state.js";
 import { ensureMfaEnrolled } from "../core/auth.js";
 import { subscribeGate, feeSummary } from "../core/gate.js";
 import { connectWallet, getConnectedWallet, proveOwnership, type Wallet } from "../core/wallet.js";
-import { approveAgent, approveBuilderFee, hlInfo, type AgentAttestationProof } from "../core/hl.js";
+import { approveAgent, approveBuilderFee, hlInfo } from "../core/hl.js";
 import { verifyAgentAttestation } from "../core/attest.js";
+import { waitForAgentReady, type AgentDetail } from "../core/agentprep.js";
 import { addressCheck } from "../core/addr.js";
 import { trustAnchors } from "../core/config.js";
 import { fmtUsd, fmtBps, fmtTenthsBp, shortAddr, microToDecimal } from "../core/format.js";
@@ -29,15 +30,6 @@ function errReason(err: unknown): string {
 
 export const title = "Subscribe";
 
-/** GET /v1/agents/{id}/attestation (backend app/api/routers/trust.py). */
-interface AgentAttestationOut {
-  agent_id: string;
-  user_id: string;
-  agent_address: string;
-  status: string;
-  attestation: { signature_b64: string; key_version: string; attested_at: string } | null;
-}
-
 interface WizState {
   v: 1;
   savedAt: number;
@@ -45,8 +37,10 @@ interface WizState {
   master?: string;
   trading?: string;
   tradingLabel?: string;
+  /** POST /v1/agents request id; agentAddress is set only once the executor generated + attested the key */
   agentId?: string;
   agentAddress?: string;
+  /** legacy (pre-0016 saved state); ignored — ApproveAgent is always built locally */
   agentTypedData?: unknown;
   /** executor attestation of agentAddress (base64 signature), bound to agentId */
   agentAttestation?: { agentId: string; sig: string };
@@ -108,6 +102,10 @@ class Wizard {
   private balanceErr: unknown = null;
   private balanceOk = false;
   private tradingAccounts: { address: string; label: string; value: number }[] | null = null;
+  /** GET /v1/agents/{id} polling in progress (executor generating + attesting the agent key) */
+  private preparing: Promise<boolean> | null = null;
+  /** agent id whose polling was auto-started on draw (once per page load; afterwards only on a button press) */
+  private autoPrepared = "";
   /** Lowest Hyperliquid max leverage across the strategy's markets (undefined = loading, null = unknown). */
   private marketMaxLev: number | null | undefined = undefined;
   private box = h("div", { class: "wizard" });
@@ -230,7 +228,7 @@ class Wizard {
       case 3:
         return st.trading ? `${st.tradingLabel ?? "Account"} · ${shortAddr(st.trading)}` : "";
       case 4:
-        return st.agentDone ? `Agent ${shortAddr(st.agentAddress ?? "")} active` : st.agentId ? "Waiting for approval" : "";
+        return st.agentDone ? `Agent ${shortAddr(st.agentAddress ?? "")} active` : st.agentId && !st.agentAddress ? "Preparing your agent…" : st.agentId ? "Waiting for approval" : "";
       case 5:
         return st.builderDone ? `${fmtTenthsBp(this.cfg.economics.builder_fee_tenths_bp)} approved` : "";
       case 6: {
@@ -532,8 +530,15 @@ class Wizard {
 
   private stepAgent(): Child {
     const st = this.st;
+    const clearAgent = (): void => {
+      st.agentId = undefined;
+      st.agentAddress = undefined;
+      st.agentTypedData = undefined;
+      st.agentAttestation = undefined;
+      this.save();
+    };
     const confirm = async (): Promise<void> => {
-      if (!st.agentId) return;
+      if (!st.agentId || !st.agentAddress) return;
       this.say("Checking Hyperliquid for your approval…");
       try {
         await api.post<AgentOut>(`/agents/${encodeURIComponent(st.agentId)}/confirm`, {}, { signal: this.ctx.signal });
@@ -541,11 +546,7 @@ class Wizard {
         const c = errCode(err);
         if (c === "not_found" || c === "conflict") {
           // server discarded / replaced the pending agent — start again
-          st.agentId = undefined;
-          st.agentAddress = undefined;
-          st.agentTypedData = undefined;
-          st.agentAttestation = undefined;
-          this.save();
+          clearAgent();
           this.draw();
         }
         this.say(`Not confirmed yet: ${errMessage(err)} If you just signed, wait a few seconds and check again.`, "err");
@@ -558,8 +559,8 @@ class Wizard {
     /** One live agent per master wallet: reuse an ACTIVE one (e.g. a second strategy on a sub-account). */
     const useActive = async (): Promise<boolean> => {
       const agents = listOf<AgentOut>(await api.get<unknown>("/agents", { signal: this.ctx.signal }));
-      const active = agents.find((a) => a.status === "active" && a.master_address.toLowerCase() === st.master);
-      if (!active) return false;
+      const active = agents.find((a) => a.status === "active" && a.master_address.toLowerCase() === st.master && isAddress(a.agent_address));
+      if (!active || !active.agent_address) return false;
       st.agentId = active.id;
       st.agentAddress = active.agent_address.toLowerCase();
       st.agentDone = true;
@@ -567,32 +568,78 @@ class Wizard {
       this.next();
       return true;
     };
-    /** Executor attestation of the agent address (SECURITY H1), polled until the executor job has signed it. */
-    const attestation = async (): Promise<AgentAttestationProof | null> => {
-      const uid = String(this.ctx.me?.id ?? "").toLowerCase();
-      if (!uid) throw new Error("Your profile hasn't loaded yet. Reload the page and try again.");
+    /**
+     * The executor generates the agent key (the api only files the request, migrations/0016) and attests it; poll
+     * GET /v1/agents/{id} until the address comes with an attestation that verifies against the PINNED key.
+     * Resolves true when the agent is ready to be approved in the wallet.
+     */
+    const prepare = (): Promise<boolean> => {
+      if (this.preparing) return this.preparing;
       const agentId = st.agentId as string;
-      if (st.agentAttestation?.agentId === agentId) return { userId: uid, signatureB64: st.agentAttestation.sig };
-      const deadline = Date.now() + 180_000;
-      this.say("Waiting for aijalon's executor to attest your new agent (usually under a minute)…");
-      while (Date.now() < deadline && this.ctx.isCurrent()) {
-        const r = await api.get<AgentAttestationOut>(`/agents/${encodeURIComponent(agentId)}/attestation`, { signal: this.ctx.signal });
-        if (r.attestation?.signature_b64) {
-          if (String(r.agent_address).toLowerCase() !== st.agentAddress || String(r.user_id).toLowerCase() !== uid) {
-            throw new Error("The server returned an attestation for a different agent. Nothing was signed — please contact support.");
-          }
-          st.agentAttestation = { agentId, sig: r.attestation.signature_b64 };
-          this.save();
-          return { userId: uid, signatureB64: r.attestation.signature_b64 };
+      const uid = String(this.ctx.me?.id ?? "").toLowerCase();
+      const run = async (): Promise<boolean> => {
+        if (!uid) {
+          this.say("Your profile hasn't loaded yet. Reload the page and try again.", "err");
+          return false;
         }
-        await new Promise((res) => window.setTimeout(res, 5000));
-      }
-      return null;
+        this.say("Preparing your agent… aijalon's executor is generating and attesting a dedicated trading key (usually under a minute).");
+        const res = await waitForAgentReady({
+          agentId,
+          userId: uid,
+          master: st.master,
+          isCurrent: () => this.ctx.isCurrent() && st.agentId === agentId,
+          fetchAgent: async (id) => {
+            try {
+              return await api.get<AgentDetail>(`/agents/${encodeURIComponent(id)}`, { signal: this.ctx.signal });
+            } catch (err) {
+              if (errCode(err) === "not_found") return null;
+              throw err;
+            }
+          },
+        });
+        if (!this.ctx.isCurrent() || st.agentId !== agentId) return false;
+        switch (res.kind) {
+          case "ready":
+            st.agentAddress = res.agentAddress;
+            st.agentAttestation = { agentId, sig: res.signatureB64 };
+            this.save();
+            this.say("Your agent is ready and attested by aijalon's executor. Approve it in your wallet.", "ok");
+            return true;
+          case "timeout":
+            this.say("Your agent is still being prepared. Keep this page open, or press the button again in a minute.", "err");
+            return false;
+          case "failed":
+            clearAgent();
+            this.say("aijalon could not prepare this agent (our team has been alerted). Nothing was signed — please try again later.", "err");
+            return false;
+          case "gone":
+            clearAgent();
+            this.say("This agent request was replaced or withdrawn. Press the button to create a new one.", "err");
+            return false;
+          case "invalid":
+            clearAgent();
+            this.say(`Signing refused: ${res.reason}. Nothing was signed — please contact support.`, "err");
+            return false;
+          default:
+            return false;
+        }
+      };
+      this.preparing = run()
+        .catch((err: unknown) => {
+          if (!isAbortError(err)) this.say(`Could not check your agent: ${errMessage(err)}`, "err");
+          return false;
+        })
+        .finally(() => {
+          this.preparing = null;
+          if (this.ctx.isCurrent()) this.draw();
+        });
+      if (this.ctx.isCurrent()) this.draw();
+      return this.preparing;
     };
     const sign = async (): Promise<void> => {
       const w = await this.requireWallet();
       if (!w) return;
-      if (!st.agentId || !st.agentAddress) {
+      if (!st.agentId) {
         if (await useActive()) return;
         let res: AgentCreateOut;
         try {
@@ -601,23 +648,23 @@ class Wizard {
           if (errCode(err) === "conflict" && (await useActive())) return;
           throw err;
         }
-        const id = res.agent?.id ?? "";
-        const addr = String(res.agent?.agent_address ?? "").toLowerCase();
-        if (!id || !isAddress(addr)) throw new Error("The server returned an invalid agent. Please try again.");
+        const id = String(res.agent?.id ?? "");
+        if (!/^[0-9a-f-]{36}$/i.test(id)) throw new Error("The server returned an invalid agent. Please try again.");
+        // the address (if any) is NOT taken from this response: only GET /agents/{id} with a valid attestation counts
         st.agentId = id;
-        st.agentAddress = addr;
-        st.agentTypedData = res.approve_agent?.typed_data;
+        st.agentAddress = undefined;
+        st.agentTypedData = undefined;
         st.agentAttestation = undefined;
         this.save();
-        this.draw();
       }
-      const att = await attestation();
-      if (!att) {
-        this.say("Your agent is not attested yet. Wait a minute, then press the button again.", "err");
-        return;
+      if (!st.agentAddress || st.agentAttestation?.agentId !== st.agentId) {
+        st.agentAddress = undefined;
+        if (!(await prepare())) return;
       }
+      const uid = String(this.ctx.me?.id ?? "").toLowerCase();
       const agentAddress = st.agentAddress as string;
-      if (!(await verifyAgentAttestation({ userId: att.userId, agentAddress, signatureB64: att.signatureB64 }))) {
+      const att = st.agentAttestation ? { userId: uid, signatureB64: st.agentAttestation.sig } : null;
+      if (!att || !(await verifyAgentAttestation({ userId: att.userId, agentAddress, signatureB64: att.signatureB64 }))) {
         st.agentAttestation = undefined;
         this.save();
         this.say("Signing refused: this agent address does not carry a valid aijalon attestation. Nothing was signed — please contact support.", "err");
@@ -628,7 +675,7 @@ class Wizard {
         message: h(
           "div",
           { class: "stack" },
-          h("p", null, "Your wallet will ask you to approve an agent named ", h("b", null, this.cfg.agent_name), ". Verified: this address is attested by aijalon's executor (signature checked in your browser)."),
+          h("p", null, "Your wallet will ask you to approve an agent named ", h("b", null, this.cfg.agent_name), ". Verified: this key was generated and attested by aijalon's executor (signature checked in your browser)."),
           addressCheck(agentAddress, { label: "Agent address — compare with your wallet's approval screen" }),
           note("An agent can trade but can never withdraw or transfer your funds.", "info"),
         ),
@@ -636,29 +683,39 @@ class Wizard {
       });
       if (!ok) return;
       this.say("Check your wallet: approve the agent (Hyperliquid ApproveAgent)…");
-      const r = await approveAgent(w, { agentAddress, serverTypedData: st.agentTypedData, attestation: att });
+      const r = await approveAgent(w, { agentAddress, attestation: att });
       if (!r.ok) {
         this.say(`Hyperliquid rejected the approval: ${r.error ?? "unknown error"}`, "err");
         return;
       }
       await confirm();
     };
+    // resumed wizard (reload / another visit): keep polling a request the executor has not served yet
+    const waiting = !!st.agentId && !st.agentAddress;
+    if (waiting && !this.preparing && this.autoPrepared !== st.agentId) {
+      this.autoPrepared = st.agentId as string;
+      queueMicrotask(() => void prepare());
+    }
+    const ready = !!st.agentAddress && st.agentAttestation?.agentId === st.agentId;
     return [
       h(
         "p",
         null,
-        "We create a dedicated agent wallet for you. You approve it with your wallet on Hyperliquid. ",
+        "aijalon's executor creates a dedicated agent wallet for you. You approve it with your wallet on Hyperliquid. ",
         h("b", null, "An agent can place and cancel orders but can never withdraw or transfer your funds."),
         " You can revoke it any time in Hyperliquid's API settings (all strategy trading stops).",
       ),
-      st.agentAddress ? kv([["Agent name", this.cfg.agent_name], ["Attested by aijalon", st.agentAttestation?.agentId === st.agentId ? "yes (verified before signing)" : "checked before signing"]]) : null,
-      st.agentAddress ? addressCheck(st.agentAddress, { label: "Agent address" }) : null,
+      waiting
+        ? h("div", { class: "row", "data-agent": "preparing" }, this.preparing ? spinner("Preparing your agent") : null, h("span", null, "Preparing your agent… (usually under a minute)"))
+        : null,
+      st.agentAddress ? kv([["Agent name", this.cfg.agent_name], ["Attested by aijalon", ready ? "yes (verified in your browser)" : "checked before signing"]]) : null,
+      st.agentAddress ? h("div", { "data-agent": "ready" }, addressCheck(st.agentAddress, { label: "Agent address" })) : null,
       this.walletLine(),
       h(
         "div",
         { class: "btns" },
-        button(st.agentId ? "Sign approval in wallet again" : "Create agent & approve in wallet", { kind: "primary", onClick: sign }),
-        st.agentId ? button("I've approved it — check again", { onClick: confirm }) : null,
+        button(waiting ? (this.preparing ? "Waiting for your agent…" : "Check my agent again") : st.agentAddress ? "Sign approval in wallet" : "Create agent & approve in wallet", { kind: "primary", onClick: sign, disabled: waiting && !!this.preparing }),
+        st.agentAddress ? button("I've approved it — check again", { onClick: confirm }) : null,
       ),
       h("p", { class: "small muted" }, "Creating the agent needs a fresh sign-in (step-up). Your wallet signs an EIP-712 message; no gas is paid."),
     ];

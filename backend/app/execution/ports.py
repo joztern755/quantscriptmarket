@@ -220,6 +220,7 @@ class SettlementSubscription:
     created_at: datetime
     trading_address: str | None = None   # the account whose fills/funding feed this subscription's PnL
     cancelled_at: datetime | None = None
+    strategy_status: str = "listed"      # strategies.status; 'paused' (admin) → no renewal is charged (0014)
 
 
 @dataclass(frozen=True)
@@ -449,10 +450,44 @@ class SolvencyRepo(Protocol):
 
 
 class StripeClearingReader(Protocol):
-    """REVIEW_MONEY M7(c) stub: Stripe balance (available + pending, USD, from balance transactions) to reconcile
-    against the ledger's ``stripe:clearing``. Not wired until a Stripe payout posting exists (see reconcile)."""
+    """REVIEW_MONEY M7(c): Stripe balance (available + pending in the settlement currency, micro) to reconcile against
+    the ledger's ``stripe:clearing``, and the payout balance transactions reconcile books (clearing → bank)."""
 
     def clearing_balance_micro(self) -> int: ...
+
+    def payout_movements(self, since_ms: int) -> Sequence["StripePayoutMovement"]:
+        """Payout balance transactions created at/after ``since_ms`` (oldest first; bounded pages)."""
+
+
+@dataclass(frozen=True)
+class StripePayoutMovement:
+    """One Stripe balance transaction of type payout (``reversal`` False: money left the Stripe balance for the bank)
+    or payout_failure / payout_cancel (``reversal`` True: it came back). Amounts in micro-USD, positive."""
+
+    txn_id: str                     # "txn_…" (idempotency: one posting per balance transaction)
+    payout_id: str                  # "po_…"
+    created_ms: int
+    amount_micro: int               # to / from the bank
+    fee_micro: int                  # Stripe's payout fee (instant payouts), 0 otherwise
+    reversal: bool = False
+
+
+@dataclass(frozen=True)
+class BuilderClaim:
+    """Builder rewards claimed on Hyperliquid (non-funding ledger update of the claim type, REVIEW_MONEY M7(b))."""
+
+    ref: str                        # stable id for the idempotency key (tx hash + time)
+    time_ms: int
+    amount_micro: int
+
+
+class BuilderClaimsReader(Protocol):
+    """REVIEW_MONEY M7(b): builder rewards still claimable on-chain, and the claims made (into the treasury)."""
+
+    def unclaimed_builder_rewards_micro(self) -> int: ...
+
+    def builder_reward_claims(self, since_ms: int) -> Sequence[BuilderClaim]:
+        """Claims at/after ``since_ms`` on the claiming account, oldest first."""
 
 
 class LedgerReader(Protocol):

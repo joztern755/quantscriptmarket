@@ -13,15 +13,20 @@ Design (docs/SPEC.md §2, §2.1, §5.3)
   ``agent-keys`` (``settings.kms_key_name``, KMS-level AAD ``AGENT_KEY_KMS_AAD``) by ``make_encryptor`` /
   ``make_decryptor``; creator strategy code under the dedicated ``creator-code`` key
   (``settings.creator_code_kms_key_name``, KMS-level AAD ``CREATOR_CODE_KMS_AAD``) by ``make_code_encryptor`` /
-  ``make_code_decryptor``. Each key has its own IAM (api encrypt-only, executor decrypt-only), rotation and blast
-  radius; the per-class wrap AAD means a DEK wrapped for one class cannot be unwrapped as the other even if a key
-  name were misconfigured, and in dev (one local KEK) the AAD alone separates them. Creator code record AAD =
-  ``creator_code_aad(strategy_id, code_hash)`` (namespace ``aijalon/creator_code/v1``).
-* Segregation mirrors IAM (§2.1): the ``api`` service holds only ``cloudkms.cryptoKeyVersions.useToEncrypt``
-  and the ``executor`` only ``useToDecrypt``. In code, the API builds an ``EnvelopeEncryptor`` (no decrypt
-  method at all) over a wrapper constructed with ``allow_unwrap=False`` (``unwrap`` raises ``Forbidden``).
-  ``EnvelopeDecryptor`` requires a wrapper built with ``allow_unwrap=True``, and ``make_decryptor`` refuses
-  unless the process runs as the executor. IAM is the real control; the code split stops accidental use.
+  ``make_code_decryptor``. Each key has its own IAM, rotation and blast radius; the per-class wrap AAD means a DEK
+  wrapped for one class cannot be unwrapped as the other even if a key name were misconfigured, and in dev (one local
+  KEK) the AAD alone separates them. Creator code record AAD = ``creator_code_aad(strategy_id, code_hash)``
+  (namespace ``aijalon/creator_code/v1``).
+* Segregation mirrors IAM (§2.1):
+    - ``agent-keys``: the EXECUTOR only — encrypt AND decrypt (``useToEncrypt`` + ``useToDecrypt``). Agent keys are
+      GENERATED inside the executor (app.execution.trust_jobs.generate_agents, migrations/0016): the api has no role
+      on this key and no code path that generates or seals an agent key, so a compromised api cannot plant a key it
+      knows. ``make_encryptor`` and ``make_decryptor`` both refuse unless the process runs as the executor.
+    - ``creator-code``: the api ENCRYPT only (``make_code_encryptor``, creator uploads), the executor DECRYPT only
+      (``make_code_decryptor``).
+  ``EnvelopeEncryptor`` has no decrypt method at all and sits on a wrapper built with ``allow_unwrap=False``
+  (``unwrap`` raises ``Forbidden``); ``EnvelopeDecryptor`` requires a wrapper built with ``allow_unwrap=True``. IAM is
+  the real control; the code split stops accidental use.
 
 Blob format v1 (all integers big-endian)
 ----------------------------------------
@@ -433,9 +438,18 @@ def _require_decrypt_role(s: Any) -> None:
         raise Forbidden("secret decryption is only available to the executor service", service_role=role)
 
 
+def _require_agent_key_role(s: Any) -> None:
+    role = getattr(s, "service_role", None)
+    allowed = _DECRYPT_ROLES_PROD if s.is_prod else _DECRYPT_ROLES_NONPROD
+    if role not in allowed:
+        raise Forbidden("agent keys are generated and sealed only by the executor service", service_role=role)
+
+
 def make_encryptor(settings: Any = None, *, kms_client: Any = None) -> EnvelopeEncryptor:
-    """For the API (and anything that only stores secrets)."""
+    """Agent-key sealing, for the EXECUTOR ONLY (it generates agent keys; migrations/0016). Same role rule as
+    ``make_decryptor``: the api must never be able to seal an agent key (it would know the plaintext)."""
     s = _settings(settings)
+    _require_agent_key_role(s)
     return EnvelopeEncryptor(_build_wrapper(s, allow_unwrap=False, kms_client=kms_client))
 
 
@@ -447,11 +461,14 @@ def make_decryptor(settings: Any = None, *, kms_client: Any = None) -> EnvelopeD
 
 
 # ================================================================ agent attestation signer (SECURITY H1)
-# The EXECUTOR (the only role that can decrypt agent keys) proves to the browser that an agent address is really the
-# sealed key it will trade with: after opening the sealed key and re-deriving its address, it signs
-#     aijalon-agent-v1|{user_id}|{agent_address}
+# The EXECUTOR — the only role that can generate, seal and decrypt agent keys — proves to the browser that an agent
+# address is a key IT generated and will trade with: after generating the key, sealing it and re-opening the sealed
+# blob (it must re-derive the address), it signs
+#     aijalon-agent-v2|{user_id}|{agent_address}
 # with a Cloud KMS ASYMMETRIC key (EC_SIGN_P256_SHA256, HSM) on which only the executor SA holds
 # roles/cloudkms.signer. The api SA has NO role on it, so a compromised api (or edge) cannot mint attestations.
+# v2 (migrations/0016) = "generated inside the executor": v1 attestations covered api-generated keys (the api knew
+# the plaintext) and are no longer accepted by the browser. The DB refuses an attestation on a key without keygen_at.
 # The browser verifies with WebCrypto against the public key pinned in web/public/app-config.json.
 import os as _os  # noqa: E402 - additive section
 
@@ -465,7 +482,7 @@ from cryptography.hazmat.primitives.serialization import (  # noqa: E402
     load_pem_public_key as _load_pem_public_key,
 )
 
-AGENT_ATTEST_PREFIX = "aijalon-agent-v1"
+AGENT_ATTEST_PREFIX = "aijalon-agent-v2"   # v2: executor-generated keys only (0016)
 _EC_SIGN_P256_SHA256 = 12          # google.cloud.kms.CryptoKeyVersion.CryptoKeyVersionAlgorithm.EC_SIGN_P256_SHA256
 _KMS_KEY_VERSION_RE = re.compile(r"^projects/[^/]+/locations/[^/]+/keyRings/[^/]+/cryptoKeys/[^/]+/cryptoKeyVersions/\d+$")
 _ATTEST_ADDR_RE = re.compile(r"^0x[0-9a-f]{40}$")

@@ -138,7 +138,7 @@ class LocalEnvelopeTests(unittest.TestCase):
 
 class SegregationTests(unittest.TestCase):
     def test_encryptor_has_no_decrypt(self):
-        enc = make_encryptor(settings())
+        enc = make_encryptor(settings(service_role="executor"))
         for name in ("open", "decrypt", "unwrap"):
             self.assertFalse(hasattr(enc, name), name)
         with self.assertRaises(Forbidden):
@@ -154,7 +154,7 @@ class SegregationTests(unittest.TestCase):
         with self.assertRaises(Forbidden):
             make_decryptor(SimpleNamespace(env="test", is_prod=False, kms_key_name="", local_dev_kek_b64=""))
         d = make_decryptor(settings(service_role="executor"))
-        e = make_encryptor(settings())
+        e = make_encryptor(settings(service_role="executor"))
         self.assertEqual(d.open(e.seal(b"x", b"a").blob, b"a"), b"x")
         make_decryptor(settings(service_role="all"))  # single-process dev
 
@@ -165,11 +165,11 @@ class SegregationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             LocalAesKeyWrapper.from_settings(settings(**prod))
         with self.assertRaises(RuntimeError):
-            make_encryptor(settings(**prod))  # no KMS key in prod
+            make_encryptor(settings(**prod, service_role="executor"))  # no KMS key in prod
         with self.assertRaises(Forbidden):
             make_decryptor(settings(**prod, kms_key_name=KEY_NAME, service_role="all"), kms_client=FakeKms())
         fake = FakeKms()
-        enc = make_encryptor(settings(**prod, kms_key_name=KEY_NAME), kms_client=fake)
+        enc = make_encryptor(settings(**prod, kms_key_name=KEY_NAME, service_role="executor"), kms_client=fake)
         dec = make_decryptor(settings(**prod, kms_key_name=KEY_NAME, service_role="executor"), kms_client=fake)
         self.assertEqual(dec.open(enc.seal(b"k", b"a").blob, b"a"), b"k")
 
@@ -181,7 +181,19 @@ class SegregationTests(unittest.TestCase):
 
     def test_missing_dev_kek(self):
         with self.assertRaises(RuntimeError):
-            make_encryptor(settings(local_dev_kek_b64=""))
+            make_encryptor(settings(local_dev_kek_b64="", service_role="executor"))
+
+    def test_make_encryptor_role_executor_only(self):
+        """migrations/0016: agent keys are generated + sealed by the executor; the api cannot build an agent-key
+        encryptor at all (it would know the plaintext of every key it sealed)."""
+        for role in ("api", "sandbox", None, ""):
+            with self.assertRaises(Forbidden):
+                make_encryptor(settings(service_role=role))
+        with self.assertRaises(Forbidden):
+            make_encryptor(settings(env="prod", is_prod=True, kms_key_name=KEY_NAME, service_role="all"),
+                           kms_client=FakeKms())
+        make_encryptor(settings(service_role="executor"))
+        make_encryptor(settings(service_role="all"))   # single-process dev only
 
     def test_reprs_hide_material(self):
         w = LocalAesKeyWrapper(b"k" * 32, is_prod=False)

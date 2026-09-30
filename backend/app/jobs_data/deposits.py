@@ -13,6 +13,17 @@ transaction per transfer through ``app.ledger.service.post_transaction`` with id
   ``topup_held`` (+ the user's ``topup_held`` event when the sender is a known user, e.g. below the minimum).
 * bridge deposits (no sender) and odd transfers into the treasury → ops events only (not booked).
 
+Scan requests first (``deposit_scan_requests``, upserted by POST /deposits/usdc/confirm — REVIEW_AUTH_API F1): before
+the treasury window, every run serves the oldest pending requests (``served_at IS NULL``; at most
+``max_scan_requests`` users, ``MAX_WALLETS_PER_REQUEST`` verified wallets each) by reading each requested wallet's OWN
+``userNonFundingLedgerUpdates`` from the request's clamped ``since`` to now — a small window, so a user's transfer is
+credited on the next run even when the treasury cursor is behind (backlog, incomplete run). Those transfers go
+through exactly the same detection / credit / hold path (same ``usdc_hl:{hash}`` key; a hash seen in both windows is
+booked once). Every request read is charged to the shared Hyperliquid budget through the job's pacer; when the budget
+(or the run's deadline) has no room the remaining requests stay pending for the next run. A request is marked served
+(``served_at``) only after all of its transfers were booked, and only if it was not re-requested meanwhile
+(``requested_at`` unchanged). Requested-wallet transfers never move the treasury cursor forward.
+
 Every transfer is its own DB transaction; the cursor advances only past transfers that were booked, so a failure is
 retried on the next call. A credit calls ``app.alerts.delivery.on_balance_changed`` in the same transaction. Events go to ``events_outbox`` (the alerts module delivers them).
 """
@@ -33,6 +44,8 @@ SUSPENSE_ACCOUNT = "suspense:usdc_unattributed"
 TREASURY_ACCOUNT = "treasury:hl_usdc"
 LEDGER_PAGE = 500
 CREATED_BY = "system:deposits_scan"
+MAX_WALLETS_PER_REQUEST = 5
+REQUEST_MAX_PAGES = 3
 
 
 @dataclass
@@ -50,6 +63,8 @@ class DepositsReport:
     complete: bool = True
     errors: list[str] = field(default_factory=list)
     requests: int = 0
+    scan_requests_served: int = 0
+    scan_requests_deferred: int = 0
     skipped_reason: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -72,7 +87,8 @@ def _alert_to_event(conn: Any, alert: Any) -> None:
 
 def deposits_scan(db: Any, now: datetime, *, info: Any = None, settings: Any = None, max_pages: int = 10,
                   overlap_minutes: int = 60, initial_lookback_days: int = 14, max_seconds: float = 120.0,
-                  weight_per_minute: int = 600, pacer: Optional[WeightPacer] = None, rate_budget: Any = None) -> dict[str, Any]:
+                  weight_per_minute: int = 600, pacer: Optional[WeightPacer] = None, rate_budget: Any = None,
+                  max_scan_requests: int = 20) -> dict[str, Any]:
     from app.hl.deposits import detect_deposits
     from app.ledger import service as ledger
     from app.payments.usdc import credit_from_detection
@@ -93,6 +109,9 @@ def deposits_scan(db: Any, now: datetime, *, info: Any = None, settings: Any = N
     with _db.transaction(db) as conn:
         cur, _state = _db.get_cursor(conn, JOB, treasury)
     start = (cur - overlap_minutes * 60_000) if cur is not None else now_ms - initial_lookback_days * 86_400_000
+
+    # 1) priority: the wallets of users who asked (POST /deposits/usdc/confirm) — small per-wallet windows
+    requested, req_updates = _serve_requests(db, info, pacer, treasury, now_ms, max_scan_requests, report)
 
     updates: dict[tuple[Any, ...], dict] = {}
     cursor = max(0, start)
@@ -119,8 +138,21 @@ def deposits_scan(db: Any, now: datetime, *, info: Any = None, settings: Any = N
             report.complete = False
     except AppError as e:
         report.errors.append(f"fetch:{type(e).__name__}")
-        return report.as_dict()
+        if not req_updates:
+            return report.as_dict()
+        treasury_ok = False                   # still book what the requested wallets showed; cursor untouched
+    else:
+        treasury_ok = True
     items = sorted(updates.values(), key=lambda u: int(u.get("time") or 0))
+    treasury_newest = max((int(u.get("time") or 0) for u in items), default=None)
+    seen_hashes = {str(u.get("hash") or "").lower() for u in items}
+    for u in req_updates:                     # a transfer seen in both windows is booked once (treasury copy wins)
+        h = str(u.get("hash") or "").lower()
+        if h and h in seen_hashes:
+            continue
+        seen_hashes.add(h)
+        items.append(u)
+    items.sort(key=lambda u: int(u.get("time") or 0))
     report.fetched = len(items)
     scan = detect_deposits(items, treasury_address=treasury, verified_wallets=None, since_ms=None)
     report.skipped = len(scan.skipped)
@@ -176,17 +208,96 @@ def deposits_scan(db: Any, now: datetime, *, info: Any = None, settings: Any = N
                           {"reason": reason[:120], "time_ms": raw.get("time"), "hash": h[:18],
                            "type": (raw.get("delta") or {}).get("type")},
                           severity="warn", dedup_key=f"treasury_skipped:{h}:{raw.get('time')}")
-        if failed_at is not None:
-            new_cur = max(0, failed_at - 1)
-        else:
-            newest = max((int(u.get("time") or 0) for u in items), default=None)
-            new_cur = newest if newest is not None else now_ms - overlap_minutes * 60_000
-            if report.complete:
-                new_cur = max(new_cur, now_ms - overlap_minutes * 60_000)
-        _db.set_cursor(conn, JOB, treasury, new_cur, {"last_run_ms": now_ms, "booked_until_ms": booked_until,
-                                                      "complete": report.complete})
+        if failed_at is None:
+            for req in requested:             # every transfer of the request was booked → served
+                done = _db.rows(conn, """UPDATE deposit_scan_requests SET served_at = CAST(:n AS timestamptz)
+                                          WHERE user_id = CAST(:u AS uuid) AND served_at IS NULL
+                                            AND requested_at = CAST(:r AS timestamptz) RETURNING user_id""",
+                                n=now, u=req["user_id"], r=req["requested_at"])
+                if done:
+                    report.scan_requests_served += 1
+                else:                         # re-requested while this run was reading: serve it next run
+                    report.scan_requests_deferred += 1
+        if treasury_ok:
+            if failed_at is not None:
+                new_cur = max(0, failed_at - 1)
+            else:
+                # requested-wallet transfers never move the treasury cursor (its window may be behind them)
+                new_cur = treasury_newest if treasury_newest is not None else now_ms - overlap_minutes * 60_000
+                if report.complete:
+                    new_cur = max(new_cur, now_ms - overlap_minutes * 60_000)
+            _db.set_cursor(conn, JOB, treasury, new_cur, {"last_run_ms": now_ms, "booked_until_ms": booked_until,
+                                                          "complete": report.complete})
     _db.log.info("deposits_scan_done", extra={"fields": report.as_dict()})
     return report.as_dict()
+
+
+def _serve_requests(db: Any, info: Any, pacer: WeightPacer, treasury: str, now_ms: int, limit: int,
+                    report: DepositsReport) -> tuple[list[dict], list[dict]]:
+    """Read the ledger window of every verified wallet of the oldest pending scan requests (budgeted). Returns
+    (requests fully read — to mark served once booked, their ledger updates). A request whose wallets could not all
+    be read (budget / deadline / HL error) stays pending (``scan_requests_deferred``)."""
+    if limit <= 0:
+        return [], []
+    with _db.transaction(db) as conn:
+        if _db.one(conn, "SELECT to_regclass('public.deposit_scan_requests') IS NOT NULL AS ok")["ok"] is not True:
+            return [], []                     # before 0012
+        pending = _db.rows(conn, """
+            SELECT r.user_id::text AS user_id, r.requested_at, r.since,
+                   (SELECT coalesce(array_agg(w.master_address ORDER BY w.verified_at), ARRAY[]::text[])
+                      FROM wallets w WHERE w.user_id = r.user_id AND w.verified_at IS NOT NULL) AS wallets
+              FROM deposit_scan_requests r
+             WHERE r.served_at IS NULL
+             ORDER BY r.requested_at, r.user_id
+             LIMIT CAST(:n AS integer)""", n=int(limit))
+    served: list[dict] = []
+    out: list[dict] = []
+    stop = False
+    for req in pending:
+        if stop:
+            report.scan_requests_deferred += 1
+            continue
+        since_ms = max(0, _db.now_ms(_as_dt(req["since"])))
+        wallets = [str(w).lower() for w in (req.get("wallets") or [])][:MAX_WALLETS_PER_REQUEST]
+        got: list[dict] = []
+        ok = True
+        for w in wallets:
+            if w == treasury:
+                continue
+            cursor = since_ms
+            try:
+                for _ in range(REQUEST_MAX_PAGES):
+                    est = list_weight(LEDGER_PAGE)
+                    if not pacer.can_start(est):          # shared budget / deadline: leave it for the next run
+                        ok, stop = False, True
+                        break
+                    pacer.spend(est)
+                    report.requests += 1
+                    page = info.user_non_funding_ledger_updates(w, cursor, now_ms)
+                    pacer.settle(list_weight(len(page)), est)
+                    got.extend(u for u in page if isinstance(u, dict))
+                    times = [u.get("time") for u in page if isinstance(u, dict) and isinstance(u.get("time"), int)]
+                    if len(page) < LEDGER_PAGE or not times or max(times) <= cursor:
+                        break
+                    cursor = max(times)
+            except AppError as e:
+                report.errors.append(f"request_fetch:{type(e).__name__}")
+                ok = False
+                stop = True                               # budget exhausted or HL failing: stop serving requests
+            if not ok:
+                break
+        if ok:
+            served.append(req)
+            out.extend(got)
+        else:
+            report.scan_requests_deferred += 1
+    return served, out
+
+
+def _as_dt(v: Any) -> datetime:
+    if isinstance(v, datetime):
+        return v
+    return datetime.fromisoformat(str(v).replace("Z", "+00:00").replace(" ", "T", 1))
 
 
 def _book_credit(conn: Any, ledger: Any, instr: Any, report: DepositsReport) -> None:

@@ -49,7 +49,7 @@ def _csp_module():
 class AttestationUnitTest(unittest.TestCase):
     def test_message_format(self) -> None:
         self.assertEqual(kms.agent_attestation_message(USER.upper(), ADDR.upper().replace("0X", "0x")),
-                         f"aijalon-agent-v1|{USER}|{ADDR}".encode())
+                         f"aijalon-agent-v2|{USER}|{ADDR}".encode())
         for bad in (("not-a-uuid", ADDR), (USER, "0x12")):
             with self.assertRaises(ValueError):
                 kms.agent_attestation_message(*bad)
@@ -164,10 +164,12 @@ class WebInfraDbTest(unittest.TestCase):
                                    {"f": f"fb{n}", "e": f"u{n}@x.io"})[0]["id"]
 
     def agent(self, uid: str, master: str, *, sealed_for: str | None = None, status: str = "pending_approval") -> tuple[str, str]:
+        """Fixture row as the executor's keygen leaves it (keygen_at set; migrations/0016)."""
         sk = generate_sealed_agent_key(self.enc, user_id=sealed_for or uid)
         aid = self.admin.fetchall("""
-            INSERT INTO agent_keys (user_id, master_address, agent_address, key_ciphertext, kms_key_version, status)
-            VALUES (CAST(:u AS uuid), :m, :a, :c, :v, CAST(:s AS agent_key_status)) RETURNING id::text AS id""",
+            INSERT INTO agent_keys (user_id, master_address, agent_address, key_ciphertext, kms_key_version, status,
+                                    keygen_at)
+            VALUES (CAST(:u AS uuid), :m, :a, :c, :v, CAST(:s AS agent_key_status), now()) RETURNING id::text AS id""",
                                   {"u": uid, "m": master, "a": sk.address, "c": sk.ciphertext, "v": sk.key_version,
                                    "s": status})[0]["id"]
         return aid, sk.address
@@ -207,7 +209,7 @@ class WebInfraDbTest(unittest.TestCase):
 
         uid = self.user()
         master = _harness._addr(int(self.tag, 16) + 3)
-        # the api may INSERT agent rows but never with an attestation
+        # the api may INSERT agent REQUESTS only: never key material, never an attestation (0013 + 0016)
         sk = generate_sealed_agent_key(self.enc, user_id=uid)
         with self.assertRaises((AppDbError, _harness.DbError)):
             self.api.fetchall("""INSERT INTO agent_keys (user_id, master_address, agent_address, key_ciphertext,

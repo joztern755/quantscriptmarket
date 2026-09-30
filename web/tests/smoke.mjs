@@ -778,6 +778,68 @@ for (const vp of VIEWPORTS) {
   }
 }
 
+// Subscribe wizard, agent step (migrations/0016 — executor keygen): a resumed request is polled via GET /v1/agents/{id}
+// ("Preparing your agent…") until the executor's attestation arrives; the address is shown only once the attestation
+// verifies against the key PINNED in app-config.json. A second run serves a forged (unattested) address: refused.
+{
+  const { generateKeyPairSync, sign: nodeSign } = await import("node:crypto");
+  const kp = generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const spki = kp.publicKey.export({ type: "spki", format: "der" }).toString("base64");
+  const appConfig = { ...SIGNED_IN_APP_CONFIG, trust: { ...SIGNED_IN_APP_CONFIG.trust, agentAttestPublicKeySpki: spki } };
+  const AGENT_ID = "0f0e0d0c-0b0a-4908-8706-050403020100";
+  const MASTER = "0x5555555555555555555555555555555555555555";
+  const AGENT_ADDR = "0x7777777777777777777777777777777777777777";
+  const attest = (addr) => nodeSign("sha256", Buffer.from(`aijalon-agent-v2|${ME.id}|${addr}`), { key: kp.privateKey, dsaEncoding: "der" }).toString("base64");
+  for (const mode of ["attested", "forged"]) {
+    const tag = `agent step (${mode})`;
+    let polls = 0;
+    const unknown = [];
+    const api = (req, u) => {
+      const m = req.method();
+      const p = u.pathname;
+      if (m === "GET" && p === "/v1/me") return { body: ME };
+      if (m === "POST" && p === "/v1/consents") return { body: { required: {}, accepted: {}, missing: [], complete: true } };
+      if (m === "GET" && p === "/v1/alerts/contacts") return { body: contactsOut(true) };
+      if (m === "GET" && p === "/v1/alerts") return { body: page([]) };
+      if (m === "GET" && p === "/v1/subscriptions") return { body: page([]) };
+      if (m === "GET" && p === `/v1/agents/${AGENT_ID}`) {
+        polls++;
+        const agent = { id: AGENT_ID, master_address: MASTER, agent_address: null, agent_name: "aijalon", status: "requested", approved_at: null, created_at: "2026-09-30T00:00:00Z" };
+        if (polls < 2) return { body: { agent, user_id: ME.id, ready: false, failed: false, attestation: null } };
+        const addr = mode === "attested" ? AGENT_ADDR : "0x8888888888888888888888888888888888888888";
+        return { body: { agent: { ...agent, agent_address: addr, status: "pending_approval" }, user_id: ME.id, ready: true, failed: false, attestation: { signature_b64: attest(AGENT_ADDR), key_version: "k", attested_at: "2026-09-30T00:00:00Z" } } };
+      }
+      unknown.push(`${m} ${p}`);
+      return { status: 404, body: { error: { code: "not_found", message: "not mocked" } } };
+    };
+    const hl = (body) => (body.type === "meta" ? { universe: [{ name: "BTC", szDecimals: 5, maxLeverage: 12 }] } : null);
+    const { context, page: pg, errors } = await newPage({ width: 390, height: 844 }, "light", { appConfig, fbAuth: FB_AUTH_SIGNED_IN, api, hl });
+    await enterSite(pg);
+    await pg.evaluate((st) => localStorage.setItem("aijalon.subwiz.fb-1.btc-momo", JSON.stringify({ v: 1, savedAt: Date.now(), ...st })), { gateAccepted: true, master: MASTER, trading: MASTER, tradingLabel: "Master account", agentId: AGENT_ID });
+    await pg.goto(BASE + "#/subscribe/btc-momo", { waitUntil: "networkidle" });
+    await pg.waitForSelector("[data-agent=preparing]", { timeout: 8000 }).catch(() => undefined);
+    const during = await pg.locator("main .page").innerText().catch(() => "");
+    check(`${tag}: resumed request shows "Preparing your agent…" and no address yet`, /Preparing your agent/.test(during) && (await pg.locator("[data-agent=ready]").count()) === 0, during.slice(0, 200));
+    if (mode === "attested") {
+      await pg.waitForSelector("[data-agent=ready]", { timeout: 15000 }).catch(() => undefined);
+      const after = await pg.locator("main .page").innerText().catch(() => "");
+      check(`${tag}: address shown once the executor attestation verifies`, (await pg.locator("[data-agent=ready]").count()) === 1 && /yes \(verified in your browser\)/.test(after) && (await pg.locator("[data-agent=preparing]").count()) === 0, after.slice(0, 300));
+      const saved = await pg.evaluate(() => JSON.parse(localStorage.getItem("aijalon.subwiz.fb-1.btc-momo") || "{}"));
+      check(`${tag}: attested address + signature saved for this agent id`, saved.agentAddress === AGENT_ADDR && saved.agentAttestation?.agentId === AGENT_ID);
+      const r = await noHorizontalScroll(pg);
+      check(`${tag}: no horizontal scroll`, r.ok, JSON.stringify(r));
+    } else {
+      await pg.waitForFunction(() => /Signing refused/.test(document.body.innerText), null, { timeout: 15000 }).catch(() => undefined);
+      const after = await pg.locator("main .page").innerText().catch(() => "");
+      check(`${tag}: unattested address refused, never shown`, /Signing refused/.test(after) && (await pg.locator("[data-agent=ready]").count()) === 0 && !/0x8888/i.test(after), after.slice(0, 300));
+    }
+    check(`${tag}: polled GET /v1/agents/{id}`, polls >= 2, String(polls));
+    check(`${tag}: every API call was a mocked backend route`, unknown.length === 0, unknown.join(", "));
+    check(`${tag}: no console errors`, errors.length === 0, errors.slice(0, 5).join(" | "));
+    await context.close();
+  }
+}
+
 await browser.close();
 server.close();
 console.log(results.join("\n"));

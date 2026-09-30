@@ -107,9 +107,10 @@ refuses any hash ≠ `legal_doc_hashes[doc]` of the current version.
 |---|---|---|---|---|---|
 | POST `/wallets/nonce` | consent | (no body) | `{nonce, expires_at}` | 429 | core wallet.proveOwnership |
 | POST `/wallets/verify` | step-up | `{address, message (EIP-4361), signature}` | `WalletOut {address, verified_at}` | 422 domain/URI/nonce/time/signature, 409 wallet linked elsewhere | wallet.proveOwnership |
-| GET `/agents` | consent | — | **array** `AgentOut[] {id, master_address, agent_address, agent_name, status, approved_at, created_at}` | — | subscribe (reuse active agent) |
-| POST `/agents` | step-up | `{master_address, signature_chain_id ("0x…" = wallet chain), rotate?}` | 201 `{agent: AgentOut, approve_agent: {typed_data, action, nonce}, approve_builder_fee|null, exchange_url, required_builder_fee_tenths_bp}` | 403 wallet not verified · 409 active agent exists (web then reuses it) | subscribe |
-| POST `/agents/{id}/confirm` | step-up | — | `AgentOut` | 422 not on-chain yet / expiring · 409 replaced | subscribe |
+| GET `/agents` | consent | — | **array** `AgentOut[] {id, master_address, agent_address (null while requested), agent_name, status, approved_at, created_at}` | — | subscribe (reuse active agent) |
+| POST `/agents` | step-up | `{master_address, signature_chain_id ("0x…" = wallet chain), rotate?}` | 201 `{agent: AgentOut (status "requested", agent_address null), approve_agent: null, approve_builder_fee|null, exchange_url, required_builder_fee_tenths_bp}` — a key REQUEST: the executor generates, seals and attests the key (migrations/0016) | 403 wallet not verified · 409 active agent exists (web then reuses it) | subscribe |
+| GET `/agents/{id}` | consent | — | `{agent: AgentOut, user_id, ready, failed, attestation: {signature_b64, key_version, attested_at}|null}` — poll every few seconds after POST until `ready` (≈ ≤ 1 min); `failed` = the executor refused the request (create a new one) | 404 | subscribe ("preparing your agent…") |
+| POST `/agents/{id}/confirm` | step-up | — | `AgentOut` | 422 still being prepared / not on-chain yet / expiring · 409 replaced | subscribe |
 | POST `/builder-approval/confirm` | consent | `{master_address}` | `{master_address, max_fee_rate_tenths_bp, required_tenths_bp, sufficient, verified_on_chain_at}` | 403 · 502 | subscribe (checks `sufficient`) |
 
 The web never signs server typed data as received: it validates it (`hl.validateServerTypedData`) and rebuilds the
@@ -128,6 +129,10 @@ EIP-712 signer is one of the caller's **verified wallets**; approveAgent: `agent
 **pending** agents, `agentName` = its name, signer = its master; approveBuilderFee: `builder` = config builder,
 `maxFeeRate` ≤ config fee; usdSend: `destination` = config treasury, positive amount (≤ 6 dp). Orders, cancels,
 withdrawals and every other type are refused. 429 rate limit · 502 Hyperliquid unreachable (nothing known to be sent).
+The forwarded `/exchange` request counts against the same per-IP Hyperliquid weight limit as the API's `/info` reads,
+so it is charged to the shared budget (`hl_rate_budget`, API egress key, low-priority pool, `HlLimits.exchange_weight`
+= 1) BEFORE it is sent; when the budget has no room within 2 s the call fails with 502 `external_service_error`
+(message "hyperliquid rate budget exhausted") and nothing was sent — the web shows "busy, retry in a minute".
 
 ## Subscriptions (SPEC §12 cancel flow)
 
@@ -151,10 +156,10 @@ Dashboard cancel = "Cancel…" → modal with the two core buttons "Close positi
 | GET `/deposits` | consent | `?limit&cursor` | `Page<DepositOut>` | — | — |
 | POST `/deposits/stripe` 🔑 | consent | `{amount_micro}` (≥ min top-up) | 201 `{payment_intent_id, client_secret, amount_micro (estimated credit)}` | 422 below min | dashboard (Stripe Payment Element) |
 | POST `/deposits/usdc/typed-data` | consent | `{amount_micro, from_address (verified), signature_chain_id}` | `{from_address, destination (= config treasury), amount_micro, time_ms, payload{typed_data, action, nonce}, exchange_url}` | 403 wallet | dashboard (checks destination = config treasury) |
-| POST `/deposits/usdc/confirm` 🔑 | consent | `{from_address?, time_ms?}` (web sends the signed usdSend time) | `{credited: DepositOut[], fee_balance_micro}` | 403 | dashboard |
+| POST `/deposits/usdc/confirm` 🔑 | consent | `{from_address?, time_ms?}` (web sends the signed usdSend time) | `{credited: DepositOut[], fee_balance_micro}` — makes NO Hyperliquid call: it records a scan request (lookback clamped to max(now − 48 h, wallet verification)) and returns what is already credited. The next deposits-scan run (≤ 5 min) reads the caller's verified wallets' own ledger windows FIRST (priority, shared HL budget), credits the transfer and marks the request served; the web polls `GET /deposits` / `GET /balance` | 403 | dashboard |
 | GET `/withdrawals` | consent | `?limit&cursor` | `Page<PayoutOut>` (both kinds) | — | — |
 | POST `/withdrawals` 🔑 | step-up | `{amount_micro, to_address (verified wallet)}` | 201 `PayoutOut {id, kind, amount_micro, to_address, status, tx_hash, created_at}` | 402 (details.withdrawable_micro — USDC-funded UNSPENT money only) · 402 accrued profit share / reserve (details `accrued_profit_share_micro`, `reserve_micro`, `max_withdrawal_micro`) · 409 reason `subscription_past_due` · 403 reasons `payout_address_hold` / `security_hold` (details `until`), `payouts_disabled`, not verified · 422 below min | dashboard |
-| POST `/payouts` 🔑 | step-up | `{amount_micro, source: "creator"\|"referrer", to_address}` | 201 `PayoutOut` | 402 (details `available_micro`, `held_card_funded_micro`) · 403 `kyc_required` / `payouts_disabled` / `payout_address_hold` / `security_hold` | creator earnings, referrals (**new UI**) |
+| POST `/payouts` 🔑 | step-up | `{amount_micro, source: "creator"\|"referrer", to_address}` | 201 `PayoutOut` | 402 (details `available_micro`, `held_card_funded_micro`) · 403 `kyc_required` (**creator AND referrer**: KYC must be `approved`; details `kyc_status`) / `payouts_disabled` / `payout_address_hold` / `security_hold` | creator earnings, referrals (**new UI**) |
 
 Stripe fee (SPEC §1, owner): passed to the user. UI estimate = `ceil(amount × stripe_fee_estimate_bps / 10000) + stripe_fee_estimate_fixed_micro`; the webhook credits amount − actual fee.
 
@@ -169,7 +174,8 @@ Stripe fee (SPEC §1, owner): passed to the user. UI estimate = `ceil(amount × 
 | POST `/reviews` | consent | `{strategy_id, rating 1–5, body?}` | 201 `ReviewOut {id, rating, body, author, created_at}` (403 < 30 days **actually subscribed** — cancelled subscriptions count only until they ended; details `subscribed_days`) | strategy |
 | GET `/posts/{id}` | consent | — | `PostOut {id, title, price_micro, strategy_slug, published_at, body|null, purchased}` | posts (signed in) |
 | POST `/posts/{id}/purchase` 🔑 | **step-up** | — | 201 `{post_id, charged_micro, fee_balance_micro}` (402; 403 needs Pro/Max; 409 free/own; 409 reason `post_price_above_cap`) | posts |
-| GET `/referrals` | consent | — | `{code, link, tier, share_of_pool_bps, active_referred_users_30d, referred_notional_30d_micro, referred_users_total, earnings_payable_micro, earnings_total_micro, next_tier|null}` | referrals |
+| GET `/referrals` | consent | — | `{code, link, tier, share_of_pool_bps, active_referred_users_30d, referred_notional_30d_micro, referred_users_total, earnings_payable_micro, earnings_total_micro, next_tier|null, kyc_status, payout_kyc_required}` — **new**: `kyc_status` = `none` \| `pending` \| `provider_approved` (passed the provider, awaiting our admin) \| `approved` \| `rejected`; `payout_kyc_required` = true. The referrals page shows "Verify identity to withdraw referral earnings" unless `approved`, and disables the payout button | referrals |
+| POST `/referrals/kyc/session` | consent (5/h) | — | `{url ("" when manual), provider, status, manual}` | referrals ("Verify identity"; manual → "reviewed by our team" notice). Same per-user KYC record and the same ONE-admin decision (`POST /admin/users/{id}/kyc`) as creator KYC — a user verified once (as creator or referrer) is verified for both. 409 approved · 409 reason `awaiting_admin` |
 
 User alert kinds in `GET /alerts` (catalog `app/alerts/prefs.py`, payloads `app/alerts/user_templates.py`; Telegram +
 email delivery by the worker per the email policy) now produced by the backend: `withdrawal_requested` (POST
@@ -177,7 +183,9 @@ email delivery by the worker per the email policy) now produced by the backend: 
 and `mfa_changed` (sign-in), `builder_approval_missing` {master, approved_tenths_bp, required_tenths_bp, where}
 (subscribe refusal, builder confirm, agent confirm, daily scan), `profit_share_charged` {amount_micro, profit_micro,
 rate_bps, strategy, period_start, period_end}, `subscription_renewed`, `balance_low` / `balance_empty` (every
-fee-balance posting incl. settlement and USDC scans), `kyc_status` {status}.
+fee-balance posting incl. settlement and USDC scans), `kyc_status` {status}, `strategy_paused` {strategy, strategy_id,
+subscription_id, reason: `admin_pause`} (**mandatory**, every live subscriber when an admin pauses the strategy),
+`strategy_resumed` {strategy, strategy_id, subscription_id, period_end} (unpause).
 
 ## Creator Studio (feature flag + creator agreement consent → role creator)
 
@@ -212,7 +220,7 @@ No-code spec = exactly `backend/app/sandbox/nocode.py` (SPEC §10): `{version: 1
 | GET `/admin/changes` | `?status=pending\|approved\|rejected\|cancelled` | `Page<ChangeOut {id, kind, target, payload, reason, status, maker_admin, checker_admin, created_at, decided_at}>` | Approvals tab (**new UI**) |
 | POST `/admin/changes/{id}/approve` \| `/reject` | `{reason}` | `AdminActionOut` | strategy_list / strategy_price / user_unsuspend / **user_suspend** (KYC no longer uses the queue; a legacy `kyc_approve` entry can only be rejected). Approval re-validates the CURRENT state: 409 reason `stale_change` (strategy delisted / back to draft, price or user status changed) or `terms_changed` (price / profit share / owner differ from the terms pinned in the proposal) |
 | GET `/admin/payouts` | `?kind=withdrawal\|payout&status=` | `Page<AdminPayoutOut {id, kind, beneficiary, amount_micro, to_address, status, maker_admin, checker_admin, tx_hash, created_at, send_issued_at, to_address_verified_at, wallet_age_hours, security_hold_until, hold_reasons[], recent_security_events[{action, at}]}>` | web loads both kinds; the context fields (open requests only) must be shown to the approving admins; read is audit-logged |
-| POST `/admin/payouts/{kind}/{id}/approve` | — | `AdminPayoutOut` | 1st then 2nd (different) admin; the 2nd approval is refused (409, reason `payout_address_hold` \| `security_hold`) while a hold applies |
+| POST `/admin/payouts/{kind}/{id}/approve` | — | `AdminPayoutOut` | 1st then 2nd (different) admin; the 2nd approval is refused (409, reason `payout_address_hold` \| `security_hold`) while a hold applies; `kind=payout` (creator / referrer earnings) is refused at either step with 409 reason `kyc_required` (details `kyc_status`) unless the beneficiary's KYC is `approved` |
 | POST `/admin/payouts/{kind}/{id}/reject` | `{reason}` | `AdminPayoutOut` | releases hold; **409 reason `send_in_progress`** for 72 h after typed data was issued (the signed usdSend could still execute) |
 | POST `/admin/payouts/{kind}/{id}/typed-data` | `{signature_chain_id}` | `{payout, payload{typed_data, action, nonce}, exchange_url}` | issued ONCE: the nonce is pinned on the first call and every later call returns the same payload. Web **refuses unless the connected wallet = config `treasury_address`**, validates destination/amount |
 | POST `/admin/payouts/{kind}/{id}/sent` | `{tx_hash, time_ms}` | `AdminPayoutOut` | web finds the hash in the treasury's `userNonFundingLedgerUpdates` (or asks); server verifies on-chain |
@@ -225,11 +233,11 @@ No-code spec = exactly `backend/app/sandbox/nocode.py` (SPEC §10): `{version: 1
 | POST `/admin/held-deposits/releases/{id}/sent` | **Idempotency-Key**; `{tx_hash, time_ms}` | `SuspenseReleaseOut` (`sent`) | server verifies on-chain (treasury → sender, hash, exact amount; 422 not found yet), 409 hash already recorded (withdrawals/payouts/refunds); ledger `suspense_refund:{hash}:sent` refunds:usdc_pending → treasury:hl_usdc |
 | GET `/admin/strategies` | `?status=review\|listed\|paused\|draft\|delisted` | `Page<AdminStrategyOut {…, owner_user_id, owner_kyc_status, versions: CreatorVersionOut[] (5)}>` | |
 | POST `/admin/strategies/{id}/list` | `{version_id, reason}` | pending change | approval checks price set, creator KYC, **≥ risk.min_listing_history_days (180)** (was a hard-coded 365) |
-| POST `/admin/strategies/{id}/pause` \| `/delist` \| `/reject` | `{reason}` | applied | |
+| POST `/admin/strategies/{id}/pause` \| `/delist` \| `/reject` | `{reason}` | applied | **pause** (from `listed`): no new subscriptions and no user resume (both need `listed`), no renewal charged while paused (billing status untouched), the executor opens nothing (exits / reductions still run), every live subscriber gets the mandatory `strategy_paused` alert. **Unpause** = `POST /admin/strategies/{id}/list` approved by a second admin from `paused`: each live subscription whose paid period was still running when the pause began gets the paused time added to `current_period_end`; renewals resume at the subscription's PINNED price; subscribers get `strategy_resumed` |
 | POST `/admin/strategies/{id}/price` | `{price_monthly_micro, reason}` | pending (in-house only) | web's PATCH /admin/strategies/{id} did not exist |
 | GET `/admin/users` | `?q (≥3)` | `Page<AdminUserOut>` | prefix search on e-mail (`%`/`_` are literal); audit-logged (`admin.read.users`, query hashed) |
 | POST `/admin/users/{id}/suspend` \| `/unsuspend` | `{reason}` | applied / pending | suspending another **admin** is a pending `user_suspend` change (second admin approves) |
-| POST `/admin/users/{id}/kyc` | `{decision: approved\|rejected, reason}` | `AdminActionOut {status: "applied"}` | **ONE admin** (owner 30 Sep 2026), step-up + audit. Manual provider: pending/rejected → approved. Sumsub: only `provider_approved` (provider GREEN; never auto-approved) → approved, else 409 reason `provider_not_approved`. 403 own KYC. 409 already approved/rejected. Rejection immediate. Listing and payouts keep two admins. |
+| POST `/admin/users/{id}/kyc` | `{decision: approved\|rejected, reason}` | `AdminActionOut {status: "applied"}` | **ONE admin** (owner 30 Sep 2026), step-up + audit. One record per user: creators AND referrers (referral payouts need it too). Manual provider: pending/rejected → approved. Sumsub: only `provider_approved` (provider GREEN; never auto-approved) → approved, else 409 reason `provider_not_approved`. 403 own KYC. 409 already approved/rejected. Rejection immediate. Listing and payouts keep two admins. |
 | GET `/admin/alerts` | `?severity=&unacked=&ops_only=` | `Page<AlertOut>` | |
 | POST `/admin/alerts/{id}/ack` | — | `{ok}` | |
 | GET `/admin/reconciliation` | — | `{report: ReconcileReport.as_dict()|null, generated_at}` | report = `{positions_checked, drifts[], builder_db_micro, builder_chain_micro, builder_mismatch, treasury_ledger_micro, treasury_chain_micro, treasury_mismatch, errors[]}` |

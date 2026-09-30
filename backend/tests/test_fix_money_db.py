@@ -198,11 +198,18 @@ class MoneyFixesDbTest(unittest.TestCase):
         u, c = self.user("m5u"), self.user("m5c")
         fee, pay = f"user:{u}:fee_balance", f"creator:{c}:payable"
         ps = json.dumps([{"account": fee, "amount_micro": 5_000_000_000}, {"account": pay, "amount_micro": -5_000_000_000}])
-        # REVIEW exploit 1: app_api posts profit_share and overdraws user2 to −$5,000 → now refused (AJ403)
+        # REVIEW exploit 1: app_api posts profit_share and overdraws user2 to −$5,000 → now refused (AJ403: no rule for
+        # app_api; 0015 — the old ledger_post is owner-only, 42501)
         self.admin.fetchall("INSERT INTO ledger_accounts (code, kind, owner_user_id, non_negative) VALUES (:c, 'liability', CAST(:o AS uuid), true)",
                             {"c": fee, "o": u})
         self.assert_sqlstate("AJ403", self.api.fetchall,
+                             "SELECT created FROM ledger_post_as('app_api', :k, 'profit_share', 'x', 'api', CAST(:e AS jsonb))",
+                             {"k": f"t1b:{u}", "e": ps})
+        self.assert_sqlstate("42501", self.api.fetchall,
                              "SELECT created FROM ledger_post(:k, 'profit_share', 'x', 'api', CAST(:e AS jsonb))",
+                             {"k": f"t1b:{u}", "e": ps})
+        self.assert_sqlstate("AJ403", self.api.fetchall,        # … nor pretend to be the executor
+                             "SELECT created FROM ledger_post_as('app_executor', :k, 'profit_share', 'x', 'api', CAST(:e AS jsonb))",
                              {"k": f"t1b:{u}", "e": ps})
         # REVIEW exploit 2: app_api pre-creates the payable with non_negative=false → forced true
         self.api.fetchall("INSERT INTO ledger_accounts (code, kind, owner_user_id, non_negative) VALUES (:c, 'liability', NULL, false)",
@@ -213,7 +220,7 @@ class MoneyFixesDbTest(unittest.TestCase):
         hold = json.dumps([{"account": pay, "amount_micro": 4_000_000_000},
                            {"account": "payouts:pending", "amount_micro": -4_000_000_000}])
         self.assert_sqlstate("AJ402", self.api.fetchall,
-                             "SELECT created FROM ledger_post(:k, 'payout_hold', 'x', 'api', CAST(:e AS jsonb))",
+                             "SELECT created FROM ledger_post_as('app_api', :k, 'payout_hold', 'x', 'api', CAST(:e AS jsonb))",
                              {"k": f"ph:{c}", "e": hold})
         # a payable with the wrong owner is refused outright
         self.assert_sqlstate("AJ422", self.api.fetchall,
@@ -224,8 +231,8 @@ class MoneyFixesDbTest(unittest.TestCase):
                              "BEGIN; ALTER TABLE ledger_accounts DISABLE TRIGGER ledger_accounts_10_shape; "
                              "INSERT INTO ledger_accounts (code, kind, non_negative) VALUES ('suspense:mf_test', 'liability', false); "
                              "ROLLBACK")
-        # direct INSERT of a profit_share tx by app_api (bypassing ledger_post) → refused at COMMIT (no authorisation)
-        self.assert_sqlstate("AJ403", self.api.fetchall, f"""
+        # direct INSERT of a profit_share tx by app_api (bypassing ledger_post_as) → no INSERT privilege (0015)
+        self.assert_sqlstate("42501", self.api.fetchall, f"""
             BEGIN;
             INSERT INTO ledger_transactions (idempotency_key, kind, created_by, entries_digest)
               VALUES ('direct:{u}', 'profit_share', 't', ledger_entries_digest(ARRAY['{fee}', '{pay}'], ARRAY[7, -7]::bigint[]));
@@ -240,16 +247,16 @@ class MoneyFixesDbTest(unittest.TestCase):
         # app_executor may post profit_share (settlement) — but even it cannot credit a creator with uncollected
         # profit share (C1 enforced in the DB: the user's balance before the charge is $0)
         self.assert_sqlstate("AJ402", self.exe.fetchall,
-                             "SELECT created FROM ledger_post(:k, 'profit_share', 'x', 'exe', CAST(:e AS jsonb))",
+                             "SELECT created FROM ledger_post_as('app_executor', :k, 'profit_share', 'x', 'exe', CAST(:e AS jsonb))",
                              {"k": f"ps-c1:{u}", "e": json.dumps([{"account": fee, "amount_micro": 100},
                                                                   {"account": pay, "amount_micro": -100}])})
         self.assert_sqlstate("AJ403", self.exe.fetchall,        # nor credit anything else (e.g. a referrer payable)
-                             "SELECT created FROM ledger_post(:k, 'profit_share', 'x', 'exe', CAST(:e AS jsonb))",
+                             "SELECT created FROM ledger_post_as('app_executor', :k, 'profit_share', 'x', 'exe', CAST(:e AS jsonb))",
                              {"k": f"ps-sh:{u}", "e": json.dumps([{"account": fee, "amount_micro": 100},
                                                                   {"account": "stripe:clearing", "amount_micro": -100}])})
         self.admin.fetchall("INSERT INTO ledger_accounts (code, kind, owner_user_id) VALUES (:c, 'liability', NULL)",
                             {"c": f"ps_pending:{u}:{c}"})
-        self.assertEqual(self.exe.fetchall("SELECT created FROM ledger_post(:k, 'profit_share', 'x', 'exe', CAST(:e AS jsonb))",
+        self.assertEqual(self.exe.fetchall("SELECT created FROM ledger_post_as('app_executor', :k, 'profit_share', 'x', 'exe', CAST(:e AS jsonb))",
                                            {"k": f"ps-ok:{u}", "e": json.dumps([{"account": fee, "amount_micro": 100},
                                                                                 {"account": f"ps_pending:{u}:{c}",
                                                                                  "amount_micro": -100}])}),
@@ -257,7 +264,7 @@ class MoneyFixesDbTest(unittest.TestCase):
         self.assert_sqlstate("42501", self.exe.fetchall,        # the executor cannot forge an authorisation row
                              "INSERT INTO ledger_tx_authorizations (tx_id, kind, authorized_as) SELECT id, kind, 'x' FROM ledger_transactions LIMIT 1")
         self.assert_sqlstate("AJ403", self.exe.fetchall,
-                             "SELECT created FROM ledger_post(:k, 'ps_pending_release', 'x', 'exe', CAST(:e AS jsonb))",
+                             "SELECT created FROM ledger_post_as('app_executor', :k, 'ps_pending_release', 'x', 'exe', CAST(:e AS jsonb))",
                              {"k": f"rel:{u}", "e": json.dumps([{"account": pay, "amount_micro": 1},
                                                                 {"account": "platform:revenue:posts", "amount_micro": -1}])})
         # Stripe dispute (webhook path, app_api) goes through the SECURITY DEFINER wrapper via PostgresLedgerStore

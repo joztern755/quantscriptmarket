@@ -2,9 +2,11 @@
 
 GET /v1/agents/{agent_id}/attestation            (the owner of the agent)
     The executor's KMS attestation of the agent address (``agent_keys.attestation_*``, written only by the executor
-    job /v1/internal/attest-agents; migrations/0013). ``attestation`` is null until the job has run (≤ ~1 minute
-    after POST /v1/agents): the web client polls, verifies the signature against the public key PINNED in
-    app-config.json, and only then asks the wallet to sign ApproveAgent. The api can read but never write or forge it.
+    when it GENERATES the key — app.execution.trust_jobs.generate_agents, migrations/0013 + 0016). ``agent_address``
+    and ``attestation`` are null until the executor has served the request (≤ ~1 minute after POST /v1/agents; the
+    web client polls GET /v1/agents/{id}, which carries the same attestation). The browser verifies the signature
+    against the public key PINNED in app-config.json, and only then asks the wallet to sign ApproveAgent. The api can
+    read but never write or forge it.
 
 GET /v1/admin/payouts/{kind}/{payout_id}/wallet-proof     (admin)
     The beneficiary's latest EIP-4361 ownership proof (message + personal_sign signature) of the payout / withdrawal
@@ -45,7 +47,7 @@ class AttestationOut(Out):
 class AgentAttestationOut(Out):
     agent_id: UUID
     user_id: UUID
-    agent_address: str
+    agent_address: Optional[str] = None
     status: str
     attestation: Optional[AttestationOut] = None
 
@@ -72,10 +74,11 @@ def agent_attestation(agent_id: UUID, ctx: AuthCtx = Depends(consented_user),
         raise NotFound("agent not found")
     r = rows[0]
     att = None
-    if r.get("attestation_sig") and r.get("attested_at"):
+    addr = r.get("agent_address")
+    if r.get("attestation_sig") and r.get("attested_at") and addr:
         att = AttestationOut(signature_b64=str(r["attestation_sig"]), key_version=str(r["attestation_key_version"]),
                              attested_at=r["attested_at"])
-    return AgentAttestationOut(agent_id=r["id"], user_id=r["user_id"], agent_address=str(r["agent_address"]).lower(),
+    return AgentAttestationOut(agent_id=r["id"], user_id=r["user_id"], agent_address=str(addr).lower() if addr else None,
                                status=str(r["status"]), attestation=att)
 
 

@@ -123,8 +123,9 @@ SQL
 
 # ------------------------------------------------------------------------------------------------ seed
 echo "-- seed"
-# 0003 seeds the 8 SPEC §4 platform accounts; 0006 adds suspense:usdc_unattributed, 0009 refunds:usdc_pending.
-expect_eq "platform ledger accounts seeded (exact set)" "builder:hl_receivable:asset:false,platform:revenue:builder:revenue:false,platform:revenue:plans:revenue:false,platform:revenue:posts:revenue:false,platform:revenue:profit_share:revenue:false,platform:revenue:subscription:revenue:false,refunds:usdc_pending:liability:true,stripe:clearing:asset:false,suspense:usdc_unattributed:liability:true,treasury:hl_usdc:asset:false" <<SQL
+# 0003 seeds the 8 SPEC §4 platform accounts; 0006 adds suspense:usdc_unattributed, 0009 refunds:usdc_pending,
+# 0015 bank:payouts + expense:stripe_fees (Stripe payouts, REVIEW_MONEY M7(c)).
+expect_eq "platform ledger accounts seeded (exact set)" "bank:payouts:asset:false,builder:hl_receivable:asset:false,expense:stripe_fees:expense:false,platform:revenue:builder:revenue:false,platform:revenue:plans:revenue:false,platform:revenue:posts:revenue:false,platform:revenue:profit_share:revenue:false,platform:revenue:subscription:revenue:false,refunds:usdc_pending:liability:true,stripe:clearing:asset:false,suspense:usdc_unattributed:liability:true,treasury:hl_usdc:asset:false" <<SQL
 SELECT string_agg(code || ':' || kind || ':' || non_negative::text, ',' ORDER BY code)
   FROM ledger_accounts WHERE owner_user_id IS NULL;
 SQL
@@ -405,7 +406,56 @@ expect_err "app_api: DELETE ledger_entries -> 42501" 42501 "$DB" "$API_USER" <<<
 expect_err "app_api: DELETE audit_log -> 42501" 42501 "$DB" "$API_USER" <<<"DELETE FROM audit_log;"
 expect_err "app_api: UPDATE consents -> 42501" 42501 "$DB" "$API_USER" <<<"UPDATE consents SET doc_version = 'x';"
 expect_err "app_api: TRUNCATE ledger_entries -> 42501" 42501 "$DB" "$API_USER" <<<"TRUNCATE ledger_entries;"
-expect_eq "app_api: can post via ledger_post" "t" "$DB" "$API_USER" <<<"$(post api:1 deposit '[{"account":"treasury:hl_usdc","amount_micro":1000000},{"account":"'$FEE1'","amount_micro":-1000000}]')"
+# 0015 (REVIEW_MONEY M5): the app roles post ONLY through ledger_post_as(role, …) and only what ledger_posting_rules
+# allows for that role; no INSERT on the ledger tables, no ledger_post / ledger_post_core.
+post_as() { # role key kind entries-json
+    printf "SELECT created FROM ledger_post_as('%s', '%s', '%s', 'test', 'tests', '%s'::jsonb);\n" "$1" "$2" "$3" "$4"
+}
+USDC1='[{"account":"treasury:hl_usdc","amount_micro":1000000},{"account":"'$FEE1'","amount_micro":-1000000}]'
+expect_err "app_api: ledger_post (owner only) -> 42501" 42501 "$DB" "$API_USER" <<<"$(post api:1 deposit "$USDC1")"
+expect_err "app_api: ledger_post_core -> 42501" 42501 "$DB" "$API_USER" <<SQL
+SELECT created FROM ledger_post_core('app_api', 'api:core', 'deposit', 'x', 't', '$USDC1'::jsonb);
+SQL
+expect_eq "app_api: can post a USDC deposit via ledger_post_as" "t" "$DB" "$API_USER" <<<"$(post_as app_api api:1 deposit "$USDC1")"
+expect_eq "app_api: replay is idempotent (created=false)" "f" "$DB" "$API_USER" <<<"$(post_as app_api api:1 deposit "$USDC1")"
+expect_eq "…authorisation recorded (role, login, rule)" "app_api|${API_USER}|112" <<SQL
+SELECT z.authorized_as || '|' || z.invoker || '|' || z.rule_id FROM ledger_tx_authorizations z
+  JOIN ledger_transactions t ON t.id = z.tx_id WHERE t.idempotency_key = 'api:1';
+SQL
+expect_err "app_api: cannot post as app_executor -> AJ403" AJ403 "$DB" "$API_USER" <<<"$(post_as app_executor api:2 deposit "$USDC1")"
+expect_err "app_api: cannot post as the owner -> AJ403" AJ403 "$DB" "$API_USER" <<<"$(post_as app_migrator api:3 deposit "$USDC1")"
+expect_err "app_api: cannot post as 'system' -> AJ403" AJ403 "$DB" "$API_USER" <<<"$(post_as system api:4 deposit "$USDC1")"
+expect_err "app_api: profit_share (no rule for the role) -> AJ403" AJ403 "$DB" "$API_USER" <<<"$(post_as app_api api:5 profit_share '[{"account":"'$FEE1'","amount_micro":1},{"account":"platform:revenue:profit_share","amount_micro":-1}]')"
+expect_err "app_api: deposit crediting a creator payable (accounts off-rule) -> AJ403" AJ403 "$DB" "$API_USER" <<<"$(post_as app_api api:6 deposit '[{"account":"treasury:hl_usdc","amount_micro":1},{"account":"'$PAY2'","amount_micro":-1}]')"
+expect_err "app_api: deposit into two fee balances (entry count off-rule) -> AJ403" AJ403 "$DB" "$API_USER" <<<"$(post_as app_api api:7 deposit '[{"account":"treasury:hl_usdc","amount_micro":2},{"account":"'$FEE1'","amount_micro":-1},{"account":"user:'$U2':fee_balance","amount_micro":-1}]')"
+expect_err "app_api: stripe_refund with a non-refund key -> AJ403" AJ403 "$DB" "$API_USER" <<<"$(post_as app_api dep:x stripe_refund '[{"account":"'$FEE1'","amount_micro":1},{"account":"stripe:clearing","amount_micro":-1}]')"
+expect_err "app_api: invented kind -> AJ403" AJ403 "$DB" "$API_USER" <<<"$(post_as app_api api:8 adjustment "$USDC1")"
+expect_err "app_api: direct INSERT ledger_transactions -> 42501" 42501 "$DB" "$API_USER" <<SQL
+INSERT INTO ledger_transactions (idempotency_key, kind, created_by, entries_digest)
+  VALUES ('api:direct', 'deposit', 't', ledger_entries_digest('{}', '{}'));
+SQL
+expect_err "app_api: direct INSERT ledger_entries -> 42501" 42501 "$DB" "$API_USER" <<SQL
+INSERT INTO ledger_entries (tx_id, account_id, amount_micro) SELECT t.id, a.id, 1 FROM ledger_transactions t, ledger_accounts a LIMIT 1;
+SQL
+expect_err "app_api: cannot write the rule table -> 42501" 42501 "$DB" "$API_USER" <<SQL
+INSERT INTO ledger_posting_rules (id, role, kind, key_pattern, debit_pattern, credit_pattern, note)
+  VALUES (999, 'app_api', 'profit_share', '^.+\$', '^.+\$', '^.+\$', 'x');
+SQL
+expect_err "rule table is append-only even for the owner -> AJ403" AJ403 <<<"UPDATE ledger_posting_rules SET key_pattern = '^.+\$' WHERE id = 113;"
+expect_err "app_executor: cannot post a Stripe refund -> AJ403" AJ403 "$DB" "$EXEC_USER" <<<"$(post_as app_executor stripe:refund:ch_1:5 stripe_refund '[{"account":"'$FEE1'","amount_micro":1},{"account":"stripe:clearing","amount_micro":-1}]')"
+expect_err "app_executor: cannot post as app_api -> AJ403" AJ403 "$DB" "$EXEC_USER" <<<"$(post_as app_api exe:1 deposit "$USDC1")"
+expect_eq "app_executor: builder rewards claim into the treasury (M7(b))" "t" "$DB" "$EXEC_USER" <<<"$(post_as app_executor builder_claim:0xabc builder_rewards_claim '[{"account":"treasury:hl_usdc","amount_micro":5},{"account":"builder:hl_receivable","amount_micro":-5}]')"
+expect_eq "app_executor: Stripe payout clearing -> bank (M7(c))" "t" "$DB" "$EXEC_USER" <<<"$(post_as app_executor stripe:payout:txn_1 stripe_payout '[{"account":"bank:payouts","amount_micro":5},{"account":"stripe:clearing","amount_micro":-5}]')"
+expect_err "superuser direct insert without authorisation rejected at COMMIT -> AJ403" AJ403 <<SQL
+BEGIN;
+INSERT INTO ledger_transactions (idempotency_key, kind, created_by, entries_digest)
+  VALUES ('noauth:1', 'deposit', 't', ledger_entries_digest(ARRAY['treasury:hl_usdc', 'stripe:clearing'], ARRAY[3, -3]::bigint[]));
+INSERT INTO ledger_entries (tx_id, account_id, amount_micro)
+  SELECT t.id, a.id, 3 FROM ledger_transactions t, ledger_accounts a WHERE t.idempotency_key = 'noauth:1' AND a.code = 'treasury:hl_usdc';
+INSERT INTO ledger_entries (tx_id, account_id, amount_micro)
+  SELECT t.id, a.id, -3 FROM ledger_transactions t, ledger_accounts a WHERE t.idempotency_key = 'noauth:1' AND a.code = 'stripe:clearing';
+COMMIT;
+SQL
 expect_ok "app_api: can append audit_log and consents" "$DB" "$API_USER" <<SQL
 INSERT INTO audit_log (actor, action, target, payload) VALUES ('user:$U1', 'consent.accept', '', '{}');
 INSERT INTO consents (user_id, doc, doc_version, doc_text_sha256, context) VALUES ('$U1', 'risk', '2026-09-30', repeat('b', 64), 'site_entry');

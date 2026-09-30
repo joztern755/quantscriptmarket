@@ -6,7 +6,7 @@ Sources of the policy:
                              frame-ancestors / upgrade-insecure-requests) from web/public/app-config.json
   * infra/csp.txt            the reviewed, committed copy (one line)
   * firebase.json            the HTTP header actually served by Firebase Hosting (must equal infra/csp.txt)
-  * backend/app/security/csp.py  (security module) — should embed the same string; checked when present
+  * backend/app/security/csp.py  its docstring embeds the same string verbatim (describes the policy); NOTE when stale
 
     python3 infra/csp_sync.py check                 # csp.txt == firebase.json (+ dist if built, + csp.py)
     python3 infra/csp_sync.py check --require-dist  # deploy: the production build must match too

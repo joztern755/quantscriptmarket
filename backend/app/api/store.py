@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 from contextlib import nullcontext
 
+from app.api.store_cleanup import CleanupStoreMixin
 from app.api.store_security import SecurityStoreMixin
 
 Cursor = Optional[tuple[datetime, str]]
@@ -52,7 +53,7 @@ def _j(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"), default=str)
 
 
-class SqlStore(SecurityStoreMixin):
+class SqlStore(SecurityStoreMixin, CleanupStoreMixin):
     # ------------------------------------------------------------------------------------------ helpers
     @staticmethod
     def _runner(conn: Any) -> Any:
@@ -284,8 +285,16 @@ class SqlStore(SecurityStoreMixin):
         return self._one(conn, sql, id=agent_id, u=user_id)
 
     def live_agents_for_master(self, conn: Any, master: str) -> list[dict]:
+        """Live = a request the executor has not served yet, a pending approval, or the active agent (0016 index)."""
         return self._all(conn, f"""SELECT {_AGENT_COLS} FROM agent_keys WHERE master_address = :m
-                                   AND status IN ('pending_approval', 'active') FOR UPDATE""", m=master)
+                                   AND status IN ('requested', 'pending_approval', 'active') FOR UPDATE""", m=master)
+
+    def get_agent_detail(self, conn: Any, agent_id: str, user_id: str) -> Optional[dict]:
+        """The agent row + the executor's keygen / attestation state (GET /v1/agents/{id}; never the ciphertext)."""
+        return self._one(conn, f"""SELECT {_AGENT_COLS}, keygen_at, attestation_sig, attestation_key_version,
+                                          attested_at, attestation_failed_at
+                                     FROM agent_keys WHERE id = CAST(:id AS uuid) AND user_id = CAST(:u AS uuid)""",
+                         id=agent_id, u=user_id)
 
     def active_agent_for_master(self, conn: Any, user_id: str, master: str) -> Optional[dict]:
         return self._one(conn, f"""SELECT {_AGENT_COLS} FROM agent_keys WHERE master_address = :m
@@ -300,13 +309,13 @@ class SqlStore(SecurityStoreMixin):
                                   ELSE revoked_at END
             WHERE id = CAST(:id AS uuid)""", s=status, t=now, id=agent_id)
 
-    def insert_agent(self, conn: Any, *, user_id: str, master: str, agent_address: str, agent_name: str,
-                     key_ciphertext: bytes, kms_key_version: str) -> dict:
+    def insert_agent_request(self, conn: Any, *, user_id: str, master: str, agent_name: str) -> dict:
+        """POST /v1/agents: a key REQUEST only. The executor generates + seals the key and fills agent_address /
+        key_ciphertext / kms_key_version / keygen_at (app_api has no INSERT/UPDATE privilege on those columns)."""
         row = self._one(conn, f"""
-            INSERT INTO agent_keys (user_id, master_address, agent_address, agent_name, key_ciphertext, kms_key_version)
-            VALUES (CAST(:u AS uuid), :m, :a, :n, :ct, :kv)
-            RETURNING {_AGENT_COLS}""", u=user_id, m=master, a=agent_address, n=agent_name, ct=key_ciphertext,
-                        kv=kms_key_version)
+            INSERT INTO agent_keys (user_id, master_address, agent_name, status)
+            VALUES (CAST(:u AS uuid), :m, :n, CAST('requested' AS agent_key_status))
+            RETURNING {_AGENT_COLS}""", u=user_id, m=master, n=agent_name)
         assert row is not None
         return row
 
@@ -906,9 +915,14 @@ class SqlStore(SecurityStoreMixin):
     def creator_earnings_by_strategy(self, conn: Any, creator_id: str) -> list[dict]:
         """Credits to ``creator:{id}:payable`` grouped by (strategy_id, category). Categories: builder (builder-fee
         share, via fills.builder_fee_ledger_tx_id), subscription (start + renewals: key sub:{subscription}:…),
-        profit_share (ps:{subscription}:{date}), posts (post:{post}:{buyer}; strategy NULL for general posts),
-        other. strategy_id NULL = not attributable to one of the creator's strategies."""
-        return self._all(conn, """
+        profit_share (ps:{subscription}:{date}, plus uncollected profit share released later from
+        ps_pending:{user}:{creator} by ps_pending_release — key ps_release:{user}:{seq}), posts (post:{post}:{buyer};
+        strategy NULL for general posts), other. A release is split over the strategies whose profit share fed that
+        user's pending account for this creator, pro-rata to what each fed (floor; the remainder to the largest), so
+        the rows still sum exactly to the lifetime credits. strategy_id NULL = not attributable to one of the
+        creator's strategies."""
+        uuid_re = "'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'"
+        return self._all(conn, f"""
             WITH cr AS (
                 SELECT t.id AS tx_id, t.kind, t.idempotency_key AS k, -e.amount_micro AS amt
                   FROM ledger_entries e
@@ -926,16 +940,43 @@ class SqlStore(SecurityStoreMixin):
                                  (SELECT s.strategy_id FROM fills f JOIN subscriptions s ON s.id = f.subscription_id
                                    WHERE f.builder_fee_ledger_tx_id = cr.tx_id LIMIT 1)
                             WHEN cr.kind IN ('subscription_start', 'subscription_renewal', 'profit_share')
-                                 AND split_part(cr.k, ':', 2) ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+                                 AND split_part(cr.k, ':', 2) ~ {uuid_re} THEN
                                  (SELECT s.strategy_id FROM subscriptions s
                                    WHERE s.id = CAST(split_part(cr.k, ':', 2) AS uuid))
                             WHEN cr.kind = 'post_purchase'
-                                 AND split_part(cr.k, ':', 2) ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+                                 AND split_part(cr.k, ':', 2) ~ {uuid_re} THEN
                                  (SELECT p.strategy_id FROM posts p WHERE p.id = CAST(split_part(cr.k, ':', 2) AS uuid))
                        END AS strategy_id
-                  FROM cr)
-            SELECT strategy_id, cat, sum(amt)::bigint AS micro FROM src GROUP BY strategy_id, cat
-             ORDER BY strategy_id NULLS LAST, cat""", code=f"creator:{creator_id}:payable")
+                  FROM cr WHERE cr.kind <> 'ps_pending_release'
+            ), rel AS (
+                SELECT cr.tx_id, cr.amt, split_part(cr.k, ':', 2) AS uid
+                  FROM cr WHERE cr.kind = 'ps_pending_release'
+            ), fed AS (
+                SELECT rel.tx_id, s.strategy_id, sum(-pe.amount_micro)::numeric AS q
+                  FROM rel
+                  JOIN ledger_accounts pa ON pa.code = 'ps_pending:' || rel.uid || ':' || CAST(:cid AS text)
+                  JOIN ledger_entries pe ON pe.account_id = pa.id AND pe.amount_micro < 0
+                  JOIN ledger_transactions pt ON pt.id = pe.tx_id AND pt.kind = 'profit_share'
+                  JOIN subscriptions s ON s.id = CASE WHEN split_part(pt.idempotency_key, ':', 2) ~ {uuid_re}
+                                                      THEN CAST(split_part(pt.idempotency_key, ':', 2) AS uuid) END
+                 GROUP BY rel.tx_id, s.strategy_id
+            ), alloc AS (
+                SELECT fed.tx_id, fed.strategy_id, rel.amt,
+                       floor(rel.amt * fed.q / sum(fed.q) OVER (PARTITION BY fed.tx_id))::bigint AS part,
+                       row_number() OVER (PARTITION BY fed.tx_id ORDER BY fed.q DESC, fed.strategy_id) AS rn
+                  FROM fed JOIN rel ON rel.tx_id = fed.tx_id
+            ), released AS (
+                SELECT (part + CASE WHEN rn = 1 THEN amt - sum(part) OVER (PARTITION BY tx_id) ELSE 0 END) AS amt,
+                       'profit_share' AS cat, strategy_id
+                  FROM alloc
+                UNION ALL
+                SELECT rel.amt, 'profit_share', CAST(NULL AS uuid) FROM rel
+                 WHERE NOT EXISTS (SELECT 1 FROM fed WHERE fed.tx_id = rel.tx_id)
+            ), everything AS (
+                SELECT amt, cat, strategy_id FROM src UNION ALL SELECT amt, cat, strategy_id FROM released
+            )
+            SELECT strategy_id, cat, sum(amt)::bigint AS micro FROM everything GROUP BY strategy_id, cat
+             ORDER BY strategy_id NULLS LAST, cat""", code=f"creator:{creator_id}:payable", cid=str(creator_id))
 
     def get_kyc(self, conn: Any, user_id: str) -> Optional[dict]:
         return self._one(conn, """SELECT provider, provider_ref, status::text AS status FROM kyc_creators

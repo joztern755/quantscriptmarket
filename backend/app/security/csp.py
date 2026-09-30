@@ -1,37 +1,49 @@
 """Security headers for the API and the CSP / headers for the web app (SPEC §5.7).
 
-The web CSP is served by Firebase Hosting (infra/firebase.json `headers`); generate it from `web_csp()` so it
-has one source of truth. The API adds `api_security_headers()` to every response.
+Source of truth for the WEB policy
+----------------------------------
+``web/build.mjs`` GENERATES the site's Content-Security-Policy at build time (``web/dist/csp.txt``; the ``<meta>``
+copy omits the header-only directives) from ``web/public/app-config.json``. The reviewed, committed copy is
+``infra/csp.txt``; ``firebase.json`` serves exactly that string as the Hosting header, and ``infra/csp_sync.py``
+(``make csp-check`` / ``make csp-sync``) keeps the three identical. The policy currently served (= infra/csp.txt,
+embedded verbatim so csp_sync can tell when this description goes stale — update it together with csp.txt):
 
-Host-by-host rationale for the web CSP (VERIFY in a staging browser before launch; the docs for Stripe and
-Firebase could not be fetched from the build environment, so these rest on the libraries' known behaviour):
+default-src 'self'; script-src 'self' https://www.gstatic.com/firebasejs/12.3.0/ https://apis.google.com/js/ https://apis.google.com/_/scs/ https://js.stripe.com https://*.js.stripe.com 'sha256-D9BZJ0AXKj/x8t8OlNhu5edJdPzYzh2u1oizKkm2Ep8='; style-src 'self' https://fonts.googleapis.com; img-src 'self' data:; font-src https://fonts.gstatic.com; connect-src 'self' https://api.aijalon.trade https://api.hyperliquid.xyz https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://api.stripe.com; frame-src 'self' https://js.stripe.com https://*.js.stripe.com https://hooks.stripe.com; object-src 'none'; base-uri 'none'; form-action 'self'; require-trusted-types-for 'script'; frame-ancestors 'none'; upgrade-insecure-requests; report-uri https://api.aijalon.trade/v1/csp-report; report-to csp
+
+``web_csp()`` below is a REFERENCE builder (unit-tested) of the same directive set; it is not what Hosting serves and
+does not know the build-time parts (pinned SDK version path, import-map hash, Trusted Types, reporting). The API adds
+``api_security_headers()`` to every response (its own, much stricter JSON-only CSP).
+
+Host-by-host rationale for the web CSP (VERIFY in a staging browser before launch):
 
 script-src
-  'self'                              our bundle (tsc -> web/dist). No inline script, no eval.
-  https://www.gstatic.com/firebasejs/ Firebase JS SDK, pinned version (SPEC §9). PATH-SCOPED: all of www.gstatic.com
-                                      hosts many Google scripts; a path limits the gadget surface. Better still:
-                                      bundle the SDK into web/dist and drop this entry.
-  https://apis.google.com             gapi loader used by Firebase Auth signInWithPopup/Redirect to create the
-                                      hidden auth iframe (it loads further scripts from apis.google.com/_/scs/…,
-                                      so it cannot be path-scoped). Known risk: apis.google.com has historically
-                                      offered CSP-bypass gadgets; accepted because popup/redirect sign-in needs it.
+  'self'                              our bundle (tsc -> web/dist). No inline script except the import map below, no
+                                      eval.
+  https://www.gstatic.com/firebasejs/<version>/   Firebase JS SDK, PATH-SCOPED to the pinned version (SPEC §9;
+                                      SECURITY M2): all of www.gstatic.com hosts many Google scripts. The modules are
+                                      also SRI-pinned through the import map (web/sri.json).
+  'sha256-…'                          the inline <script type=importmap> carrying those SRI hashes (production builds
+                                      refuse to build without web/sri.json).
+  https://apis.google.com/js/, https://apis.google.com/_/scs/   gapi loader + its chunks, used by Firebase Auth
+                                      signInWithPopup/Redirect for the hidden auth iframe. Path-scoped (SECURITY M2);
+                                      known risk: apis.google.com has historically offered CSP-bypass gadgets.
   https://js.stripe.com, https://*.js.stripe.com   Stripe.js / Payment Element (Stripe serves some assets from
                                       subdomains of js.stripe.com).
+require-trusted-types-for 'script'    Trusted Types: script sinks only through a policy (public/boot-guard.js
+                                      installs the default one) — the enforcing control behind the DOM tripwires.
 frame-src
-  'self'                              Firebase auth iframe when authDomain = aijalon.trade (recommended: Firebase
-                                      Hosting serves /__/auth/*; avoids third-party-storage breakage in Safari/Chrome).
-  https://<project>.firebaseapp.com   auth iframe when authDomain is the default firebaseapp.com domain. Scoped to
-                                      OUR project (the requested `https://*.firebaseapp.com` would allow framing any
-                                      Firebase project).
+  'self'                              Firebase auth iframe: authDomain = aijalon.trade (Firebase Hosting serves
+                                      /__/auth/*; avoids third-party-storage breakage in Safari/Chrome). A different
+                                      authDomain / <project>.firebaseapp.com is added by the build only when
+                                      configured — never ``https://*.firebaseapp.com``.
   https://js.stripe.com, https://*.js.stripe.com, https://hooks.stripe.com   Payment Element + 3-D Secure frames.
   NOT included: https://appleid.apple.com. With Firebase, Apple sign-in runs in the popup / top-level redirect
-  (authDomain/__/auth/handler -> appleid.apple.com), never in a frame of our page; add it back only if a browser
-  test proves otherwise.
+  (authDomain/__/auth/handler -> appleid.apple.com), never in a frame of our page.
 connect-src
-  'self', api origin, https://api.hyperliquid.xyz
+  'self', https://api.aijalon.trade, https://api.hyperliquid.xyz
   https://identitytoolkit.googleapis.com, https://securetoken.googleapis.com   Firebase Auth REST (sign-in, MFA
                                       enrolment/sign-in incl. TOTP, token refresh). Enumerated instead of
-                                      `https://*.googleapis.com`, which would include storage.googleapis.com — an
+                                      ``https://*.googleapis.com``, which would include storage.googleapis.com — an
                                       exfiltration channel to any attacker-owned bucket after an XSS.
   https://api.stripe.com              Stripe.js API calls from the page.
   If WalletConnect is added later it needs its relay (wss://relay.walletconnect.com / .org) — not included.
@@ -39,7 +51,9 @@ img-src 'self' data:   style-src 'self' https://fonts.googleapis.com   font-src 
   Stripe renders its UI inside its own iframes, so its images/fonts/styles are governed by Stripe's CSP, not ours.
   UNVERIFIED: whether Stripe.js injects a <style> element into the host page (would need a hash or
   'unsafe-inline' in style-src). Test in staging; do not add 'unsafe-inline' for scripts under any circumstances.
-object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests.
+object-src 'none'; base-uri 'none'; form-action 'self'.
+Header-only: frame-ancestors 'none'; upgrade-insecure-requests; report-uri https://api.aijalon.trade/v1/csp-report
+  + report-to csp (Reporting-Endpoints header) — the api's rate-limited, sanitising POST /v1/csp-report.
 
 Other launch notes:
 * Apple Pay via Stripe needs /.well-known/apple-developer-merchantid-domain-association served by Firebase Hosting

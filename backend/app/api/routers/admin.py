@@ -211,6 +211,9 @@ def _apply_change(conn: Any, svc: Services, ctx: AuthCtx, ch: dict) -> None:
                                history_days=days, min_days=min_days)
         svc.store.publish_version(conn, vid, svc.now())
         svc.store.set_strategy_status(conn, sid, "listed")
+        if st["status"] == "paused":
+            # unpause: paused time credited back to prepaid periods, billing resumes at the pinned price
+            billing_ops.resume_strategy_subscriptions(conn, svc, strategy_id=sid, strategy_name=st.get("name"))
     elif kind == "strategy_price":
         sid = ch["target"].split(":", 1)[1]
         st = svc.store.get_strategy(conn, sid, for_update=True)
@@ -332,6 +335,11 @@ def approve_payout(kind: PayoutKind, payout_id: UUID, ctx: AuthCtx = Depends(adm
             raise NotFound("not found")
         if str(row["beneficiary"]) == ctx.user_id:
             raise Forbidden("you cannot approve a payout to yourself")
+        if kind == "payout":        # creator / referrer earnings: KYC must still be approved (M2; revocable)
+            kyc = svc.store.get_kyc(conn, str(row["beneficiary"]))
+            if not kyc or kyc["status"] != "approved":
+                raise Conflict("the beneficiary's KYC is not approved", reason="kyc_required",
+                               kyc_status=(kyc or {}).get("status") or "none")
         now = svc.now()
         if row["status"] == "requested":
             ok, step = svc.store.payout_approve_1(conn, kind, str(payout_id), ctx.user_id, now), "approve_1"
@@ -491,6 +499,12 @@ def _set_status_now(strategy_id: UUID, status: str, body: S.DecisionIn, ctx: Aut
         cancelled = svc.store.cancel_pending_changes(conn, f"strategy:{strategy_id}",
                                                      f"superseded: strategy {status} by admin", svc.now())
         ended = {"closing": 0, "cancelled": 0}
+        told = 0
+        if status == "paused":
+            # admin pause: no new subscriptions / renewals, exits only (executor entries gate) — every live
+            # subscriber gets the mandatory strategy_paused alert (SPEC §12)
+            told = billing_ops.pause_strategy_subscriptions(conn, svc, strategy_id=str(strategy_id),
+                                                            strategy_name=st.get("name"))
         if status == "delisted":
             # H5: subscriptions END (closing → reduce-only exit; paused → cancelled); billing stops; users alerted
             ended = billing_ops.end_strategy_subscriptions(conn, svc, strategy_id=str(strategy_id),
@@ -498,7 +512,7 @@ def _set_status_now(strategy_id: UUID, status: str, body: S.DecisionIn, ctx: Aut
         svc.notifier.notify(conn, user_id=None, severity="warn", kind=f"strategy_{status}",
                             payload={"strategy_id": str(strategy_id), "subscriptions_closing": ended["closing"],
                                      "subscriptions_cancelled": ended["cancelled"],
-                                     "changes_cancelled": len(cancelled)})
+                                     "subscribers_notified": told, "changes_cancelled": len(cancelled)})
         svc.audit.write(conn, actor=ctx.actor, action=f"strategy.{status}", target=f"strategy:{strategy_id}",
                         payload={"reason": body.reason, "from": st["status"], **{f"subscriptions_{k}": n
                                                                                    for k, n in ended.items()},
@@ -590,8 +604,9 @@ def unsuspend_user(user_id: UUID, body: S.DecisionIn, ctx: AuthCtx = Depends(adm
 @router.post("/users/{user_id}/kyc", response_model=S.AdminActionOut)
 def kyc_decision(user_id: UUID, body: S.KycDecisionIn, ctx: AuthCtx = Depends(admin_step_up),
                  svc: Services = Depends(get_services)) -> S.AdminActionOut:
-    """Creator KYC verdict by ONE admin (owner decision; documents stay at the provider). Approval unlocks listing,
-    paid posts and payouts (those keep their own two-admin rules). Manual provider: pending/rejected → approved.
+    """Identity KYC verdict by ONE admin (owner decision; documents stay at the provider) — creators and referrers
+    share the record. Approval unlocks listing, paid posts and creator / referrer payouts (those keep their own
+    two-admin rules). Manual provider: pending/rejected → approved.
     Sumsub: only a provider GREEN (``provider_approved``) can be confirmed. Rejection: immediate."""
     uid = str(user_id)
     with svc.db.begin() as conn:

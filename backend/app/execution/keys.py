@@ -4,8 +4,9 @@ refuses any other ``service_role`` in prod).
 ``DbAgentKeyProvider`` (``KeyProvider`` port)
   Loads the ACTIVE agent key of (user_id, master_address) — ``agent_keys.key_ciphertext`` (app_executor has the
   column privilege, app_api does not) — and opens it with ``app.security.agent_keys.opened_agent_key``. The AAD is
-  exactly what the API sealed with (``generate_sealed_agent_key(encryptor, user_id=)`` →
-  ``agent_key_aad(user_id, agent_address)``), and the decrypted key must re-derive the stored agent address. The
+  exactly what the executor's keygen job sealed with (``trust_jobs.generate_agents`` →
+  ``generate_sealed_agent_key(encryptor, user_id=)`` → ``agent_key_aad(user_id, agent_address)``; the api never
+  generates or seals agent keys, migrations/0016), and the decrypted key must re-derive the stored agent address. The
   plaintext is a ``bytearray`` zeroized when the ``with`` block exits (after the orders are signed).
 
 ``CreatorCodeDecryptor``

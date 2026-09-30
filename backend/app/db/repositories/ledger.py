@@ -1,9 +1,13 @@
 """Postgres implementation of ``app.ledger.service.LedgerStore``.
 
-Writes go through the SQL function ``ledger_post`` (0001/0010; Stripe refunds and disputes through
-``ledger_post_payment_reversal``), which validates, gates kinds by role, locks the ledger chain,
-handles idempotency race-free and checks balances; the deferred constraint triggers re-check at COMMIT.
-Custom SQLSTATEs are mapped to ``app.errors``.
+Writes go through the SQL function ``ledger_post_as(role, …)`` (0015, SECURITY DEFINER — the app roles have no
+INSERT on the ledger tables any more). ``role`` is the app role the caller posts AS (``app_api`` / ``app_executor``);
+the DB checks that the session (SET ROLE, else the login) is a member of it and that the posting matches a row of the
+fixed ``ledger_posting_rules`` table for (role, kind) — key pattern, debit / credit account patterns, entry counts —
+then validates, locks the ledger chain, handles idempotency race-free, checks balances and records the authorisation
+(rule id, role, login); the deferred constraint triggers re-check at COMMIT. ``PostgresLedgerStore(conn, role=None)``
+lets the DB pick the invoker's single app role (``ledger_invoker_app_role()``; owner sessions post as app_migrator).
+Custom SQLSTATEs are mapped to ``app.errors`` (a posting no rule allows → AJ403 → ValidationFailed).
 """
 from __future__ import annotations
 
@@ -13,9 +17,9 @@ from typing import Any, Mapping, Sequence
 
 from app.db.engine import SqlAlchemyRunner, SqlRunner, sqlstate_of
 from app.errors import AppError, Conflict, InsufficientBalance, NotFound, ValidationFailed
-from app.ledger.service import PAYMENT_REVERSAL_KINDS, Account, PostedTx
+from app.ledger.service import Account, PostedTx
 
-__all__ = ["PostgresLedgerStore", "map_db_error"]
+__all__ = ["PostgresLedgerStore", "map_db_error", "POSTING_ROLES"]
 
 _SQLSTATE_TO_ERROR: dict[str, type[AppError]] = {
     "AJ402": InsufficientBalance,
@@ -61,17 +65,14 @@ SELECT t.id::text AS id, t.idempotency_key, t.kind, t.memo, t.created_by, t.seq,
  WHERE t.idempotency_key = :key
 """
 
+# 0015: the one posting entry point for the app roles. A NULL role → the DB resolves the invoker's app role.
 _POST_SQL = """
 SELECT tx_id::text AS tx_id, created
-  FROM ledger_post(:key, :kind, :memo, :created_by, CAST(:entries AS jsonb))
+  FROM ledger_post_as(coalesce(CAST(:role AS text), ledger_invoker_app_role()), :key, :kind, :memo, :created_by,
+                      CAST(:entries AS jsonb))
 """
 
-# Stripe refund / dispute may overdraw a fee balance: the DB only accepts them through this SECURITY DEFINER wrapper
-# (0010_money_fixes.sql — fixed key prefix and entry shape; the API role cannot post those kinds directly).
-_POST_REVERSAL_SQL = """
-SELECT tx_id::text AS tx_id, created
-  FROM ledger_post_payment_reversal(:key, :kind, :memo, :created_by, CAST(:entries AS jsonb))
-"""
+POSTING_ROLES = ("app_api", "app_executor", "app_migrator")
 
 _BALANCE_SQL = """
 SELECT (SELECT coalesce(sum(e.amount_micro), 0) FROM ledger_entries e WHERE e.account_id = a.id)::bigint AS balance
@@ -90,9 +91,12 @@ SELECT t.id::text AS tx_id, t.seq, utc_iso(t.created_at) AS created_at, t.kind, 
 
 
 class PostgresLedgerStore:
-    def __init__(self, conn: Any) -> None:
+    def __init__(self, conn: Any, *, role: str | None = None) -> None:
         # a SqlRunner (has fetchall) or a SQLAlchemy Connection
         self.runner: SqlRunner = conn if hasattr(conn, "fetchall") else SqlAlchemyRunner(conn)
+        if role is not None and role not in POSTING_ROLES:
+            raise ValidationFailed("unknown ledger posting role", role=role)
+        self.role = role              # None: the DB uses the session's own app role
 
     def _q(self, sql: str, params: Mapping[str, Any]) -> list[dict[str, Any]]:
         try:
@@ -140,9 +144,8 @@ class PostgresLedgerStore:
         payload = json.dumps([{"account": c, "amount_micro": int(a)} for c, a in entries])
         savepoint = getattr(self.runner, "savepoint", None)
         with (savepoint() if savepoint else nullcontext()):
-            rows = self._q(_POST_REVERSAL_SQL if kind in PAYMENT_REVERSAL_KINDS else _POST_SQL,
-                           {"key": idempotency_key, "kind": kind, "memo": memo, "created_by": created_by,
-                            "entries": payload})
+            rows = self._q(_POST_SQL, {"role": self.role, "key": idempotency_key, "kind": kind, "memo": memo,
+                                       "created_by": created_by, "entries": payload})
         created = bool(rows[0]["created"]) if rows else False
         tx = self.get_tx_by_key(idempotency_key)
         if tx is None:  # pragma: no cover

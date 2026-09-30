@@ -48,7 +48,7 @@ const USER = "5b0f5f2e-3c5d-4d0e-9a51-2f1f7c0d9a11";
 const AGENT = "0x1111111111111111111111111111111111111111";
 const BUILDER = "0x2222222222222222222222222222222222222222";
 const TREASURY = "0x3333333333333333333333333333333333333333";
-const attestMsg = (u, a) => Buffer.from(`aijalon-agent-v1|${u}|${a.toLowerCase()}`);
+const attestMsg = (u, a, v = "v2") => Buffer.from(`aijalon-agent-${v}|${u}|${a.toLowerCase()}`);
 const sigDer = (m, key = privateKey) => nodeSign("sha256", m, { key, dsaEncoding: "der" }).toString("base64");
 const sigRaw = (m) => nodeSign("sha256", m, { key: privateKey, dsaEncoding: "ieee-p1363" }).toString("base64");
 
@@ -91,7 +91,8 @@ ok("trust loaded", config.trustAnchors().builderAddress === BUILDER && config.tr
 // ---- attest.ts
 const at = await imp("core/attest.js");
 const good = sigDer(attestMsg(USER, AGENT));
-ok("attestation message format", at.agentAttestationMessage(USER, AGENT.toUpperCase().replace("0X", "0x")) === `aijalon-agent-v1|${USER}|${AGENT}`);
+ok("attestation message format (v2 = executor-generated key)", at.agentAttestationMessage(USER, AGENT.toUpperCase().replace("0X", "0x")) === `aijalon-agent-v2|${USER}|${AGENT}`);
+ok("a v1 attestation (api-generated key, pre-0016) is refused", !(await at.verifyAgentAttestation({ userId: USER, agentAddress: AGENT, signatureB64: sigDer(attestMsg(USER, AGENT, "v1")) })));
 ok("attestation DER verifies", await at.verifyAgentAttestation({ userId: USER, agentAddress: AGENT, signatureB64: good }));
 ok("attestation raw r||s verifies", await at.verifyAgentAttestation({ userId: USER, agentAddress: AGENT, signatureB64: sigRaw(attestMsg(USER, AGENT)) }));
 ok("attestation for another agent fails", !(await at.verifyAgentAttestation({ userId: USER, agentAddress: BUILDER, signatureB64: good })));
@@ -164,6 +165,63 @@ const md = await imp("pages/_shared/markdown.js");
 ok("externalHost", md.externalHost("https://evil.example/aijalon.trade/x") === "evil.example" && md.externalHost("#/market") === null);
 ok("misleading label detected", md.misleadingLabel("aijalon.trade/reconnect-wallet", "evil.example"));
 ok("honest label allowed", !md.misleadingLabel("Hyperliquid docs", "hyperliquid.gitbook.io") && !md.misleadingLabel("hyperliquid.xyz", "app.hyperliquid.xyz"));
+
+// ---- agentprep.ts: POST /agents files a request; the browser polls GET /agents/{id} until the EXECUTOR generated and
+// attested the key (migrations/0016). The address is only accepted with a valid attestation for this user.
+const ap = await imp("core/agentprep.js");
+const AID = "0f0e0d0c-0b0a-4908-8706-050403020100";
+const MASTER = "0x5555555555555555555555555555555555555555";
+const detail = (over = {}) => ({ agent: { id: AID, master_address: MASTER, agent_address: null, status: "requested", ...(over.agent ?? {}) }, user_id: USER, ready: false, failed: false, attestation: null, ...over, ...(over.agent ? { agent: { id: AID, master_address: MASTER, agent_address: null, status: "requested", ...over.agent } } : {}) });
+function poller(seq) {
+  const calls = [];
+  return { calls, fetchAgent: async (id) => (calls.push(id), seq.length > 1 ? seq.shift() : seq[0]) };
+}
+const fastClock = () => { let t = 0; return { now: () => t, sleep: async (ms) => { t += ms; } }; };
+const readyRow = detail({ agent: { agent_address: AGENT, status: "pending_approval" }, ready: true, attestation: { signature_b64: good } });
+{
+  const p = poller([detail(), detail(), readyRow]);
+  const waits = [];
+  const r = await ap.waitForAgentReady({ agentId: AID, userId: USER, master: MASTER, fetchAgent: p.fetchAgent, intervalMs: 1000, onWaiting: (n) => waits.push(n), ...fastClock() });
+  ok("agentprep: polls while requested, then ready with the attested address", r.kind === "ready" && r.agentAddress === AGENT && p.calls.length === 3 && waits.join() === "1,2", JSON.stringify(r));
+}
+{
+  const forged = detail({ agent: { agent_address: BUILDER, status: "pending_approval" }, ready: true, attestation: { signature_b64: good } });
+  const r = await ap.waitForAgentReady({ agentId: AID, userId: USER, fetchAgent: poller([forged]).fetchAgent, ...fastClock() });
+  ok("agentprep: an address whose attestation does not verify is refused (api substitutes its own key)", r.kind === "invalid", JSON.stringify(r));
+}
+{
+  const v1 = detail({ agent: { agent_address: AGENT, status: "pending_approval" }, ready: true, attestation: { signature_b64: sigDer(attestMsg(USER, AGENT, "v1")) } });
+  const r = await ap.waitForAgentReady({ agentId: AID, userId: USER, fetchAgent: poller([v1]).fetchAgent, ...fastClock() });
+  ok("agentprep: a v1 (api-generated) attestation is refused", r.kind === "invalid");
+}
+{
+  const other = { ...readyRow, user_id: "00000000-0000-4000-8000-000000000000" };
+  const r1 = await ap.waitForAgentReady({ agentId: AID, userId: USER, fetchAgent: poller([other]).fetchAgent, ...fastClock() });
+  const r2 = await ap.waitForAgentReady({ agentId: AID, userId: USER, fetchAgent: poller([{ ...readyRow, agent: { ...readyRow.agent, id: "11111111-2222-4333-8444-555555555555" } }]).fetchAgent, ...fastClock() });
+  const r3 = await ap.waitForAgentReady({ agentId: AID, userId: USER, master: "0x6666666666666666666666666666666666666666", fetchAgent: poller([readyRow]).fetchAgent, ...fastClock() });
+  ok("agentprep: another user / agent / master is refused", r1.kind === "invalid" && r2.kind === "invalid" && r3.kind === "invalid");
+}
+{
+  const r1 = await ap.waitForAgentReady({ agentId: AID, userId: USER, fetchAgent: poller([detail({ failed: true })]).fetchAgent, ...fastClock() });
+  const r2 = await ap.waitForAgentReady({ agentId: AID, userId: USER, fetchAgent: poller([detail({ agent: { status: "revoked" } })]).fetchAgent, ...fastClock() });
+  const r3 = await ap.waitForAgentReady({ agentId: AID, userId: USER, fetchAgent: async () => null, ...fastClock() });
+  ok("agentprep: executor refusal / withdrawn / 404", r1.kind === "failed" && r2.kind === "gone" && r3.kind === "gone");
+}
+{
+  const p = poller([detail()]);
+  const r = await ap.waitForAgentReady({ agentId: AID, userId: USER, fetchAgent: p.fetchAgent, timeoutMs: 10_000, intervalMs: 2000, ...fastClock() });
+  ok("agentprep: times out (bounded polling)", r.kind === "timeout" && p.calls.length >= 4 && p.calls.length <= 6, String(p.calls.length));
+  let live = true;
+  const q = poller([detail()]);
+  const r2 = await ap.waitForAgentReady({ agentId: AID, userId: USER, fetchAgent: q.fetchAgent, isCurrent: () => live, onWaiting: () => { live = false; }, ...fastClock() });
+  ok("agentprep: stops when the page is left", r2.kind === "cancelled" && q.calls.length === 1);
+}
+{
+  // an address WITHOUT attestation is never "ready", however the server labels it
+  const p = poller([detail({ agent: { agent_address: AGENT, status: "pending_approval" }, ready: true, attestation: null })]);
+  const r = await ap.waitForAgentReady({ agentId: AID, userId: USER, fetchAgent: p.fetchAgent, timeoutMs: 5000, intervalMs: 1000, ...fastClock() });
+  ok("agentprep: an unattested address is not accepted", r.kind === "timeout");
+}
 
 console.log(`\n${pass}/${pass + fail} trust checks passed`);
 process.exit(fail ? 1 : 0);

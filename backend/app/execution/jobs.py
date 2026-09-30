@@ -55,14 +55,14 @@ import time
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
-from decimal import ROUND_DOWN, ROUND_FLOOR, Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, Callable, Mapping
 
 from app.config import Economics, get_settings
 from app.errors import ExternalServiceError, ValidationFailed
 from app.https_only import https_open
 from app.logging import get_logger
-from app.money import BPS, parse_decimal, to_micro
+from app.money import BPS
 
 from .executor import Executor, ExecutorConfig
 from .pg import (
@@ -89,6 +89,7 @@ from .pg import (
 from .ports import AlertEvent
 from .reconcile import ReconcileConfig, Reconciler
 from .settlement import Settlement
+from .treasury_books import HlBuilderRewardsReader, HlRewardsSchema, HlTreasuryReader, stripe_reader_from_settings
 from .wiring import (
     CatalogMarketData,
     DomainBilling,
@@ -152,45 +153,8 @@ def weight_to_bps(weight: Any, max_leverage: int) -> int:
 
 
 # ======================================================================================================== on-chain readers
-
-class HlBuilderRewardsReader:
-    """``BuilderRewardsReader``: builder fees accrued on-chain to our builder address = unclaimed builder rewards
-    (info ``referral`` → ``builderRewards``) + rewards already claimed (non-funding ledger updates of type
-    ``rewardsClaim``). UNVERIFIED field names (docs blocked here) — verify on mainnet before go-live; a wrong read
-    only raises a reconciliation alert, it never moves money."""
-
-    def __init__(self, info: Any, builder_address: str, *, since_ms: int = 1_704_067_200_000) -> None:
-        self.info = info
-        self.builder = builder_address.lower()
-        self.since_ms = since_ms
-
-    def cumulative_builder_rewards_micro(self) -> int:
-        if not self.builder:
-            raise ValidationFailed("builder address not configured")
-        ref = self.info.post({"type": "referral", "user": self.builder})
-        unclaimed = parse_decimal(str((ref or {}).get("builderRewards", "0")))
-        claimed = Decimal(0)
-        for u in self.info.iter_user_non_funding_ledger_updates(self.builder, self.since_ms, int(time.time() * 1000)):
-            delta = u.get("delta") or {}
-            if delta.get("type") == "rewardsClaim":
-                claimed += parse_decimal(str(delta.get("amount", "0")))
-        return to_micro(unclaimed + claimed, ROUND_FLOOR)
-
-
-class HlTreasuryReader:
-    """``TreasuryReader``: USDC in the treasury's perps account (deposits arrive by usdSend). The treasury holds no
-    positions, so accountValue = USDC. UNVERIFIED against a live treasury — verify before go-live."""
-
-    def __init__(self, info: Any, treasury_address: str) -> None:
-        self.info = info
-        self.treasury = treasury_address.lower()
-
-    def treasury_usdc_micro(self) -> int:
-        if not self.treasury:
-            raise ValidationFailed("treasury address not configured")
-        state = self.info.clearinghouse_state(self.treasury, "")
-        value = ((state or {}).get("marginSummary") or {}).get("accountValue", "0")
-        return to_micro(parse_decimal(str(value)), ROUND_FLOOR)
+# HlBuilderRewardsReader (builder rewards: cumulative, still claimable, claims — REVIEW_MONEY M7(b)) and HlTreasuryReader
+# (perp + spot USDC + each trusted builder dex — M7(g)) live in app.execution.treasury_books; re-exported here.
 
 
 # ======================================================================================================== sandbox client
@@ -348,7 +312,7 @@ class Runtime:
         self._lock = threading.RLock()
         self._rate_budget: Any = None
         self._anchor_publisher = anchor_publisher
-        self.stripe_clearing = stripe_clearing       # StripeClearingReader (REVIEW_MONEY M7(c) stub; None = not wired)
+        self.stripe_clearing = stripe_clearing       # StripeClearingReader (REVIEW_MONEY M7(c)); None: from settings
 
     def anchor_publisher(self) -> Any:
         if self._anchor_publisher is None:
@@ -478,7 +442,9 @@ class Runtime:
     @property
     def builder_rewards(self) -> Any:
         if self._builder_rewards is None:
-            self._builder_rewards = HlBuilderRewardsReader(self.info, self.settings.builder_address)
+            self._builder_rewards = HlBuilderRewardsReader(
+                self.info, self.settings.builder_address, treasury_address=self.settings.treasury_address,
+                schema=HlRewardsSchema.from_settings(self.settings))
         return self._builder_rewards
 
     @property
@@ -510,11 +476,33 @@ class Runtime:
             alerts=alerts or self.alerts(db), clock=self.clock, events=PgUserEvents(db),
             pending=PgPendingReleaser(db))
 
+    def treasury_for(self, db: PgDatabase) -> Any:
+        """The treasury reader of one reconcile run: an injected one as is; else perp + spot USDC + each ACTIVE
+        trusted builder dex (read from ``trusted_dexes`` at run time — REVIEW_MONEY M7(g))."""
+        if self._treasury is not None:
+            return self._treasury
+        from app.strategies.dexes import VALIDATOR_DEX, load_trusted
+
+        return HlTreasuryReader(self.info, self.settings.treasury_address,
+                                dexes=lambda: sorted(d for d in load_trusted(db) if d != VALIDATOR_DEX))
+
+    def stripe_reader(self) -> Any:
+        """REVIEW_MONEY M7(c): the injected ``stripe_clearing`` reader, else a Stripe balance reader when this service
+        has a Stripe key (None → reconcile reports ``not_configured``)."""
+        if self.stripe_clearing is None and getattr(self.settings, "stripe_secret_key", ""):
+            with self._lock:
+                if self.stripe_clearing is None:
+                    self.stripe_clearing = stripe_reader_from_settings(self.settings)
+        return self.stripe_clearing
+
     def reconciler(self, db: PgDatabase, *, alerts: Any = None) -> Reconciler:
-        repo = PgReconcileRepo(db)
-        return Reconciler(repo=repo, positions=self.positions, builder_rewards=self.builder_rewards,
-                          treasury=self.treasury, ledger=PgLedger(db), alerts=alerts or self.alerts(db),
-                          config=self.reconcile_config, solvency=repo, stripe=self.stripe_clearing)
+        repo = PgReconcileRepo(db, self.economics)
+        rewards = self.builder_rewards
+        claims = rewards if hasattr(rewards, "builder_reward_claims") else None   # M7(b): same reader
+        return Reconciler(repo=repo, positions=self.positions, builder_rewards=rewards,
+                          treasury=self.treasury_for(db), ledger=PgLedger(db), alerts=alerts or self.alerts(db),
+                          config=self.reconcile_config, solvency=repo, stripe=self.stripe_reader(),
+                          builder_claims=claims, uow=PgUnitOfWork(db))
 
 
 _RUNTIME: Runtime | None = None
@@ -552,14 +540,26 @@ def _emit(alerts: Any, severity: str, kind: str, payload: dict[str, Any], *, ded
 
 # ======================================================================================================== jobs
 
-def run_tick(*, db: Any, now: datetime, runtime: Runtime | None = None, creator_signals: bool = True) -> dict[str, Any]:
-    """/internal/tick (every minute): creator signals for bars that just closed, then the executor tick."""
+def run_tick(*, db: Any, now: datetime, runtime: Runtime | None = None, creator_signals: bool = True,
+             agent_keygen: bool = True) -> dict[str, Any]:
+    """/internal/tick (every minute): pending agent-key requests (executor keygen), creator signals for bars that just
+    closed, then the executor tick."""
     rt = runtime or get_runtime()
     now = _aware(now)
     pdb = _db(db)
     rt.bind_db(pdb)
     alerts = rt.alerts(pdb)
     out: dict[str, Any] = {}
+    if agent_keygen:
+        # agent keys requested since the last run (POST /v1/agents) are generated HERE, in the executor (0016); a
+        # small budget so trading is never delayed, and any failure is left to the every-minute attest-agents job.
+        try:
+            kg = tick_generate_agents(db=pdb, now=now, runtime=rt)
+            if kg:
+                out["agent_keygen"] = kg
+        except Exception as e:  # noqa: BLE001 - never block trading on key generation
+            log.error("tick_agent_keygen_failed", extra={"fields": {"error": type(e).__name__}})
+            out["agent_keygen"] = {"error": type(e).__name__}
     if creator_signals:
         try:
             out["creator_signals"] = run_creator_signals(db=pdb, now=now, runtime=rt, alerts=alerts)
@@ -748,7 +748,14 @@ def run_creator_signals(*, db: Any, now: datetime, runtime: Runtime | None = Non
                         alerts: Any = None) -> dict[str, Any]:
     """For every listed creator version whose TIMEFRAME bar has closed (and settled ``bar_settle_seconds``) and has
     no signal yet: fetch bars, decrypt the code (dedicated decryptor, AAD bound to strategy + code hash), run it
-    ONCE in the sandbox, store one ``signals`` row per market (source sandbox). The executor then fans out."""
+    ONCE in the sandbox, store one ``signals`` row per market (source sandbox). The executor then fans out.
+
+    Trusted dexes (SPEC §12, REVIEW_TRADING_KEYS F1): the allowlist is read once per run (unreadable → fail closed:
+    validator perps only). A market on a builder dex that is not on the ACTIVE allowlist (never added, or removed
+    after the version was listed) gets NO signal row — the other markets of the version are still stored — and a
+    critical ops alert ``creator_signal_untrusted_dex`` is raised (deduplicated per version / bar)."""
+    from app.strategies.dexes import dex_of, is_trusted_coin, load_trusted
+
     rt = runtime or get_runtime()
     now = _aware(now)
     pdb = _db(db)
@@ -758,8 +765,14 @@ def run_creator_signals(*, db: Any, now: datetime, runtime: Runtime | None = Non
     now_ms = _ms(now)
     t0 = time.monotonic()
     rep: dict[str, Any] = {"versions": 0, "not_closed": 0, "already": 0, "waiting_data": 0, "stored": 0,
-                           "errors": 0, "deferred": 0}
+                           "errors": 0, "deferred": 0, "untrusted": 0}
     versions = repo.creator_versions()
+    trusted: frozenset[str] | None
+    try:
+        trusted = load_trusted(pdb)
+    except Exception as e:  # noqa: BLE001 - fail closed: only validator perps get signals
+        trusted = None
+        log.error("trusted_dexes_unavailable", extra={"fields": {"error": type(e).__name__}})
     rep["versions"] = len(versions)
     use_stored: bool | None = None
     for v in versions:
@@ -805,10 +818,22 @@ def run_creator_signals(*, db: Any, now: datetime, runtime: Runtime | None = Non
                 bps = {c: weight_to_bps(weights.get(c, 0), int(v["max_leverage"])) for c in v["markets"]}
                 if sum(abs(x) for x in bps.values()) > int(v["max_leverage"]) * BPS:
                     raise ValidationFailed("Σ|weights| above MAX_LEVERAGE")
+                untrusted = sorted(c for c in bps if not is_trusted_coin(c, trusted))
+                if untrusted:
+                    rep["untrusted"] += len(untrusted)
+                    _emit(alerts, "critical", "creator_signal_untrusted_dex",
+                          {"strategy_version_id": v["version_id"], "strategy_id": v["strategy_id"],
+                           "bar_close": bar_close.isoformat(), "markets": untrusted,
+                           "dexes": sorted({dex_of(c) for c in untrusted}), "allowlist_loaded": trusted is not None},
+                          dedup=f"creator_signal_untrusted_dex:{v['version_id']}:{bar_close.isoformat()}")
+                    bps = {c: w for c, w in bps.items() if c not in untrusted}
+                    if not bps:
+                        continue
                 raw = {"weights": {c: str(weights.get(c, 0)) for c in v["markets"]}, "code_hash": v["code_hash"],
                        "cpu_seconds": result.get("cpu_seconds"), "bars_last_t": {c: (b[-1]["t"] if b else None)
                                                                                 for c, b in bars.items()},
-                       "missing_last_bar": missing, "computed_at": now.isoformat()}
+                       "missing_last_bar": missing, "untrusted_not_stored": untrusted,
+                       "computed_at": now.isoformat()}
                 rep["stored"] += repo.insert_signals(strategy_id=v["strategy_id"], version_id=v["version_id"],
                                                      bar_close=bar_close, weights_bps=bps, raw=raw)
                 log.info("creator_signal_stored", extra={"fields": {"strategy_version_id": v["version_id"],
@@ -851,14 +876,63 @@ def _agent_decryptor(rt: Runtime) -> Any:
         return rt._agent_decryptor
 
 
+def _agent_encryptor(rt: Runtime) -> Any:
+    """Agent-key SEALING (executor only, migrations/0016): ``make_encryptor`` refuses every other service role."""
+    with rt._lock:
+        if getattr(rt, "_agent_encryptor", None) is None:
+            from app.security.kms import make_encryptor
+
+            rt._agent_encryptor = make_encryptor(rt.settings)
+        return rt._agent_encryptor
+
+
+def _optional_signer(rt: Runtime) -> Any:
+    try:
+        return _attest_signer(rt)
+    except Exception as e:  # noqa: BLE001 - keys are still generated; attest_agents retries the signature
+        log.error("attestation_signer_unavailable", extra={"fields": {"error": type(e).__name__}})
+        return None
+
+
+def generate_agents(*, db: Any, now: datetime, runtime: Runtime | None = None, encryptor: Any = None,
+                    decryptor: Any = None, signer: Any = None, limit: int = 20,
+                    max_seconds: float = 30.0) -> dict[str, Any]:
+    """/internal/generate-agents (and the first half of /internal/attest-agents): executor-side agent key generation
+    for pending agent requests (see trust_jobs.generate_agents)."""
+    from .trust_jobs import generate_agents as _run
+
+    rt = runtime or get_runtime()
+    return _run(db, _aware(now), encryptor=encryptor or _agent_encryptor(rt),
+                decryptor=decryptor or _agent_decryptor(rt), signer=signer or _optional_signer(rt), limit=limit,
+                max_seconds=max_seconds)
+
+
+def tick_generate_agents(*, db: Any, now: datetime, runtime: Runtime | None = None) -> dict[str, Any] | None:
+    """Tick hook: a cheap SELECT first; KMS is only touched when a request is waiting. Budget: 5 keys / 5 s."""
+    from app.jobs_data import _db as jdb
+
+    with jdb.transaction(db) as conn:
+        waiting = jdb.one(conn, """SELECT 1 AS x FROM agent_keys WHERE status = 'requested' AND key_ciphertext IS NULL
+                                     AND attestation_failed_at IS NULL LIMIT 1""")
+    if not waiting:
+        return None
+    return generate_agents(db=db, now=now, runtime=runtime, limit=5, max_seconds=5.0)
+
+
 def attest_agents(*, db: Any, now: datetime, runtime: Runtime | None = None, signer: Any = None,
-                  decryptor: Any = None, limit: int = 100) -> dict[str, Any]:
-    """/internal/attest-agents (every minute): executor attestation of each new agent key (see trust_jobs)."""
+                  decryptor: Any = None, encryptor: Any = None, limit: int = 100) -> dict[str, Any]:
+    """/internal/attest-agents (every minute): generate keys for pending agent requests (executor keygen, 0016), then
+    attest executor-generated keys whose attestation is still missing (see trust_jobs)."""
     from .trust_jobs import attest_agents as _run
 
     rt = runtime or get_runtime()
-    return _run(db, _aware(now), decryptor=decryptor or _agent_decryptor(rt), signer=signer or _attest_signer(rt),
-                limit=limit)
+    dec = decryptor or _agent_decryptor(rt)
+    sig = signer or _attest_signer(rt)
+    keygen = generate_agents(db=db, now=now, runtime=rt, encryptor=encryptor, decryptor=dec, signer=sig,
+                             limit=min(int(limit), 50))
+    rep = _run(db, _aware(now), decryptor=dec, signer=sig, limit=limit)
+    rep["keygen"] = keygen
+    return rep
 
 
 def agent_substitution_scan(*, db: Any, now: datetime, runtime: Runtime | None = None, info: Any = None) -> dict[str, Any]:
@@ -881,4 +955,4 @@ def executor_selftest(*, db: Any, now: datetime, runtime: Runtime | None = None)
     return _run(pdb, _aware(now), runtime=rt, signer_factory=lambda: _attest_signer(rt))
 
 
-__all__ += ["attest_agents", "agent_substitution_scan", "executor_selftest"]
+__all__ += ["generate_agents", "tick_generate_agents", "attest_agents", "agent_substitution_scan", "executor_selftest"]

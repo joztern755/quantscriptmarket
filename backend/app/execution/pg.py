@@ -309,8 +309,10 @@ class PgSubscriptionRepo:
         gate = ("alert_contacts_entries_allowed(s.user_id, CAST(:now AS timestamptz))" if self._gate
                 else "(CAST(:now AS timestamptz) IS NULL AND false)")
         # REVIEW_MONEY L7/H3: a past_due subscription opens nothing once its grace period is over, even before the
-        # next 00:30 settlement flips it to reduce_only (domain.billing.entries_allowed)
-        gate = (f"({gate} AND NOT (s.status = 'past_due' AND (s.past_due_since IS NULL OR s.past_due_since"
+        # next 00:30 settlement flips it to reduce_only (domain.billing.entries_allowed).
+        # 0014: an admin-PAUSED strategy opens nothing either (exits and reductions keep running).
+        gate = (f"({gate} AND st.status::text <> 'paused'"
+                f" AND NOT (s.status = 'past_due' AND (s.past_due_since IS NULL OR s.past_due_since"
                 f" <= CAST(:now AS timestamptz) - make_interval(hours => {int(self.billing_grace_hours)}))))")
         return f"{_SUB_VIEW_COLS}, {gate} AS entries_allowed"
 
@@ -640,7 +642,7 @@ class PgSettlementRepo:
                    {bps} AS profit_share_bps,
                    {price} AS price_monthly_micro, s.cum_pnl_micro, s.hwm_micro,
                    s.pnl_cursor, s.current_period_end, s.past_due_since, s.created_at, s.trading_address,
-                   s.cancelled_at
+                   s.cancelled_at, st.status::text AS strategy_status
               FROM subscriptions s JOIN strategies st ON st.id = s.strategy_id
              WHERE s.status IN ('active', 'past_due', 'reduce_only', 'paused_user', 'closing')
                 OR (s.status = 'cancelled' AND s.cancelled_at IS NOT NULL
@@ -654,7 +656,8 @@ class PgSettlementRepo:
             current_period_end=as_datetime(r["current_period_end"]), past_due_since=as_datetime(r["past_due_since"]),
             created_at=as_datetime(r["created_at"]),
             trading_address=str(r["trading_address"]).lower() if r.get("trading_address") else None,
-            cancelled_at=as_datetime(r.get("cancelled_at"))) for r in rows]
+            cancelled_at=as_datetime(r.get("cancelled_at")),
+            strategy_status=str(r.get("strategy_status") or "listed")) for r in rows]
 
     def data_coverage(self, trading_addresses: Sequence[str]) -> dict[str, DataCoverage]:
         """``job_cursors`` of fills-ingest (job ``fills``) and funding-scan (job ``funding``), key = trading address.
@@ -772,12 +775,15 @@ class PgSettlementRepo:
     def lock_for_billing(self, subscription_id: str) -> dict[str, Any] | None:
         """REVIEW_MONEY M8: the CURRENT billing state, row-locked inside the renewal transaction (the settlement
         loaded its list earlier; a cancel / pause / unpause-with-renewal may have landed since)."""
-        r = self.db.one("""SELECT status::text AS status, cancelled_at, current_period_end FROM subscriptions
-                            WHERE id = CAST(:s AS uuid) FOR UPDATE""", s=subscription_id)
+        r = self.db.one("""SELECT s.status::text AS status, s.cancelled_at, s.current_period_end,
+                                  st.status::text AS strategy_status
+                             FROM subscriptions s JOIN strategies st ON st.id = s.strategy_id
+                            WHERE s.id = CAST(:s AS uuid) FOR UPDATE OF s""", s=subscription_id)
         if r is None:
             return None
         return {"status": r["status"], "cancelled_at": as_datetime(r.get("cancelled_at")),
-                "current_period_end": as_datetime(r.get("current_period_end"))}
+                "current_period_end": as_datetime(r.get("current_period_end")),
+                "strategy_status": str(r.get("strategy_status") or "listed")}
 
     def _our_fill_fee_sql(self) -> str:
         """Builder fee we may recognise for fill ``f`` (REVIEW_MONEY H2): only a fill of an order WE recorded for that
@@ -973,8 +979,29 @@ class PgChainVerifier:
 # ---------------------------------------------------------------------------------------------------------- reconcile
 
 class PgReconcileRepo:
-    def __init__(self, db: PgDatabase) -> None:
+    def __init__(self, db: PgDatabase, economics: Economics | None = None) -> None:
         self.db = db
+        self.economics = economics
+
+    # REVIEW_MONEY M7(b)/(c): resumable cursors of the reconcile bookings (job_cursors, job 'reconcile')
+    def get_cursor(self, name: str) -> int | None:
+        r = self.db.one("SELECT cursor_ms FROM job_cursors WHERE job = 'reconcile' AND key = CAST(:k AS text)", k=name)
+        return int(r["cursor_ms"]) if r and r.get("cursor_ms") is not None else None
+
+    def set_cursor(self, name: str, cursor_ms: int) -> None:
+        """Monotonic upsert (a concurrent / older run never moves it back)."""
+        self.db.all("""
+            INSERT INTO job_cursors (job, key, cursor_ms) VALUES ('reconcile', CAST(:k AS text), CAST(:c AS bigint))
+            ON CONFLICT (job, key) DO UPDATE SET cursor_ms = greatest(job_cursors.cursor_ms, EXCLUDED.cursor_ms)
+            RETURNING job""", k=name, c=int(cursor_ms))
+
+    def unrecognised_builder_fees_micro(self) -> int:
+        """Σ builder fee settlement WILL recognise for fills stored but not recognised yet (same per-fill amount as
+        ``PgSettlementRepo.unrecognised_builder_fee_fills``): the receivable's timing difference vs on-chain."""
+        fee = PgSettlementRepo(self.db, self.economics)._our_fill_fee_sql()
+        row = self.db.one(f"""SELECT coalesce(sum({fee}), 0)::bigint AS total FROM fills f
+                               WHERE f.builder_fee_recognised_at IS NULL""")
+        return int(row["total"]) if row else 0
 
     def solvency_ledger(self) -> dict[str, int]:
         """REVIEW_MONEY M7(d): normal balances of every liability class and of the non-treasury assets."""

@@ -1,6 +1,6 @@
 # Cloud Run service "api" — public API behind Cloudflare -> Global HTTPS LB (Cloud Armor) -> this service.
 # Rendered by infra/gcp/render.py in deploy.yml, applied with `gcloud run services replace`.
-# Identity: aijalon-api SA (KMS ENCRYPT only on agent-keys, Cloud SQL IAM login, its own secrets).
+# Identity: aijalon-api SA (KMS ENCRYPT only on creator-code, NO role on agent-keys — migrations/0016; Cloud SQL IAM login, its own secrets).
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
@@ -56,7 +56,7 @@ spec:
             - {name: FIREBASE_PROJECT_ID, value: "${PROJECT_ID}"}
             - {name: FIREBASE_AUTH_DOMAIN, value: "${WEB_DOMAIN}"}
             - {name: EMAIL_FROM, value: "alerts@${WEB_DOMAIN}"}
-            - {name: KMS_KEY_NAME, value: "${KMS_KEY_NAME}"}
+            - {name: KMS_KEY_NAME, value: "${KMS_KEY_NAME}"}   # name only (config check); the api has NO role on agent-keys
             - {name: CREATOR_CODE_KMS_KEY_NAME, value: "${KMS_CODE_KEY_NAME}"}   # encrypt-only (IAM)
             - {name: HL_EGRESS_KEY, value: "api"}               # api NAT IP; user-triggered HL reads budgeted here
             - {name: HL_TICK_RESERVE_PER_MINUTE, value: "0"}    # no executor tick behind the api IP

@@ -282,17 +282,23 @@ def earnings(ctx: AuthCtx = Depends(creator_user), svc: Services = Depends(get_s
 
 @router.post("/kyc/session", response_model=S.KycSessionOut, dependencies=[user_limit("kyc", 5, 3600)])
 def kyc_session(ctx: AuthCtx = Depends(creator_user), svc: Services = Depends(get_services)) -> S.KycSessionOut:
+    return start_kyc_session(ctx, svc, return_path="/#/creator/kyc", audit_action="creator.kyc.session")
+
+
+def start_kyc_session(ctx: AuthCtx, svc: Services, *, return_path: str, audit_action: str) -> S.KycSessionOut:
+    """One identity KYC per user (table kyc_creators) — the same record unlocks creator listing / paid posts /
+    payouts AND referrer payouts; ONE admin decides (POST /v1/admin/users/{id}/kyc)."""
     with svc.db.begin() as conn:
         kyc = svc.store.get_kyc(conn, ctx.user_id)
     if kyc and kyc["status"] == "approved":
         raise Conflict("KYC already approved")
     if kyc and kyc["status"] == "provider_approved":
         raise Conflict("verification passed; awaiting confirmation by our team", reason="awaiting_admin")
-    session = svc.kyc.create_session(user_id=ctx.user_id, return_url=f"{svc.settings.web_origin}/#/creator/kyc")
+    session = svc.kyc.create_session(user_id=ctx.user_id, return_url=f"{svc.settings.web_origin}{return_path}")
     with svc.db.begin() as conn:
         svc.store.upsert_kyc_pending(conn, user_id=ctx.user_id, provider=str(session["provider"]),
                                      provider_ref=str(session["provider_ref"]))
-        svc.audit.write(conn, actor=ctx.actor, action="creator.kyc.session", target=f"user:{ctx.user_id}",
+        svc.audit.write(conn, actor=ctx.actor, action=audit_action, target=f"user:{ctx.user_id}",
                         payload={"provider": str(session["provider"])}, ip_hash=ctx.ip_hash)
     return S.KycSessionOut(url=str(session.get("url") or ""), provider=str(session["provider"]),
                            status=str(session.get("status") or "pending"), manual=bool(session.get("manual")))

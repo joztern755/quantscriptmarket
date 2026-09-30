@@ -3,7 +3,7 @@
 Sign convention (migrations/0001_init.sql): amount_micro + = DEBIT, − = CREDIT. A user's fee balance is a
 liability, so spending it is a DEBIT (+) on `user:{id}:fee_balance` and topping it up is a CREDIT (−).
 
-Every posting is idempotent on its ledger key (the DB's ledger_post() returns the existing tx for a repeated key
+Every posting is idempotent on its ledger key (the DB's ledger_post_as() returns the existing tx for a repeated key
 with identical content and raises AJ409 for different content). Keys used here never collide with the
 settlement job's keys (`sub:{id}:{period_end}`, `plan:{uid}:{period_end}`, `ps:…`, `bf:…`).
 """

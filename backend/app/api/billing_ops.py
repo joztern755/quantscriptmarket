@@ -6,6 +6,11 @@ REVIEW_MONEY.md H3 H4 H5 M1 M6 L1). No FastAPI imports (unit-testable against a 
   is refused with 402 — a pause/unpause cycle never re-activates an unpaid subscription or restarts its grace.
 * Delisting (H5): trading subscriptions → ``closing`` (reduce-only exit, then cancelled; billing stops), paused /
   pending ones → ``cancelled`` (positions left as they are); every user gets a mandatory ``strategy_ended`` alert.
+* Admin strategy pause (0014): subscription statuses are kept; ``strategies.paused_at`` is recorded, settlement
+  charges no renewal while the strategy is paused, the executor opens nothing (exits run), subscribe / user resume
+  need ``listed``; every live subscriber gets the mandatory ``strategy_paused`` alert. Unpause (listing approval from
+  ``paused``) credits the paused time back to each prepaid period that was still running, and billing resumes at the
+  pinned price; subscribers get ``strategy_resumed``.
 * Chargeback / refund (M6, L1): a reversal that leaves the fee balance negative moves the user's billable
   subscriptions to ``reduce_only`` at once; a full reversal marks the deposit ``reversed``.
 * Money out (F4/H4, F5, M1): the withdrawable amount is the USDC-funded unspent balance (card lot spent first),
@@ -27,6 +32,7 @@ from . import ledger_ops
 __all__ = [
     "PAYOUT_ADDRESS_HOLD", "SECURITY_HOLD", "CARD_DISPUTE_HOLD", "MAX_POST_PRICE_MICRO",
     "renewal_key", "charge_subscription_renewal", "resume_subscription", "end_strategy_subscriptions",
+    "pause_strategy_subscriptions", "resume_strategy_subscriptions",
     "after_payment_reversal", "payout_holds", "require_no_payout_hold", "accrued_profit_share",
     "require_withdrawal_headroom", "payout_available",
 ]
@@ -139,6 +145,33 @@ def end_strategy_subscriptions(conn: Any, svc: Any, *, strategy_id: str, strateg
                                      "reason": "strategy_delisted"},
                             dedup_key=f"strategy_ended:{r['id']}")
     return {"closing": closing, "cancelled": cancelled}
+
+
+# ---------------------------------------------------------------------------------------------- admin pause (0014)
+def pause_strategy_subscriptions(conn: Any, svc: Any, *, strategy_id: str, strategy_name: Optional[str]) -> int:
+    """Admin paused the strategy: record the pause start and alert every live subscriber (mandatory kind)."""
+    now = svc.now()
+    rows = svc.store.mark_strategy_paused(conn, strategy_id, now)
+    for r in rows:
+        svc.notifier.notify(conn, user_id=str(r["user_id"]), severity="warn", kind="strategy_paused",
+                            payload={"strategy_id": strategy_id, "strategy": strategy_name,
+                                     "subscription_id": str(r["id"]), "reason": "admin_pause"},
+                            dedup_key=f"strategy_paused:{r['id']}:{_utc(now).isoformat()}")
+    return len(rows)
+
+
+def resume_strategy_subscriptions(conn: Any, svc: Any, *, strategy_id: str, strategy_name: Optional[str]) -> int:
+    """The paused strategy is listed again: paused time back on running prepaid periods; subscribers told."""
+    now = svc.now()
+    paused_at, rows = svc.store.resume_strategy_billing(conn, strategy_id, now)
+    for r in rows:
+        end = r.get("current_period_end")
+        svc.notifier.notify(conn, user_id=str(r["user_id"]), severity="info", kind="strategy_resumed",
+                            payload={"strategy_id": strategy_id, "strategy": strategy_name,
+                                     "subscription_id": str(r["id"]),
+                                     "period_end": end.isoformat() if isinstance(end, datetime) else end},
+                            dedup_key=f"strategy_resumed:{r['id']}:{_utc(now).isoformat()}")
+    return len(rows)
 
 
 # ---------------------------------------------------------------------------------------------- reversals (M6, L1)

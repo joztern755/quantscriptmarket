@@ -338,6 +338,26 @@ class StripeHttpGateway:
             raise ExternalServiceError("stripe unreachable", error=type(e).__name__) from None
         return self._handle(resp, "retrieve_payment_intent")
 
+    # -- balance (read-only; REVIEW_MONEY M7(c) reconcile: app.execution.treasury_books.StripeBalanceReader)
+    def retrieve_balance(self) -> dict:
+        try:
+            resp = self._session_().get(f"{self.api_base}/v1/balance", headers=self._headers(), timeout=self.timeout)
+        except Exception as e:
+            raise ExternalServiceError("stripe unreachable", error=type(e).__name__) from None
+        return self._handle(resp, "retrieve_balance")
+
+    def list_balance_transactions(self, params: Mapping[str, Any]) -> dict:
+        allowed = {"type", "created[gte]", "limit", "starting_after", "payout"}
+        if set(params) - allowed:
+            raise ValidationFailed("unsupported balance_transactions parameter")
+        try:
+            resp = self._session_().get(f"{self.api_base}/v1/balance_transactions",
+                                        params=[(k, _scalar(v)) for k, v in params.items() if v is not None],
+                                        headers=self._headers(), timeout=self.timeout)
+        except Exception as e:
+            raise ExternalServiceError("stripe unreachable", error=type(e).__name__) from None
+        return self._handle(resp, "list_balance_transactions")
+
 
 def _stripe_lib():
     try:
@@ -393,6 +413,26 @@ class StripeLibGateway:
             return _plain(self._lib.PaymentIntent.retrieve(pi_id, **kw))
         except Exception as e:
             raise ExternalServiceError("stripe retrieve_payment_intent failed", error=type(e).__name__) from None
+
+    def retrieve_balance(self) -> dict:
+        try:
+            return _plain(self._lib.Balance.retrieve(**self._opts()))
+        except Exception as e:
+            raise ExternalServiceError("stripe retrieve_balance failed", error=type(e).__name__) from None
+
+    def list_balance_transactions(self, params: Mapping[str, Any]) -> dict:
+        kw: dict[str, Any] = dict(self._opts())
+        for k, v in params.items():
+            if k == "created[gte]":
+                kw["created"] = {"gte": v}
+            elif k in ("type", "limit", "starting_after", "payout"):
+                kw[k] = v
+            else:
+                raise ValidationFailed("unsupported balance_transactions parameter")
+        try:
+            return _plain(self._lib.BalanceTransaction.list(**kw))
+        except Exception as e:
+            raise ExternalServiceError("stripe list_balance_transactions failed", error=type(e).__name__) from None
 
 
 def default_gateway(settings: Any) -> StripeGateway:

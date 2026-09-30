@@ -238,11 +238,14 @@ def main() -> None:
             "CRITICAL", "Only the executor may decrypt agent keys (SPEC §2.1). Treat as key compromise: "
             "set kill_switch_global, revoke the principal, rotate agent keys (docs/RUNBOOK.md).", ch, 60),
         log_policy(
-            "SEC: agent-keys ENCRYPT by anyone but api",
+            "SEC: agent-keys ENCRYPT by anyone but executor",
             'protoPayload.serviceName="cloudkms.googleapis.com" AND protoPayload.methodName="Encrypt" '
             f'AND protoPayload.resourceName:"cryptoKeys/{E["KMS_KEY"]}" '
-            f'AND NOT protoPayload.authenticationInfo.principalEmail="{api}"',
-            "ERROR", "Unexpected encrypt on agent-keys.", ch),
+            f'AND NOT protoPayload.authenticationInfo.principalEmail="{ex}"',
+            "CRITICAL", "Only the executor generates and seals agent keys (migrations/0016). An encrypt by any other "
+            "principal (the api included) means someone is trying to plant an agent key they know: set "
+            "kill_switch_global, revoke the principal, check agent_keys rows without keygen_at (docs/RUNBOOK.md).",
+            ch, 60),
         log_policy(
             "SEC: KMS key admin change (disable/destroy/primary/IAM)",
             'protoPayload.serviceName="cloudkms.googleapis.com" AND protoPayload.methodName=('

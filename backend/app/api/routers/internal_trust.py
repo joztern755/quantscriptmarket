@@ -2,6 +2,10 @@
 by ``create_executor_app`` next to routers/internal.py; same Cloud Scheduler OIDC authentication.
 
 POST /v1/internal/attest-agents             every minute  — app.execution.jobs.attest_agents
+                                                              (generates keys for pending agent requests first —
+                                                              executor keygen, migrations/0016 — then attests)
+POST /v1/internal/generate-agents           on demand     — app.execution.jobs.generate_agents (keygen only; the
+                                                              tick also runs it with a small budget every minute)
 POST /v1/internal/agent-substitution-scan   every 10 min  — app.execution.jobs.agent_substitution_scan
 POST /v1/internal/selftest                  deploy only   — app.execution.jobs.executor_selftest
 
@@ -33,8 +37,8 @@ def _register_jobs() -> None:
         from app.api.adapters import JOB_ENTRYPOINTS
     except ImportError:  # pragma: no cover
         return
-    for name, fn in (("attest-agents", "attest_agents"), ("agent-substitution-scan", "agent_substitution_scan"),
-                     ("selftest", "executor_selftest")):
+    for name, fn in (("attest-agents", "attest_agents"), ("generate-agents", "generate_agents"),
+                     ("agent-substitution-scan", "agent_substitution_scan"), ("selftest", "executor_selftest")):
         JOB_ENTRYPOINTS.setdefault(name, (("app.execution.jobs", fn),))
 
 
@@ -82,6 +86,11 @@ def _run(svc: Services, job: str) -> S.JobOut:
 @router.post("/attest-agents", response_model=S.JobOut, dependencies=[Depends(scheduler_auth)])
 def attest_agents(svc: Services = Depends(get_services)) -> S.JobOut:
     return _run(svc, "attest-agents")
+
+
+@router.post("/generate-agents", response_model=S.JobOut, dependencies=[Depends(scheduler_auth)])
+def generate_agents(svc: Services = Depends(get_services)) -> S.JobOut:
+    return _run(svc, "generate-agents")
 
 
 @router.post("/agent-substitution-scan", response_model=S.JobOut, dependencies=[Depends(scheduler_auth)])

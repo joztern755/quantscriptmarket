@@ -1,16 +1,18 @@
-// Agent attestation (SECURITY H1). The EXECUTOR — the only service that can decrypt agent keys — checks that a
-// user's sealed agent key really decrypts to `agent_address` and then signs
-//     aijalon-agent-v1|{user_id}|{agent_address}
+// Agent attestation (SECURITY H1; executor keygen, migrations/0016). The EXECUTOR — the only service that can
+// generate, seal and decrypt agent keys — generates the user's agent key itself, checks the sealed blob re-opens to
+// `agent_address`, and then signs
+//     aijalon-agent-v2|{user_id}|{agent_address}
 // with a Cloud KMS asymmetric key (EC_SIGN_P256_SHA256, HSM) that the api service account cannot use. The browser
 // verifies that signature with the public key PINNED in app-config.json (Hosting, reviewed commit) before it asks
 // the wallet to sign ApproveAgent. A compromised api or edge can therefore no longer substitute its own agent
-// address: it cannot produce a valid attestation for it.
+// address (it cannot produce a valid attestation), and — since the api can no longer generate or seal agent keys at
+// all — cannot get a key it KNOWS attested either. v1 attestations (api-generated keys, before 0016) are refused.
 //
 // WebCrypto verifies ECDSA P-256 natively; KMS returns an ASN.1 DER ECDSA-Sig-Value, WebCrypto wants raw r||s.
 
 import { trustAnchors } from "./config.js";
 
-export const AGENT_ATTEST_PREFIX = "aijalon-agent-v1";
+export const AGENT_ATTEST_PREFIX = "aijalon-agent-v2";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ADDR = /^0x[0-9a-fA-F]{40}$/;

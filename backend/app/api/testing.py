@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Iterator, Optional
 
-from app.api.deps import SealedAgentKey, Services
+from app.api.deps import Services
 from app.config import Settings, get_settings
 from app.errors import AppError, Conflict, InsufficientBalance, Unauthorized, ValidationFailed
 
@@ -48,6 +48,7 @@ class FakeWorld:
     wallets: dict[str, dict] = field(default_factory=dict)          # address -> row
     nonces: dict[str, dict] = field(default_factory=dict)
     agents: dict[str, dict] = field(default_factory=dict)
+    keygen_calls: int = 0
     strategies: dict[str, dict] = field(default_factory=dict)
     versions: dict[str, dict] = field(default_factory=dict)
     subscriptions: dict[str, dict] = field(default_factory=dict)
@@ -96,9 +97,23 @@ class FakeWorld:
     def add_agent(self, user_id: str, master: str, *, status: str = "active") -> dict:
         row = {"id": _id(), "created_at": self.now, "user_id": user_id, "master_address": master,
                "agent_address": "0x" + hashlib.sha256(master.encode()).hexdigest()[:40], "agent_name": "aijalon",
-               "status": status, "approved_at": self.now if status == "active" else None, "revoked_at": None}
+               "status": status, "approved_at": self.now if status == "active" else None, "revoked_at": None,
+               "keygen_at": self.now, "attestation_sig": None, "attestation_key_version": None, "attested_at": None,
+               "attestation_failed_at": None}
         self.agents[row["id"]] = row
         return row
+
+    def executor_keygen(self, agent_id: str, *, attestation_sig: Optional[str] = "QUJD" * 24) -> dict:
+        """What the EXECUTOR does for a request (app.execution.trust_jobs.generate_agents): address + attestation,
+        status requested → pending_approval. The api has no code path that can do this."""
+        a = self.agents[agent_id]
+        assert a["status"] == "requested" and a["agent_address"] is None
+        self.keygen_calls += 1
+        a.update(agent_address="0x" + hashlib.sha256(f"agent{agent_id}".encode()).hexdigest()[:40],
+                 status="pending_approval", keygen_at=self.now, attestation_sig=attestation_sig,
+                 attestation_key_version="local-dev:test" if attestation_sig else None,
+                 attested_at=self.now if attestation_sig else None)
+        return a
 
     def add_strategy(self, slug: str = "silver", *, price: int = 0, profit_share_bps: int = 0, status: str = "listed",
                      in_house: bool = True, owner: Optional[str] = None, markets: tuple[str, ...] = ("xyz:SILVER",),
@@ -152,9 +167,10 @@ _LIVE = ("pending", "active", "past_due", "reduce_only", "paused_user", "closing
 
 
 from app.api.testing_security import FakeSecurityStoreMixin  # noqa: E402  (security-fix round store fakes)
+from app.api.testing_cleanup import FakeCleanupStoreMixin  # noqa: E402  (clean-up round store fakes)
 
 
-class FakeStore(FakeSecurityStoreMixin):
+class FakeStore(FakeSecurityStoreMixin, FakeCleanupStoreMixin):
     def __init__(self, world: FakeWorld) -> None:
         self.w = world
 
@@ -305,7 +321,10 @@ class FakeStore(FakeSecurityStoreMixin):
 
     def live_agents_for_master(self, conn, master):
         return [dict(a) for a in self.w.agents.values()
-                if a["master_address"] == master and a["status"] in ("pending_approval", "active")]
+                if a["master_address"] == master and a["status"] in ("requested", "pending_approval", "active")]
+
+    def get_agent_detail(self, conn, agent_id, user_id):
+        return self.get_agent(conn, agent_id, user_id)
 
     def active_agent_for_master(self, conn, user_id, master):
         return next((dict(a) for a in self.w.agents.values() if a["master_address"] == master
@@ -314,12 +333,13 @@ class FakeStore(FakeSecurityStoreMixin):
     def set_agent_status(self, conn, agent_id, status, now):
         self.w.agents[agent_id]["status"] = status
 
-    def insert_agent(self, conn, *, user_id, master, agent_address, agent_name, key_ciphertext, kms_key_version):
+    def insert_agent_request(self, conn, *, user_id, master, agent_name):
         if self.live_agents_for_master(conn, master):
             raise AssertionError("unique index agent_keys_one_live_per_master violated")
         row = {"id": _id(), "created_at": self.w.now, "user_id": user_id, "master_address": master,
-               "agent_address": agent_address, "agent_name": agent_name, "status": "pending_approval",
-               "approved_at": None, "revoked_at": None}
+               "agent_address": None, "agent_name": agent_name, "status": "requested",
+               "approved_at": None, "revoked_at": None, "keygen_at": None, "attestation_sig": None,
+               "attestation_key_version": None, "attested_at": None, "attestation_failed_at": None}
         self.w.agents[row["id"]] = row
         return dict(row)
 
@@ -660,16 +680,6 @@ class FakeLedger:
         return self.w.balances.get(account_code, 0)
 
 
-class FakeAgentKeys:
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def generate_sealed(self, user_id: str) -> SealedAgentKey:
-        self.calls += 1
-        addr = "0x" + hashlib.sha256(f"agent{user_id}{self.calls}".encode()).hexdigest()[:40]
-        return SealedAgentKey(agent_address=addr, key_ciphertext=b"\x01sealed", kms_key_version="v1")
-
-
 class FakeTypedData:
     def approve_agent(self, **kw):
         return {"typed_data": {"primaryType": "HyperliquidTransaction:ApproveAgent", "message": kw}, "action": kw,
@@ -815,7 +825,7 @@ def make_services(world: FakeWorld, settings: Optional[Settings] = None, **overr
     s = settings or make_settings(launch_phase="public", payouts_enabled=True)
     svc = Services(
         settings=s, db=FakeDatabase(world), store=FakeStore(world), auth=FakeAuth(), audit=FakeAudit(world),
-        ledger=FakeLedger(world), agent_keys=FakeAgentKeys(), typed_data=FakeTypedData(), hl=FakeHl(),
+        ledger=FakeLedger(world), typed_data=FakeTypedData(), hl=FakeHl(),
         stripe=FakeStripe(), usdc=_Unused(), notifier=FakeNotifier(world), sandbox=_Unused(), code_vault=_Unused(),
         kyc=_Unused(), jobs=FakeJobs(world), ratelimit=AllowAllRateLimit(), oidc=FakeOidc(), wallet_sig=_Unused(),
         domain=DomainAdapter(s), clock=lambda: world.now,

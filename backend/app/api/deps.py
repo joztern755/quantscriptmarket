@@ -238,15 +238,8 @@ class LedgerPort(Protocol):
     def balance(self, conn: Any, account_code: str) -> int: ...              # raw Σ amount_micro (debit +)
 
 
-@dataclass(frozen=True)
-class SealedAgentKey:
-    agent_address: str
-    key_ciphertext: bytes
-    kms_key_version: str
-
-
-class AgentKeyPort(Protocol):
-    def generate_sealed(self, user_id: str) -> SealedAgentKey: ...   # AAD binds user_id; plaintext never leaves
+# Agent keys: deliberately NO port. The api never generates, seals or opens an agent private key; POST /v1/agents
+# inserts a request row and the EXECUTOR generates the key (app.execution.trust_jobs.generate_agents, 0016).
 
 
 class TypedDataPort(Protocol):
@@ -347,7 +340,6 @@ class Services:
     auth: AuthPort
     audit: AuditPort
     ledger: LedgerPort
-    agent_keys: AgentKeyPort
     typed_data: TypedDataPort
     hl: HlInfoPort
     stripe: StripePort

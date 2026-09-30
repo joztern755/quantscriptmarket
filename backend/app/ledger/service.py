@@ -9,9 +9,13 @@ SIGN CONVENTION (same as backend/migrations/0001_init.sql header):
     refunds pending; suspense:*) may not be DECREASED below zero. The ONLY exception is the fixed (kind, account)
     allowlist ``overdraft_allowed``: a ``user:{uuid}:fee_balance`` may be overdrawn by ``OVERDRAFT_KINDS`` (debts that
     exist regardless). The DB (0010_money_fixes.sql) enforces the same rule at commit (SQLSTATE AJ402 ->
-    ``InsufficientBalance``), and additionally GATES those kinds by role: profit_share only for app_executor,
-    stripe_refund / stripe_dispute only through ``ledger_post_payment_reversal`` (SECURITY DEFINER, used by
-    ``PostgresLedgerStore`` for those kinds), ps_pending_release only through the SQL ``ps_pending_release``.
+    ``InsufficientBalance``).
+  * Posting lockdown (0015_ledger_lockdown.sql, REVIEW_MONEY M5): the app roles cannot INSERT into the ledger tables;
+    every posting goes through the SECURITY DEFINER ``ledger_post_as(role, …)`` and must match a row of the fixed
+    ``ledger_posting_rules`` table for (posting role, kind): key pattern, debit / credit account patterns, entry
+    counts (e.g. profit_share only as app_executor, stripe_refund / stripe_dispute only as app_api with key
+    ``stripe:refund:…`` / ``stripe:dispute:…`` and exactly fee balance → stripe:clearing, ps_pending_release only by
+    the SQL ``ps_pending_release`` as 'system'). Anything else → AJ403 → ``ValidationFailed``.
   * Uncollected profit share (REVIEW_MONEY C1): ``ps_pending:{user}:{creator}`` / ``ps_pending:{user}:platform`` hold
     the part of a profit-share charge the user's fee balance did not cover. They are never payable; the DB releases
     them to ``creator:{id}:payable`` / ``platform:revenue:profit_share`` pro-rata when the user tops up.
@@ -21,7 +25,7 @@ Idempotency: ``idempotency_key`` is unique. Re-posting the same key with the sam
 different content raises ``Conflict``.
 
 Storage is behind the small ``LedgerStore`` protocol:
-  * ``app.db.repositories.ledger.PostgresLedgerStore`` (prod; calls SQL function ``ledger_post``)
+  * ``app.db.repositories.ledger.PostgresLedgerStore`` (prod; calls SQL function ``ledger_post_as``)
   * ``app.ledger.memory.InMemoryLedgerStore`` (tests; same rules, same hash chain)
 Every public function takes ``conn`` = a ``LedgerStore`` or a SQLAlchemy Connection / ``SqlRunner`` (wrapped in
 ``PostgresLedgerStore`` automatically).
@@ -46,6 +50,7 @@ __all__ = [
     "ps_pending_account",
     "PLATFORM_REVENUE_BUILDER", "PLATFORM_REVENUE_PROFIT_SHARE", "PLATFORM_REVENUE_SUBSCRIPTION",
     "PLATFORM_REVENUE_POSTS", "PLATFORM_REVENUE_PLANS", "TREASURY_HL_USDC", "STRIPE_CLEARING", "BUILDER_HL_RECEIVABLE",
+    "BANK_PAYOUTS", "EXPENSE_STRIPE_FEES",
     "fee_balance_account", "creator_payable_account", "referrer_payable_account", "default_account_spec",
     "validate_account_code", "normalize_entries", "entries_digest", "canonical_json", "tx_hash",
     "ensure_account", "post_transaction", "get_balance", "normal_balance", "available_fee_balance",
@@ -72,6 +77,9 @@ PLATFORM_REVENUE_PLANS = "platform:revenue:plans"
 TREASURY_HL_USDC = "treasury:hl_usdc"
 STRIPE_CLEARING = "stripe:clearing"
 BUILDER_HL_RECEIVABLE = "builder:hl_receivable"
+# Seeded by 0015_ledger_lockdown.sql (REVIEW_MONEY M7(c)): Stripe balance paid out to the bank; payout fees
+BANK_PAYOUTS = "bank:payouts"
+EXPENSE_STRIPE_FEES = "expense:stripe_fees"
 
 _CODE_RE = re.compile(r"^[a-z0-9_]+(:[a-z0-9_.-]+)+$")
 _TX_KIND_RE = re.compile(r"^[a-z][a-z0-9_.]{0,63}$")

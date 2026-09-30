@@ -397,19 +397,38 @@ class AgentCreateIn(In):
 class AgentOut(Out):
     id: UUID
     master_address: str
-    agent_address: str
+    agent_address: Optional[str] = None         # null while status = 'requested' (the executor generates the key)
     agent_name: str
-    status: str
+    status: str                                 # requested | pending_approval | active | revoked | rotated | expired
     approved_at: Optional[datetime] = None
     created_at: datetime
 
 
 class AgentCreateOut(Out):
+    """POST /v1/agents: the agent REQUEST. ``agent.agent_address`` is null and ``approve_agent`` is null — the executor
+    generates the key; poll GET /v1/agents/{id} until ``ready`` (address + executor attestation)."""
     agent: AgentOut
-    approve_agent: dict[str, Any]               # {action, typed_data} for the browser wallet to sign
+    approve_agent: Optional[dict[str, Any]] = None   # never set by POST any more (the browser builds it locally)
     approve_builder_fee: Optional[dict[str, Any]] = None
     exchange_url: str
     required_builder_fee_tenths_bp: int
+
+
+class AgentKeyAttestationOut(Out):
+    signature_b64: str
+    key_version: str
+    attested_at: datetime
+
+
+class AgentDetailOut(Out):
+    """GET /v1/agents/{id}. ``ready`` = the executor generated the key AND attested it (the browser still verifies the
+    attestation against the pinned public key before any wallet signature). ``failed`` = the executor refused this
+    request (critical ops alert raised) — create a new agent."""
+    agent: AgentOut
+    user_id: UUID
+    ready: bool
+    failed: bool = False
+    attestation: Optional[AgentKeyAttestationOut] = None
 
 
 class BuilderApprovalConfirmIn(In):
@@ -664,6 +683,9 @@ class ReferralsOut(Out):
     earnings_payable_micro: int
     earnings_total_micro: int
     next_tier: Optional[ReferralTierOut] = None
+    # REVIEW_MONEY M2: referral payouts need KYC approved (none | pending | provider_approved | approved | rejected)
+    kyc_status: str = "none"
+    payout_kyc_required: bool = True
 
 
 # ---------------------------------------------------------------------------------------------------- creator

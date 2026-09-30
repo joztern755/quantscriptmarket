@@ -151,9 +151,10 @@ class ApiAdapterTest(unittest.TestCase):
         from app.api import adapters
 
         svc = adapters.build_services(settings(service_role="api"))
-        self.assertIsNot(svc.code_vault._enc, svc.agent_keys._enc)          # never one instance for both
+        self.assertFalse(hasattr(svc, "agent_keys"))                        # the api has no agent-key path (0016)
         self.assertEqual(svc.code_vault._enc._factory, "make_code_encryptor")
-        self.assertEqual(svc.agent_keys._enc._factory, "make_encryptor")
+        with self.assertRaises(ValueError):
+            adapters._Encryptor(settings(service_role="api"), "make_encryptor")
         aad = kms.creator_code_aad("sid", "h")
         ct, _ = svc.code_vault.seal(b"code", aad)
         self.assertEqual(bytes(kms.make_code_decryptor(settings()).open(ct, aad)), b"code")
@@ -168,11 +169,19 @@ class InfraTest(unittest.TestCase):
         self.assertIn('KMS_CODE_KEY:=creator-code', env)
         self.assertIn('KMS_CODE_KEY_NAME=', env)
         self.assertRegex(boot, r'gcloud kms keys create "\$\{KMS_CODE_KEY\}"[^\n]*\\\n[^\n]*--protection-level=hsm')
-        loop = re.search(r'for key in "\$\{KMS_KEY\}" "\$\{KMS_CODE_KEY\}"; do(.*?)done', boot, re.S)
-        self.assertIsNotNone(loop)
-        body = loop.group(1)
-        self.assertIn('--member="serviceAccount:${SA_API}" --role=roles/cloudkms.cryptoKeyEncrypter', body)
-        self.assertIn('--member="serviceAccount:${SA_EXECUTOR}" --role=roles/cloudkms.cryptoKeyDecrypter', body)
+        start = boot.index("# creator-code: api ENCRYPT only")
+        body = boot[start:boot.index("# api + executor: Cloud SQL client", start)]
+        # creator-code: api encrypt, executor decrypt
+        self.assertRegex(body, r'add-iam-policy-binding "\$\{KMS_CODE_KEY\}"[^\n]*\\\n\s*--member="serviceAccount:\$\{SA_API\}" '
+                               r'--role=roles/cloudkms.cryptoKeyEncrypter')
+        self.assertRegex(body, r'add-iam-policy-binding "\$\{KMS_CODE_KEY\}"[^\n]*\\\n\s*--member="serviceAccount:\$\{SA_EXECUTOR\}" '
+                               r'--role=roles/cloudkms.cryptoKeyDecrypter')
+        # agent-keys (0016): executor encrypt + decrypt, the api binding is REMOVED, never EncrypterDecrypter
+        self.assertIn('for role in roles/cloudkms.cryptoKeyEncrypter roles/cloudkms.cryptoKeyDecrypter; do', body)
+        self.assertRegex(body, r'add-iam-policy-binding "\$\{KMS_KEY\}"[^\n]*\\\n\s*--member="serviceAccount:\$\{SA_EXECUTOR\}" '
+                               r'--role="\$\{role\}"')
+        self.assertRegex(body, r'remove-iam-policy-binding "\$\{KMS_KEY\}"[^\n]*\\\n\s*--member="serviceAccount:\$\{SA_API\}"')
+        self.assertNotRegex(body, r'add-iam-policy-binding "\$\{KMS_KEY\}"[^\n]*\\\n\s*--member="serviceAccount:\$\{SA_API\}"')
         self.assertNotIn("EncrypterDecrypter", body)
 
     def test_services_get_the_key_name(self) -> None:

@@ -297,17 +297,20 @@ export interface Alert {
 export interface AgentOut {
   id: string;
   master_address: string;
-  agent_address: string;
+  /** null while status = "requested" (the executor generates the key, migrations/0016) */
+  agent_address: string | null;
   agent_name: string;
-  status: "pending_approval" | "active" | "revoked" | "rotated" | string;
+  status: "requested" | "pending_approval" | "active" | "revoked" | "rotated" | "expired" | string;
   approved_at: string | null;
   created_at: string;
 }
 
-/** POST /v1/agents (201). approve_agent / approve_builder_fee = {typed_data, action, nonce}. */
+/** POST /v1/agents (201): an agent REQUEST (status "requested", no address). Poll GET /v1/agents/{id}
+ *  (core/agentprep.ts AgentDetail) until the executor has generated and attested the key. approve_agent is always
+ *  null now (the browser builds ApproveAgent locally); approve_builder_fee = {typed_data, action, nonce}. */
 export interface AgentCreateOut {
   agent: AgentOut;
-  approve_agent: { typed_data: unknown; action: unknown; nonce: number };
+  approve_agent: { typed_data: unknown; action: unknown; nonce: number } | null;
   approve_builder_fee: { typed_data: unknown; action: unknown; nonce: number } | null;
   exchange_url: string;
   required_builder_fee_tenths_bp: number;

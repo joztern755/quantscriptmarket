@@ -1,6 +1,6 @@
 # Cloud Run service "executor" — same image as api, entry create_executor_app, SERVICE_ROLE=executor. Never public: ingress internal,
 # invoked only by Cloud Scheduler (OIDC as aijalon-scheduler, the only principal with run.invoker).
-# Identity: aijalon-executor SA (KMS DECRYPT only on agent-keys, Cloud SQL IAM login, its own secrets).
+# Identity: aijalon-executor SA (KMS ENCRYPT + DECRYPT on agent-keys — it generates agent keys, migrations/0016 —, DECRYPT on creator-code, Cloud SQL IAM login, its own secrets).
 # Rendered by infra/gcp/render.py in deploy.yml, applied with `gcloud run services replace`.
 apiVersion: serving.knative.dev/v1
 kind: Service
