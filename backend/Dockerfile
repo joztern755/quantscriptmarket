@@ -55,6 +55,10 @@ COPY --from=build /opt/venv /opt/venv
 WORKDIR /srv
 # Code is owned by root and not writable by the app user. .dockerignore allow-lists app/, migrations/, scripts/.
 COPY --chown=root:root . /srv
+# Legal documents (repo-root legal/) via the named build context `legal` (docker build --build-context legal=legal).
+# The API hashes these exact bytes to verify what users consented to (must equal what the web serves).
+COPY --from=legal --chown=root:root . /srv/legal
+ENV LEGAL_DIR=/srv/legal
 RUN python -m compileall -q /srv/app /srv/scripts \
  && chmod -R a-w /srv
 USER 10001:10001

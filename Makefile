@@ -59,7 +59,7 @@ csp-sync:  ## rebuild web with the PRODUCTION app-config, then copy its CSP into
 	python3 infra/csp_sync.py write
 
 docker:  ## build both images locally
-	docker build -f backend/Dockerfile -t aijalon-backend:local backend
+	DOCKER_BUILDKIT=1 docker build -f backend/Dockerfile --build-context legal=legal -t aijalon-backend:local backend
 	DOCKER_BUILDKIT=1 docker build -f sandbox/Dockerfile -t aijalon-sandbox:local .
 
 validate:  ## syntax-check every shell script, YAML and JSON this repo's infra uses

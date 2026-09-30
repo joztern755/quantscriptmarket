@@ -79,8 +79,10 @@ def _fee_balance_changed(conn: Any, svc: Any, user_id: str, prev: int) -> None:
         if new == prev:
             return
         savepoint = getattr(svc.store, "savepoint", None)
+        ports = getattr(svc, "notifier", None) is not None and hasattr(getattr(svc, "domain", None),
+                                                                        "estimate_monthly_need")
         with (savepoint(conn) if savepoint is not None else nullcontext()):
-            on_balance_changed(conn, user_id, prev, new, svc=svc, raise_errors=True)
+            on_balance_changed(conn, user_id, prev, new, svc=svc if ports else None, raise_errors=True)
     except Exception as e:  # noqa: BLE001 - alerts must never block a ledger posting
         log.warning("low-balance alert hook failed", extra={"fields": {"user_id": user_id, "error": type(e).__name__}})
 

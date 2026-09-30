@@ -203,7 +203,7 @@ jobs:
             echo "::warning::base image not pinned yet — CI smoke build uses the tag"; args="--build-arg PYTHON_IMAGE=python:3.12-slim"
           fi
           [ -f backend/requirements.lock ] || args="$args --build-arg ALLOW_UNLOCKED=1"
-          docker build $args -f backend/Dockerfile -t aijalon-backend:ci backend
+          DOCKER_BUILDKIT=1 docker build $args -f backend/Dockerfile --build-context legal=legal -t aijalon-backend:ci backend
       - name: Image runs as non-root, contains no tests / secrets / build tools
         run: |
           set -e

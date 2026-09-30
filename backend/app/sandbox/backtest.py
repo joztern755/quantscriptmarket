@@ -70,7 +70,8 @@ class BacktestParams:
     min_order_usd: float = 10.0           # SPEC §10 churn rule
     min_rebalance_frac: float = 0.02      # SPEC §10 churn rule (2% of allocation)
     in_sample_frac: float = 0.70
-    min_history_days_to_list: int = 365   # SPEC §10: ≥ 1 year required to list
+    min_history_days_to_list: int = 180   # SPEC §12 (owner): ≥ 180 days required to list
+    short_history_warning_days: int = 365  # "Short history" warning below this
     cpu_budget_seconds: int = 120         # total CPU for the whole series run in the sandbox child
     max_trades_reported: int = 20_000
 
@@ -547,6 +548,8 @@ def backtest_on_data(source: str, data: MarketData, *, params: BacktestParams | 
     ]
     if sim_days < params.min_history_days_to_list:
         warnings.append(f"Only {sim_days:.0f} days simulated; ≥ {params.min_history_days_to_list} days are required to list.")
+    elif sim_days < params.short_history_warning_days:
+        warnings.append(f"Short history ({sim_days:.0f} days): less than {params.short_history_warning_days} days of data.")
     if meta.timeframe != "1d":
         warnings.append(f"Hyperliquid serves only the latest {HL_MAX_CANDLES} {meta.timeframe} candles, which limits history.")
     dropped = sum(lens.values()) - len(ts) * len(meta.markets)

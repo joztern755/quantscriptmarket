@@ -78,6 +78,7 @@ cmd_images() {
   gcloud auth configure-docker "${AR_HOST}" --quiet >/dev/null
   local tag="${BACKEND_IMAGE_REPO}:${GIT_SHA}"
   docker build --file "${REPO_ROOT}/backend/Dockerfile" --tag "${tag}" \
+    --build-context "legal=${REPO_ROOT}/legal" \
     --label "org.opencontainers.image.revision=${GIT_SHA}" "${REPO_ROOT}/backend"
   docker push "${tag}" >/dev/null
   local d; d="$(docker inspect --format='{{index .RepoDigests 0}}' "${tag}")"
