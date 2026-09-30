@@ -71,13 +71,13 @@ class SizingTest(unittest.TestCase):
         self.assertEqual(self.one(plan(20_000, m=mkt(max_leverage=1))).notional_micro, usd(10_000))
         self.assertEqual(self.one(plan(20_000, ctx(strategy_max_leverage_x100=150))).notional_micro, usd(15_000))
         self.assertEqual(self.one(plan(-20_000, ctx(max_leverage_x100=50))).notional_micro, usd(5_000))
-        # platform cap 5x
+        # user cap 10x (platform ceiling 50x no longer binds)
         self.assertEqual(self.one(plan(50_000, ctx(max_leverage_x100=1000))).notional_micro, usd(50_000))
         self.assertEqual(self.one(plan(50_000, ctx(max_leverage_x100=1000), limits=replace(L, platform_max_leverage=3)),
                                   ).notional_micro, usd(30_000))
 
     def test_weight_above_platform_cap_is_clamped(self):
-        p = self.one(plan(60_000, ctx(max_leverage_x100=1000)))
+        p = self.one(plan(60_000, ctx(max_leverage_x100=1000), limits=replace(L, platform_max_leverage=5)))
         self.assertEqual(p.notional_micro, usd(50_000))
         self.assertIn("leverage_clamped", p.notes)
 

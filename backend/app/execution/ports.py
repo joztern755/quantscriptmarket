@@ -46,6 +46,10 @@ class SubscriptionView:
     consecutive_rejections: int = 0  # circuit-breaker counter
     strategy_max_leverage_x100: int | None = None
     past_due_since: datetime | None = None
+    # SPEC §12 alert contacts: False when the user has no confirmed email or no working Telegram link (past the
+    # 24 h grace) — SQL ``alert_contacts_entries_allowed(user, now)``. The executor and the planner then treat the
+    # subscription as ``reduce_only`` for this tick: exits still run, no new or increased exposure.
+    entries_allowed: bool = True
 
 
 @dataclass(frozen=True)
@@ -470,6 +474,19 @@ class SettlementRepo(Protocol):
     def set_plan_period(self, user_id: str, plan_period_end: datetime | None, past_due_since: datetime | None) -> None: ...
 
     def downgrade_plan(self, user_id: str, plan: str) -> None: ...
+
+
+class UserEventSink(Protocol):
+    """User-facing events written in the CALLER'S transaction (settlement: inside ``UnitOfWork.atomic()``, right after
+    the ledger post they describe). Delivered to Telegram / email / in-app by ``app.alerts.delivery``."""
+
+    def emit(self, *, user_id: str, kind: str, severity: str, payload: Mapping[str, Any], dedup_key: str) -> bool:
+        """One user event (kinds: ``app.alerts.prefs.CATALOG``; payload: ``app.alerts.user_templates``). Idempotent
+        on ``dedup_key``; returns False when it already existed."""
+
+    def fee_balance_changed(self, *, user_id: str, prev_micro: int, new_micro: int, now: datetime) -> list[str]:
+        """Low-balance hook (``app.alerts.delivery.on_balance_changed``): user-facing balances (−ledger) before and
+        after a posting on ``user:{id}:fee_balance``. Never raises; returns the emitted kinds."""
 
 
 class ReferralLookup(Protocol):

@@ -112,7 +112,13 @@ CERT_MAP_ENTRY="api-certmap-entry"
 : "${ARMOR_EDGE_HEADER_CHECK:=1}"                # also enforce X-Edge-Auth at Cloud Armor (the app checks too)
 
 # ---- secrets (names only; values are added by the owner, never committed) --------------------------------
-# name|who may read (space separated: api executor migrator sandbox)|generated? (1 = bootstrap generates a random value)
+# name|who may read (space separated: api executor migrator sandbox)|value source:
+#   0     = the owner adds it (DEPLOY.md §5); bootstrap warns while it has no version
+#   1     = bootstrap generates a random value
+#   owner = bootstrap seeds it with OWNER_EMAIL when empty (e-mail lists: personal data, so a secret, not a
+#           plain env var or a GitHub variable); the owner replaces it with the real list (DEPLOY.md §5)
+#   opt   = optional: created with its accessor binding but no value; referenced by a Cloud Run template only
+#           when the feature is switched on (KYC_* when KYC_PROVIDER=sumsub), so an empty one never blocks a deploy
 SECRETS_SPEC=(
   "STRIPE_SECRET_KEY|api|0"
   "STRIPE_WEBHOOK_SECRET|api|0"
@@ -130,18 +136,47 @@ SECRETS_SPEC=(
   # The ONLY grant the sandbox SA has: it protects nothing but the sandbox itself, and the sandbox has no
   # route to Google APIs (no Private Google Access / NAT), so it cannot be used from inside anyway.
   "SANDBOX_SHARED_SECRET|api executor sandbox|1"
+  # comma-separated e-mail lists (app/config.py). ALLOWLIST_EMAILS: LAUNCH_PHASE=internal refuses to start
+  # without it (every prod role). OPS_EMAILS: ops alert recipients (api + executor notifier).
+  "ALLOWLIST_EMAILS|api executor|owner"
+  "OPS_EMAILS|api executor|owner"
+  # creator KYC (app/kyc/sumsub.py) — only when KYC_PROVIDER=sumsub; the launch default is `manual`
+  "KYC_APP_TOKEN|api|opt"
+  "KYC_SECRET_KEY|api|opt"
+  "KYC_WEBHOOK_SECRET|api|opt"
 )
 
 # ---- Cloud Scheduler (all UTC) ---------------------------------------------------------------------------
+# Every job: POST ${EXECUTOR_URL}${INTERNAL_PREFIX}/<path>, body {}, OIDC token as SA_SCHEDULER with audience =
+# the executor URL (= its INTERNAL_AUDIENCE), created PAUSED (bootstrap `scheduler`; `make go-live` resumes them).
+# Routes: backend/app/api/routers/internal.py + alerts_settings.internal_router, mounted only by
+# create_executor_app (SPEC §8). Every job is idempotent, so retries and overlapping runs are safe.
+# Deadlines: data jobs stop themselves after max_seconds=240 (app/jobs_data), so they get >= 300s.
+#
+# Ordering around the daily settlement (00:30, settles yesterday; PnL = fills + funding with time <= 00:00):
+#   fills-ingest runs every 10 min (00:00, 00:10, 00:20 each finish by ~00:24) AND once more at 00:25
+#   (fills-ingest-presettle) so the last fills of the day are stored before 00:30 — a fill stored after its
+#   day was settled can no longer be counted and raises the critical ops event `fill_after_settlement`.
+#   funding-scan runs at :07 (the 00:00 funding payment is stored at 00:07, before settlement).
+#   daily-pnl-summary (00:15) reads the previous day's fills after the 00:00/00:10 fills-ingest runs.
+#   referral-tiers (01:15) runs after settlement on purpose: the NEXT settlement uses the new tier.
+# candles-sync runs at :05/:15/…/:55 (not :00/:10) so it never starts together with fills-ingest: both pace
+# themselves to 600 weight/min of Hyperliquid's ~1200/min per-IP /info budget, which they share with the tick.
 # name|cron|path (under INTERNAL_PREFIX)|attempt deadline|max retries
 SCHEDULER_SPEC=(
   "tick|* * * * *|tick|180s|0"
+  "deliver-alerts|* * * * *|deliver-alerts|120s|0"
+  "deposits-scan|*/5 * * * *|deposits-scan|300s|0"
+  "candles-sync|5-59/10 * * * *|candles-sync|300s|0"
+  "fills-ingest|*/10 * * * *|fills-ingest|300s|0"
+  "fills-ingest-presettle|25 0 * * *|fills-ingest|300s|1"
+  "funding-scan|7 * * * *|funding-scan|300s|1"
+  "ingest-signals|50 * * * *|ingest-signals|300s|1"
+  "reconcile|0 * * * *|reconcile|900s|1"
+  "daily-pnl-summary|15 0 * * *|daily-pnl-summary|600s|2"
   "settle-daily|30 0 * * *|settle-daily|1800s|3"
-  "ingest-signals|*/15 * * * *|ingest-signals|120s|1"
-  "reconcile|7 * * * *|reconcile|900s|1"
-  "deposits-scan|* * * * *|deposits-scan|120s|0"
   "referral-tiers|15 1 * * *|referral-tiers|900s|3"
-  "candles-sync|5 * * * *|candles-sync|900s|1"
+  "agent-expiry-scan|13 */6 * * *|agent-expiry-scan|300s|1"
 )
 
 # ---- Workload Identity Federation ------------------------------------------------------------------------

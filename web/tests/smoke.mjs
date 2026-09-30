@@ -136,7 +136,16 @@ const MOMO_DETAIL = {
   rating_count: 0,
 };
 const page = (items) => ({ items, next_cursor: null });
+// GET /v1/public/strategies/{slug}/equity → {points:[{t (ms), pnl_micro, roi_bps}], hidden_reason}
+const MOMO_V2_LIVE = Date.parse("2026-09-20T00:00:00Z");
+const MOMO_EQUITY = {
+  points: Array.from({ length: 11 }, (_, i) => ({ t: MOMO_V2_LIVE + i * DAY, pnl_micro: Math.round((i * 37 - (i % 3) * 20) * 1e6), roi_bps: i * 31 - (i % 3) * 17 })),
+  hidden_reason: null,
+};
+const SILVER_EQUITY = { points: [], hidden_reason: "too_few_subscribers" };
 function publicRoute(pathname) {
+  if (pathname === "/v1/public/strategies/silver/equity") return SILVER_EQUITY;
+  if (pathname === "/v1/public/strategies/btc-momo/equity") return MOMO_EQUITY;
   if (pathname === "/v1/public/strategies") return page([SILVER, MOMO]);
   if (pathname === "/v1/public/strategies/silver") return SILVER_DETAIL;
   if (pathname === "/v1/public/strategies/btc-momo") return MOMO_DETAIL;
@@ -178,7 +187,7 @@ async function newPage(viewport, colorScheme, opts = {}) {
   const page = await context.newPage();
   const errors = [];
   page.on("console", (m) => {
-    if (m.type() === "error") errors.push(`console: ${m.text()}`);
+    if (m.type() === "error") errors.push(`console: ${m.text()}${m.location()?.url ? " @ " + m.location().url : ""}`);
   });
   page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
   page.on("requestfailed", (r) => {
@@ -302,9 +311,29 @@ for (const vp of VIEWPORTS) {
     const detail = await page.locator("main .page").innerText();
     check(`${tag}: strategy page shows backtest + both warnings`, /not proven live yet/.test(detail) && /Short history \(208 days\)/i.test(detail) && /Out-of-sample/.test(detail));
     check(`${tag}: version reset timeline`, /v2/.test(detail) && /performance reset/.test(detail));
+    // Live equity chart (GET /public/strategies/{slug}/equity): renders, hover tooltip, version-reset marker, themed stroke
+    await page.waitForSelector(".equity-live svg.chart", { timeout: 5000 }).catch(() => undefined);
+    check(`${tag}: live equity chart renders`, (await page.locator(".equity-live svg.chart path.line").count()) === 1 && (await page.locator("[data-equity=hidden]").count()) === 0);
+    check(`${tag}: equity chart marks the v2 reset`, (await page.locator(".equity-live line.marker").count()) >= 1);
+    const stroke = await page.locator(".equity-live path.line").evaluate((el) => getComputedStyle(el).stroke);
+    check(`${tag}: equity line uses a theme colour`, /^rgb/.test(stroke) && stroke !== "rgb(0, 0, 0)", stroke);
+    await page.locator(".equity-live svg.chart").scrollIntoViewIfNeeded();
+    const chartBox = await page.locator(".equity-live svg.chart").boundingBox();
+    if (chartBox) await page.mouse.move(chartBox.x + chartBox.width * 0.6, chartBox.y + chartBox.height / 2);
+    await page.waitForTimeout(100);
+    const tipText = await page.locator(".equity-live .lchart-tip").innerText().catch(() => "");
+    check(`${tag}: equity chart hover tooltip`, (await page.locator(".equity-live .lchart-tip").isVisible()) && /%/.test(tipText), tipText);
+    await page.click(".equity-live .seg button:has-text('$ made')");
+    check(`${tag}: equity chart switches to $ made`, /\$/.test(await page.locator(".equity-live svg.chart").innerHTML()));
+    check(`${tag}: short-history + not-live-proven warnings kept`, /Short history \(208 days\)/.test(detail) && /Not live-proven/.test(await page.locator("main .page").innerText()));
+    hs = await noHorizontalScroll(page);
+    check(`${tag}: strategy page with chart without horizontal scroll`, hs.ok, JSON.stringify(hs));
+    if (SHOTS) await page.screenshot({ path: join(SHOTS, `${vp.name}-${scheme}-strategy.png`), fullPage: true });
     await page.goto(BASE + "#/s/silver", { waitUntil: "networkidle" });
     await page.waitForTimeout(300);
-    check(`${tag}: SILVER page states the free showcase`, /CASH since 1980-01-15/.test(await page.locator("main .page").innerText()));
+    const silverText = await page.locator("main .page").innerText();
+    check(`${tag}: SILVER page states the free showcase`, /CASH since 1980-01-15/.test(silverText));
+    check(`${tag}: equity chart hidden with hidden_reason message`, (await page.locator("[data-equity=hidden][data-reason=too_few_subscribers]").count()) === 1 && (await page.locator(".equity-live").count()) === 0 && /at least 5 subscribers/.test(silverText));
     hs = await noHorizontalScroll(page);
     check(`${tag}: strategy page without horizontal scroll`, hs.ok, JSON.stringify(hs));
 
@@ -374,27 +403,52 @@ for (const vp of VIEWPORTS) {
 // Signed-in (TOTP) user: consents carry doc_text_sha256 of the served legal files with backend doc keys; the
 // dashboard renders the backend's Page/Balance shapes; cancel = two buttons + double confirm + step-up →
 // DELETE /v1/subscriptions/{id} {"positions": "close"} (SPEC §12).
-{
-  const FB_AUTH_SIGNED_IN = FB_AUTH_STUB
-    .replace("export function initializeAuth(){ return { currentUser: null }; }", "export function initializeAuth(){ return { currentUser: USER }; }")
-    .replace("export function onIdTokenChanged(auth, cb){ setTimeout(() => cb(null), 0); return () => {}; }", "export function onIdTokenChanged(auth, cb){ setTimeout(() => cb(USER), 0); return () => {}; }")
-    .replace("export function multiFactor(){ return { enrolledFactors: [],", "export function multiFactor(){ return { enrolledFactors: [{ factorId: 'totp' }],")
-    + `\nconst USER = { uid: "fb-1", email: "u@example.com", displayName: "U", photoURL: null, providerData: [{ providerId: "google.com" }],
-      getIdToken: async () => "tok-1", getIdTokenResult: async () => ({ signInSecondFactor: "totp", claims: { firebase: { sign_in_second_factor: "totp" } } }) };\n`;
-  const appConfig = JSON.parse(readFileSync(join(DIST, "app-config.json"), "utf8"));
-  appConfig.firebase = { apiKey: "test-key", authDomain: "aijalon.trade", projectId: "aijalon-test", appId: "1:1:web:1" };
-  const SUB = {
-    id: "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d", strategy_id: SILVER.id, strategy_slug: "silver", strategy_name: "CREST Silver", strategy_markets: ["xyz:SILVER"],
-    trading_address: "0x3333333333333333333333333333333333333333", allocation_micro: 500000000, max_leverage_x100: 100, status: "active",
-    cancel_positions: null, cancelled_at: null, current_period_end: "2026-10-30T00:00:00Z", cum_pnl_micro: 0, hwm_micro: 0, created_at: "2026-09-30T00:00:00Z",
+const FB_AUTH_SIGNED_IN = FB_AUTH_STUB
+  .replace("export function initializeAuth(){ return { currentUser: null }; }", "export function initializeAuth(){ return { currentUser: USER }; }")
+  .replace("export function onIdTokenChanged(auth, cb){ setTimeout(() => cb(null), 0); return () => {}; }", "export function onIdTokenChanged(auth, cb){ setTimeout(() => cb(USER), 0); return () => {}; }")
+  .replace("export function multiFactor(){ return { enrolledFactors: [],", "export function multiFactor(){ return { enrolledFactors: [{ factorId: 'totp' }],")
+  + `\nconst USER = { uid: "fb-1", email: "u@example.com", displayName: "U", photoURL: null, providerData: [{ providerId: "google.com" }],
+    getIdToken: async () => "tok-1", getIdTokenResult: async () => ({ signInSecondFactor: "totp", claims: { firebase: { sign_in_second_factor: "totp" } } }) };\n`;
+const SIGNED_IN_APP_CONFIG = JSON.parse(readFileSync(join(DIST, "app-config.json"), "utf8"));
+SIGNED_IN_APP_CONFIG.firebase = { apiKey: "test-key", authDomain: "aijalon.trade", projectId: "aijalon-test", appId: "1:1:web:1" };
+const SUB = {
+  id: "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d", strategy_id: SILVER.id, strategy_slug: "silver", strategy_name: "CREST Silver", strategy_markets: ["xyz:SILVER"],
+  trading_address: "0x3333333333333333333333333333333333333333", allocation_micro: 500000000, max_leverage_x100: 100, status: "active",
+  cancel_positions: null, cancelled_at: null, current_period_end: "2026-10-30T00:00:00Z", cum_pnl_micro: 0, hwm_micro: 0, created_at: "2026-09-30T00:00:00Z",
+};
+/** GET /v1/alerts/contacts (ContactsOut) — linked = Telegram linked + email confirmed. */
+function contactsOut(linked) {
+  return {
+    telegram: { status: linked ? "linked" : "unlinked", linked_at: linked ? "2026-09-30T00:00:00Z" : null, lapsed_at: null },
+    email: { address: linked ? "u@example.com" : null, verified: linked, pending: null, account_email: "u@example.com" },
+    ready: linked, missing: linked ? [] : ["telegram", "email"], entries_allowed: linked, entries_pause_at: null,
   };
+}
+const ALERT_PREFS = [
+  { kind: "trade_opened", label: "Trade opened", group: "trades", group_label: "Trades", mandatory: false, muted: false, channels: ["telegram", "in_app"] },
+  { kind: "fee_balance_low", label: "Fee balance low", group: "money", group_label: "Fee balance & money", mandatory: true, muted: false, channels: ["telegram", "email", "in_app"] },
+];
+const ME = { id: "11111111-2222-4333-8444-555555555555", email: "u@example.com", display_name: "U", role: "user", plan: "free", status: "active", referral_code: "abcd2345", country_attested: null, mfa_enrolled: true, created_at: "2026-09-30T00:00:00Z", consents_complete: true, wallets: [], kyc_status: null };
+async function enterSite(pg) {
+  await pg.goto(BASE, { waitUntil: "networkidle" });
+  await pg.waitForSelector("#gate-title", { timeout: 10000 });
+  const bx = pg.locator(".gate-form input[type=checkbox]");
+  for (let i = 0; i < 5; i++) await bx.nth(i).check();
+  await pg.click("#gate-accept");
+  await pg.waitForSelector("#gate-title", { state: "detached" });
+  await pg.waitForTimeout(1200);
+}
+
+{
+  const appConfig = SIGNED_IN_APP_CONFIG;
   const consentBodies = [];
   const deletes = [];
   const unknown = [];
   const api = (req, u) => {
     const m = req.method();
     const p = u.pathname;
-    if (m === "GET" && p === "/v1/me") return { body: { id: "11111111-2222-4333-8444-555555555555", email: "u@example.com", display_name: "U", role: "user", plan: "free", status: "active", referral_code: "abcd2345", country_attested: null, mfa_enrolled: true, created_at: "2026-09-30T00:00:00Z", consents_complete: true, wallets: [], kyc_status: null } };
+    if (m === "GET" && p === "/v1/me") return { body: ME };
+    if (m === "GET" && p === "/v1/alerts/contacts") return { body: contactsOut(true) };
     if (m === "POST" && p === "/v1/consents") {
       consentBodies.push(JSON.parse(req.postData() || "{}"));
       return { body: { required: {}, accepted: {}, missing: [], complete: true } };
@@ -454,6 +508,156 @@ for (const vp of VIEWPORTS) {
   check("signed-in: every API call was a mocked backend route", unknown.length === 0, unknown.join(", "));
   check("signed-in: no console errors", errors.length === 0, errors.slice(0, 5).join(" | "));
   await context.close();
+}
+
+// Signed-in, both viewports × both themes: #/alerts (unlinked → linked), dashboard alerts link + set-up note,
+// Plans (Free $0 / Pro $20 / Max $50 from public config; confirm + step-up → POST /v1/me/plan; insufficient balance →
+// top-up prompt, both client-side and on 402), Creator Studio own posts + per-strategy earnings (cards on phones).
+for (const vp of VIEWPORTS) {
+  for (const scheme of ["light", "dark"]) {
+    const tag = `signed-in ${vp.name}/${scheme}`;
+    const st = { linked: false, plan: "free", fee: 25000000 };
+    const planPosts = [];
+    const unknown = [];
+    const PLAN_PRICE = { free: 0, pro: 20000000, max: 50000000 };
+    const CREATOR_STRAT = { id: MOMO.id, slug: "btc-momo", name: "BTC Momentum 4h", status: "listed", markets: ["BTC"], timeframe: "4h", price_monthly_micro: 29000000, profit_share_bps: 1000, description: null, created_at: "2026-08-01T00:00:00Z" };
+    const api = (req, u) => {
+      const m = req.method();
+      const p = u.pathname;
+      if (m === "GET" && p === "/v1/me") return { body: { ...ME, plan: st.plan } };
+      if (m === "POST" && p === "/v1/consents") return { body: { required: {}, accepted: {}, missing: [], complete: true } };
+      if (m === "GET" && p === "/v1/alerts/contacts") return { body: contactsOut(st.linked) };
+      if (m === "GET" && p === "/v1/alerts/settings") return { body: { contacts: contactsOut(st.linked), prefs: ALERT_PREFS, telegram_bot: "aijalon_bot", email_policy: "Telegram carries every alert. Email carries only mandatory alerts and security / money events." } };
+      if (m === "GET" && p === "/v1/alerts") return { body: page([]) };
+      if (m === "GET" && p === "/v1/subscriptions") return { body: page([SUB]) };
+      if (m === "GET" && p === "/v1/positions") return { body: { positions: [], unavailable: [] } };
+      if (m === "GET" && p === "/v1/balance") return { body: { fee_balance_micro: st.fee, withdrawable_micro: 0, withdrawals_pending_micro: 0, estimated_monthly_need_micro: 0, reserve_required_micro: 0, min_topup_micro: 10000000 } };
+      if (m === "GET" && p === "/v1/balance/ledger") return { body: page([]) };
+      if (m === "POST" && p === "/v1/me/plan") {
+        const body = JSON.parse(req.postData() || "{}");
+        planPosts.push({ body, key: req.headers()["idempotency-key"] });
+        if (body.plan === "max") return { status: 402, body: { error: { code: "insufficient_balance", message: "Not enough fee balance.", details: {} }, request_id: "t" } };
+        st.plan = body.plan;
+        st.fee -= PLAN_PRICE[body.plan];
+        return { body: { plan: body.plan, charged_micro: PLAN_PRICE[body.plan], period_end: "2026-10-30T00:00:00Z", fee_balance_micro: st.fee } };
+      }
+      if (m === "GET" && p === "/v1/creator/strategies") return { body: [CREATOR_STRAT] };
+      if (m === "GET" && p === "/v1/creator/posts") return { body: page([
+        { id: "p0000000-0000-4000-8000-000000000001", title: "Weekly notes: why we held cash", price_micro: 0, published_at: "2026-09-28T00:00:00Z", strategy_id: MOMO.id },
+        { id: "p0000000-0000-4000-8000-000000000002", title: "Deep dive: the 4h momentum filter, entry timing and why the stop sits where it does", price_micro: 5000000, published_at: "2026-09-29T00:00:00Z", strategy_id: MOMO.id, sales_count: 7 },
+      ]) };
+      if (m === "GET" && p === "/v1/creator/earnings") return { body: {
+        payable_micro: 150000000, payouts_pending_micro: 0, total_earned_micro: 489760000,
+        by_strategy: [{ strategy_id: MOMO.id, slug: "btc-momo", name: "BTC Momentum 4h", active_subscribers: 12, builder_micro: 4200000, subscription_micro: 337560000, profit_share_micro: 120000000, posts_micro: 28000000, total_micro: 489760000 }],
+        recent: [],
+      } };
+      unknown.push(`${m} ${p}`);
+      return { status: 404, body: { error: { code: "not_found", message: "not mocked" } } };
+    };
+    const { context, page: pg, errors } = await newPage(vp.viewport, scheme, { appConfig: SIGNED_IN_APP_CONFIG, fbAuth: FB_AUTH_SIGNED_IN, api });
+    await enterSite(pg);
+    const hsOk = async (name) => {
+      const r = await noHorizontalScroll(pg);
+      check(`${tag}: ${name} without horizontal scroll`, r.ok, JSON.stringify(r));
+    };
+    const text = () => pg.locator("main .page").innerText();
+
+    // Nav entry (desktop bar / mobile menu)
+    if (vp.name === "mobile") await pg.click(".menu-btn");
+    check(`${tag}: Alerts in the main nav`, await pg.isVisible("#site-nav a[href='#/alerts']"));
+    if (vp.name === "mobile") await pg.click(".menu-btn");
+
+    // Dashboard: set-up note while alerts are not linked → link to #/alerts
+    await pg.goto(BASE + "#/dashboard", { waitUntil: "networkidle" });
+    await pg.waitForSelector("text=Set up alerts", { timeout: 8000 }).catch(() => undefined);
+    check(`${tag}: dashboard asks to set up alerts when unlinked`, await pg.isVisible("main a[href='#/alerts']:has-text('Open alert settings')"));
+    await hsOk("dashboard");
+    await pg.click("main a:has-text('Open alert settings')");
+    await pg.waitForFunction(() => location.hash === "#/alerts");
+    await pg.waitForSelector("button:has-text('Link Telegram')", { timeout: 8000 }).catch(() => undefined);
+    let t = await text();
+    check(`${tag}: #/alerts unlinked state`, /Not linked/i.test(t) && /Not confirmed/i.test(t) && !/Alerts are set up/.test(t) && (await pg.isVisible("button:has-text('Link Telegram')")), t.slice(0, 160));
+    check(`${tag}: #/alerts prefs with a locked mandatory alert`, (await pg.locator("main .check input[type=checkbox]:disabled").count()) === 1 && /Trade opened/.test(t));
+    check(`${tag}: nav marks Alerts current`, (await pg.locator("#site-nav a[href='#/alerts'][aria-current=page]").count()) === 1);
+    await hsOk("#/alerts (unlinked)");
+    if (SHOTS) await pg.screenshot({ path: join(SHOTS, `${vp.name}-${scheme}-alerts.png`), fullPage: true });
+    st.linked = true;
+    await pg.reload({ waitUntil: "networkidle" });
+    await pg.waitForSelector("text=Alerts are set up", { timeout: 8000 }).catch(() => undefined);
+    t = await text();
+    check(`${tag}: #/alerts linked state`, /Alerts are set up/.test(t) && /Linked/i.test(t) && !/Not linked/i.test(t) && /Confirmed/i.test(t) && !/Not confirmed/i.test(t) && !(await pg.isVisible("button:has-text('Link Telegram')")));
+    await hsOk("#/alerts (linked)");
+    await pg.goto(BASE + "#/dashboard/alerts", { waitUntil: "networkidle" });
+    await pg.waitForTimeout(300);
+    check(`${tag}: dashboard Alerts tab links to #/alerts`, (await pg.locator("#alert-settings-link[href='#/alerts']").count()) === 1);
+    await pg.goto(BASE + "#/dashboard", { waitUntil: "networkidle" });
+    await pg.waitForTimeout(400);
+    check(`${tag}: no set-up note once linked`, !/Set up alerts/.test(await text()));
+
+    // Plans
+    await pg.goto(BASE + "#/dashboard?tab=plan", { waitUntil: "networkidle" });
+    await pg.waitForSelector(".plan-card", { timeout: 8000 }).catch(() => undefined);
+    const cardsText = await pg.locator(".plan-card").allInnerTexts();
+    check(`${tag}: three plans Free $0 / Pro $20 / Max $50`, cardsText.length === 3 && /Free[\s\S]*\$0/.test(cardsText[0]) && /Pro[\s\S]*\$20/.test(cardsText[1]) && /Max[\s\S]*\$50/.test(cardsText[2]), cardsText.map((c) => c.slice(0, 30)).join(" | "));
+    check(`${tag}: alerts included on every plan`, cardsText.every((c) => /Telegram \+ email alerts/.test(c)));
+    check(`${tag}: current plan marked`, /Current plan/i.test(cardsText[0] ?? "") && !/Current plan/i.test(cardsText[1] ?? ""));
+    await hsOk("plans");
+    if (SHOTS) await pg.screenshot({ path: join(SHOTS, `${vp.name}-${scheme}-plans.png`), fullPage: true });
+    // Max ($50) with $25 balance → top-up prompt, nothing posted
+    await pg.click(".plan-card[data-plan=max] button:has-text('Upgrade to Max')");
+    await pg.waitForSelector("#plan-topup", { timeout: 5000 }).catch(() => undefined);
+    check(`${tag}: insufficient balance → top-up prompt (no charge attempted)`, (await pg.isVisible("#plan-topup")) && planPosts.length === 0);
+    await pg.click("dialog >> button:has-text('Top up balance')");
+    await pg.waitForFunction(() => location.hash === "#/dashboard/balance", null, { timeout: 5000 }).catch(() => undefined);
+    check(`${tag}: top-up prompt opens the fee balance tab`, (await pg.evaluate(() => location.hash)) === "#/dashboard/balance");
+    // Pro ($20): confirm → step-up → POST /me/plan {plan:"pro"}
+    await pg.goto(BASE + "#/dashboard?tab=plan", { waitUntil: "networkidle" });
+    await pg.waitForSelector(".plan-card[data-plan=pro] button", { timeout: 8000 }).catch(() => undefined);
+    await pg.click(".plan-card[data-plan=pro] button:has-text('Upgrade to Pro')");
+    await pg.waitForSelector("dialog >> text=Switch to Pro?");
+    check(`${tag}: plan confirm shows the charge`, (await pg.locator("dialog >> text=/\\$20\\.00 from your fee balance/").count()) >= 1);
+    await pg.click("dialog >> button:has-text('Switch to Pro')");
+    await pg.waitForSelector("dialog >> text=Confirm it's you", { timeout: 5000 }).catch(() => undefined);
+    check(`${tag}: plan change asks for step-up before charging`, (await pg.isVisible("dialog >> text=Confirm it's you")) && planPosts.length === 0);
+    await pg.click("dialog >> button:has-text('Continue with Google')");
+    await pg.waitForSelector(".plan-card[data-plan=pro].current", { timeout: 8000 }).catch(() => undefined);
+    check(`${tag}: POST /me/plan {plan:"pro"} with Idempotency-Key`, planPosts.length === 1 && planPosts[0].body.plan === "pro" && Object.keys(planPosts[0].body).length === 1 && /^[0-9a-f-]{36}$/.test(planPosts[0].key ?? ""), JSON.stringify(planPosts));
+    check(`${tag}: Pro shown as current after the change`, /Current plan/i.test(await pg.locator(".plan-card[data-plan=pro]").innerText()));
+    // Max with enough client-side balance but the server says 402 → same top-up prompt
+    st.fee = 100000000;
+    await pg.reload({ waitUntil: "networkidle" });
+    await pg.waitForSelector(".plan-card[data-plan=max] button", { timeout: 8000 }).catch(() => undefined);
+    await pg.click(".plan-card[data-plan=max] button:has-text('Upgrade to Max')");
+    await pg.click("dialog >> button:has-text('Switch to Max')");
+    await pg.waitForSelector("dialog >> text=Confirm it's you", { timeout: 5000 }).catch(() => undefined);
+    await pg.click("dialog >> button:has-text('Continue with Google')");
+    await pg.waitForSelector("#plan-topup", { timeout: 5000 }).catch(() => undefined);
+    check(`${tag}: 402 insufficient_balance → top-up prompt`, (await pg.isVisible("#plan-topup")) && planPosts.length === 2 && st.plan === "pro");
+    await pg.click("dialog >> button:has-text('Not now')");
+
+    // Creator Studio: own posts + per-strategy earnings
+    await pg.goto(BASE + "#/creator/posts", { waitUntil: "networkidle" });
+    await pg.waitForSelector("text=Weekly notes", { timeout: 8000 }).catch(() => undefined);
+    t = await text();
+    check(`${tag}: creator lists own posts`, /Weekly notes: why we held cash/.test(t) && /Deep dive/.test(t) && (await pg.locator("main a[href='#/posts/p0000000-0000-4000-8000-000000000002']").count()) === 1);
+    await hsOk("creator posts");
+    await pg.goto(BASE + "#/creator/earnings", { waitUntil: "networkidle" });
+    await pg.waitForSelector(".earnings-by-strategy", { timeout: 8000 }).catch(() => undefined);
+    t = await pg.locator(".earnings-by-strategy").innerText();
+    check(`${tag}: per-strategy earnings breakdown`, /BTC Momentum 4h/.test(t) && /\$337\.56/.test(t) && /\$120\.00/.test(t) && /\$4\.20/.test(t) && /\$28\.00/.test(t) && /\$489\.76/.test(t), t.slice(0, 200));
+    const rowDisplay = await pg.locator(".earnings-by-strategy .rtable tbody tr").first().evaluate((el) => getComputedStyle(el).display);
+    check(`${tag}: earnings ${vp.name === "mobile" ? "cards on mobile" : "table on desktop"}`, vp.name === "mobile" ? rowDisplay === "block" : rowDisplay === "table-row", rowDisplay);
+    await hsOk("creator earnings");
+    if (SHOTS) await pg.screenshot({ path: join(SHOTS, `${vp.name}-${scheme}-earnings.png`), fullPage: true });
+
+    const bg = await pg.evaluate(() => getComputedStyle(document.body).backgroundColor);
+    check(`${tag}: ${scheme} theme applied`, scheme === "dark" ? bg === "rgb(20, 17, 14)" : bg === "rgb(246, 244, 240)", bg);
+    check(`${tag}: every API call was a mocked backend route`, unknown.length === 0, unknown.join(", "));
+    // The mocked 402 is an expected server response (Chromium logs it as "Failed to load resource"); nothing else may log.
+    const unexpected = errors.filter((e) => !(/status of 402/.test(e) && /\/v1\/me\/plan$/.test(e)));
+    check(`${tag}: no console errors`, unexpected.length === 0, unexpected.slice(0, 5).join(" | "));
+    await context.close();
+  }
 }
 
 await browser.close();

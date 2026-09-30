@@ -14,7 +14,7 @@ transaction per transfer through ``app.ledger.service.post_transaction`` with id
 * bridge deposits (no sender) and odd transfers into the treasury → ops events only (not booked).
 
 Every transfer is its own DB transaction; the cursor advances only past transfers that were booked, so a failure is
-retried on the next call. Events go to ``events_outbox`` (the alerts module delivers them).
+retried on the next call. A credit calls ``app.alerts.delivery.on_balance_changed`` in the same transaction. Events go to ``events_outbox`` (the alerts module delivers them).
 """
 from __future__ import annotations
 
@@ -193,9 +193,13 @@ def _book_credit(conn: Any, ledger: Any, instr: Any, report: DepositsReport) -> 
             "hash": instr.external_ref[:18], "amount_micro": instr.amount_micro, "user_id": instr.user_id,
             "booked_as": existing.kind}, severity="warn", dedup_key=f"topup_held_now_attributable:{instr.external_ref}")
         return
+    fee_account = f"user:{instr.user_id}:fee_balance"
+    prev = -ledger.get_balance(conn, fee_account)
     tx = ledger.post_transaction(conn, instr.idempotency_key, instr.kind, instr.memo or "deposit",
                                  [(instr.debit_account, instr.amount_micro), (instr.credit_account, -instr.amount_micro)],
                                  CREATED_BY)
+    if tx.created and fee_account in (instr.debit_account, instr.credit_account):
+        _balance_changed(conn, ledger, instr.user_id, prev)
     meta = {k: (v if isinstance(v, (str, int, bool)) else str(v)) for k, v in dict(instr.meta or {}).items()
             if v is not None}
     meta["from"] = _db.short_addr(str(meta.get("from", "")))
@@ -207,6 +211,22 @@ def _book_credit(conn: Any, ledger: Any, instr: Any, report: DepositsReport) -> 
         report.credited_micro += instr.amount_micro
     else:
         report.already_booked += 1
+
+
+def _balance_changed(conn: Any, ledger: Any, user_id: str, prev: int) -> None:
+    """Same-transaction low-balance hook (app.alerts.delivery.on_balance_changed) after a fee-balance posting made
+    outside app.api.ledger_ops. A credit never crosses a threshold downwards, but every posting goes through the
+    hook so the rule stays in one place. SAVEPOINT: a failed alert never undoes the credit."""
+    from app.alerts import _db as alerts_db
+    from app.alerts.delivery import on_balance_changed
+
+    try:
+        new = -ledger.get_balance(conn, f"user:{user_id}:fee_balance")
+        with alerts_db.savepoint(conn):
+            on_balance_changed(conn, user_id, prev, new, raise_errors=True)
+    except Exception as e:  # noqa: BLE001 - alerts must never block a deposit credit
+        _db.log.warning("deposit_balance_hook_failed", extra={"fields": {"user_id": user_id,
+                                                                         "error": type(e).__name__}})
 
 
 def _book_held(conn: Any, ledger: Any, det: Any, reason: str, report: DepositsReport) -> None:

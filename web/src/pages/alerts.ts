@@ -5,8 +5,8 @@
 //   GET   /v1/alerts/settings  → { contacts, prefs: [{kind, label, group, group_label, mandatory, muted, channels}], telegram_bot, email_policy }
 //   PATCH /v1/alerts/prefs     { muted: { <kind>: boolean } } → same shape as GET /settings
 //   POST  /v1/alerts/test      → { results: { telegram: "sent"|…, email: "sent"|… } }
-// Route: needs core to register { pattern: "/alerts", name: "alerts", access: "user" } (router.ts is core-owned);
-// `renderAlertsSettings` can also be embedded (e.g. a dashboard tab) without a route.
+// Route: core registers { pattern: "/alerts", name: "alerts", access: "user" } (router.ts; nav entry in main.ts, and the
+// dashboard's Alerts tab links here). `renderAlertsSettings` can also be embedded without a route.
 import type { PageContext } from "../core/router.js";
 import { h, mount, skeleton, errorState, note, badge, button, toast, type Child } from "../core/ui.js";
 import { api } from "../core/api.js";

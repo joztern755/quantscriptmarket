@@ -226,6 +226,50 @@ class ReduceOnlyTest(unittest.TestCase):
         w.tick()
         self.assertEqual(w.ex.placed, [])
 
+    # SPEC §12 alert-contacts entries gate: entries_allowed=False ⇒ reduce-only for the tick (exits still run)
+    def test_contacts_gate_opens_nothing_from_flat(self):
+        w = World(subs=[make_sub(1, entries_allowed=False)], signals=[make_signal(weight=1)])
+        r = w.tick()
+        self.assertEqual(w.ex.placed, [])
+        self.assertEqual(r.contacts_gated, 1)
+        self.assertEqual(w.subs.done[("sub1", BAR)], "ok")          # nothing to do this bar (not an error)
+
+    def test_contacts_gate_never_increases(self):
+        w = World(subs=[make_sub(1, entries_allowed=False)], signals=[make_signal(weight=2)])
+        w.ex.set_position("0xmaster1", SILVER, "100")
+        w.tick()
+        self.assertEqual(w.ex.placed, [])
+        self.assertEqual(w.subs.targets[("sub1", SILVER)][1], usd(3000))   # holds current exposure
+
+    def test_contacts_gate_still_exits(self):
+        w = World(subs=[make_sub(1, entries_allowed=False)], signals=[make_signal(weight=0)])
+        w.ex.set_position("0xmaster1", SILVER, "100")
+        w.tick()
+        self.assertEqual(len(w.ex.placed), 1)
+        o = w.ex.placed[0]
+        self.assertEqual((o["is_buy"], o["reduce_only"], o["sz"]), (False, True, Decimal("100")))
+        self.assertEqual(w.ex.pos[("0xmaster1", SILVER)], Decimal(0))
+
+    def test_contacts_gate_in_planner_alone_blocks_entries(self):
+        """The planner treats entries_allowed=False as reduce_only even without the executor's reduce_only_mode."""
+        from app.execution.ports import MarketSnapshot, PlanInput, Position
+        from app.execution.wiring import RiskPlanner
+
+        w = World()
+        snap = w.market.snapshot(SILVER)
+        planner = RiskPlanner()
+        for allowed, expect_legs in ((True, 1), (False, 0)):
+            sub = make_sub(1, entries_allowed=allowed)
+            try:
+                plan = planner.plan(PlanInput(subscription=sub, coin=SILVER, weight_bps=10_000,
+                                              position=Position.flat(SILVER), snapshot=snap, flags=Flags(),
+                                              reduce_only_mode=False, now=w.clock.now()))
+                legs = len(plan.legs)
+            except Exception:  # noqa: BLE001 - a guard rejection also means "nothing opened"
+                legs = 0
+            self.assertEqual(legs, expect_legs, allowed)
+        self.assertIsInstance(snap, MarketSnapshot)
+
     def test_paused_and_cancelled_are_not_traded(self):
         for st in ("paused_user", "cancelled", "pending"):
             w = World(subs=[make_sub(1, status=st)])

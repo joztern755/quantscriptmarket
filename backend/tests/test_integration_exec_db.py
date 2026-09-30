@@ -436,12 +436,27 @@ class ExecIntegrationDbTest(unittest.TestCase):
         kw.setdefault("executor_config", ExecutorConfig.from_settings(self.settings, unknown_order_grace_seconds=0))
         return Runtime(self.settings, info=info, gateways=gw, **kw)
 
-    def user(self, tag: str, *, referred_by: str | None = None) -> str:
+    def user(self, tag: str, *, referred_by: str | None = None, contacts: bool = True) -> str:
+        """A user; with ``contacts`` (default) Telegram is linked and the alert email confirmed (SPEC §12: without
+        them the executor's entries gate runs every subscription of the user reduce-only)."""
         t = f"{tag}{uuid.uuid4().hex[:8]}"
-        return self.admin.fetchall("""
+        uid = self.admin.fetchall("""
             INSERT INTO users (firebase_uid, email, referral_code, referred_by, mfa_enrolled)
             VALUES (:u, :e, :c, CAST(:r AS uuid), true) RETURNING id::text AS id""",
             {"u": "fb" + t, "e": f"{t}@example.test", "c": "R" + t[:20], "r": referred_by})[0]["id"]
+        if contacts and "0007_alerts.sql" in self.db_.applied:
+            self.link_contacts(uid)
+        return uid
+
+    def link_contacts(self, uid: str) -> None:
+        chat = int(uuid.uuid4().int % 10**12) + 10**12
+        self.admin.fetchall("""
+            INSERT INTO user_contacts (user_id, telegram_chat_id, telegram_linked_at, email, email_verified_at)
+            VALUES (CAST(:u AS uuid), :c, now(), :e, now())
+            ON CONFLICT (user_id) DO UPDATE SET telegram_chat_id = EXCLUDED.telegram_chat_id,
+                   telegram_linked_at = EXCLUDED.telegram_linked_at, telegram_blocked_at = NULL,
+                   telegram_block_reason = NULL, email = EXCLUDED.email, email_verified_at = EXCLUDED.email_verified_at
+            RETURNING user_id""", {"u": uid, "c": chat, "e": f"c{chat}@example.test"})
 
     def connect_wallet(self, user_id: str, master: str) -> str:
         """What the API does on POST /agents + confirm: seal a fresh agent key for this user (AAD = user + agent)."""
@@ -652,11 +667,24 @@ class ExecIntegrationDbTest(unittest.TestCase):
             "SELECT 1 FROM ledger_transactions WHERE idempotency_key = :k", {"k": f"ps:{sub}:{settle_now.date()}"}))
         self.ledger_ok()
 
+        # user event: profit_share_charged (events_outbox, same tx as the ledger post), with amount + period
+        if "0006_data.sql" in self.db_.applied:
+            ev = self.admin.fetchall("""SELECT payload, severity::text AS severity FROM events_outbox
+                                         WHERE kind = 'profit_share_charged' AND user_id = CAST(:u AS uuid)""", {"u": u})
+            self.assertEqual(len(ev), 1)
+            self.assertEqual((ev[0]["payload"]["amount_micro"], ev[0]["payload"]["profit_micro"],
+                              ev[0]["payload"]["rate_bps"], ev[0]["payload"]["strategy_id"]),
+                             (charge, realized, 150, sid))
+            self.assertEqual(ev[0]["payload"]["period_end"], rep["cutoff"])
+
         # settlement is idempotent
         n_tx = self.admin.fetchall("SELECT count(*) AS n FROM ledger_transactions")[0]["n"]
         rep2 = jobs.settle_daily(db=self.exe, now=settle_now + timedelta(minutes=5), settle_date=self.now.date(), runtime=rt)
         self.assertEqual(rep2["profit_share_charged_micro"], 0)
         self.assertEqual(self.admin.fetchall("SELECT count(*) AS n FROM ledger_transactions")[0]["n"], n_tx)
+        if "0006_data.sql" in self.db_.applied:
+            self.assertEqual(self.admin.fetchall("""SELECT count(*) AS n FROM events_outbox WHERE kind = 'profit_share_charged'
+                                                    AND user_id = CAST(:u AS uuid)""", {"u": u})[0]["n"], 1)
         self.ledger_ok()
 
         # reconcile: stored + readable by the API role; builder fees DB vs chain
@@ -771,6 +799,51 @@ class ExecIntegrationDbTest(unittest.TestCase):
         self.assertEqual(len(hl.orders_log), n)
         self.assertGreater(hl.position(master, SILVER), 0)
 
+    def test_35_alert_contacts_entries_gate(self) -> None:
+        """SPEC §12: no confirmed email / no working Telegram (past the 24 h grace) → reduce-only for the tick:
+        no entry from flat, exits still run; linking contacts lifts the gate."""
+        if "0007_alerts.sql" not in self.db_.applied:
+            self.skipTest("needs 0007")
+        from app.execution import jobs
+        from app.execution.pg import PgDatabase, PgSubscriptionRepo
+
+        hl, info, gw = self.hl_world()
+        rt = self.runtime(hl, info, gw)
+        sid, vid = self.strategy()
+        u = self.user("gate", contacts=False)
+        master = addr("gate-" + u)
+        self.connect_wallet(u, master)
+        sub = self.subscribe(u, sid, vid, master)
+        repo = PgSubscriptionRepo(PgDatabase(self.exe), clock=lambda: self.now)
+        self.assertFalse(repo.get_subscription(sub).entries_allowed)
+        self.signal(sid, vid, self.now - timedelta(minutes=5), 10_000)          # long
+        r = jobs.run_tick(db=self.exe, now=self.now, runtime=rt)
+        self.assertEqual((r["orders_placed"], r["contacts_gated"]), (0, 1), r)
+        self.assertEqual(hl.position(master, SILVER), 0)
+        # contacts linked → entries allowed on the next bar
+        self.link_contacts(u)
+        self.assertTrue(repo.get_subscription(sub).entries_allowed)
+        self.signal(sid, vid, self.now - timedelta(minutes=4), 10_000)
+        r = jobs.run_tick(db=self.exe, now=self.now + timedelta(seconds=20), runtime=rt)
+        self.assertEqual(r["orders_filled"], 1, r)
+        self.assertGreater(hl.position(master, SILVER), 0)
+        # Telegram lapsed: still allowed inside the 24 h grace, gated after it — the exit still runs
+        lapsed = self.now - timedelta(hours=30)
+        self.admin.fetchall("""UPDATE user_contacts SET telegram_blocked_at = :t, telegram_block_reason = 'blocked'
+                               WHERE user_id = CAST(:u AS uuid)""", {"t": lapsed, "u": u})
+        self.assertTrue(PgSubscriptionRepo(PgDatabase(self.exe), clock=lambda: lapsed + timedelta(hours=1))
+                        .get_subscription(sub).entries_allowed)
+        self.assertFalse(repo.get_subscription(sub).entries_allowed)
+        self.signal(sid, vid, self.now - timedelta(minutes=3), 20_000)          # "add" → refused
+        r = jobs.run_tick(db=self.exe, now=self.now + timedelta(seconds=40), runtime=rt)
+        self.assertEqual((r["orders_placed"], r["contacts_gated"]), (0, 1), r)
+        self.signal(sid, vid, self.now - timedelta(minutes=2), 0)               # exit → runs
+        r = jobs.run_tick(db=self.exe, now=self.now + timedelta(seconds=50), runtime=rt)
+        self.assertEqual(r["orders_filled"], 1, r)
+        last = self.orders_of(sub)[-1]
+        self.assertEqual((last["side"], last["reduce_only"]), ("sell", True))
+        self.assertEqual(hl.position(master, SILVER), 0)
+
     def test_40_kill_switches(self) -> None:
         from app.execution import jobs
 
@@ -860,6 +933,51 @@ class ExecIntegrationDbTest(unittest.TestCase):
                                  lines=[("treasury:hl_usdc", 5), (f"user:{u}:fee_balance", -5)], created_by="t")
         self.assertTrue(led.has_transaction(key))
         self.ledger_ok()
+
+    def test_65_settlement_low_balance_thresholds_fire_once(self) -> None:
+        """Renewal posted by settlement (outside ledger_ops) → on_balance_changed in the same transaction: the 50 %
+        threshold of the monthly need fires exactly once, re-runs add nothing; a plan renewal crossing 20 % and 0 %
+        fires those once each; subscription_renewed is emitted once."""
+        if "0007_alerts.sql" not in self.db_.applied:
+            self.skipTest("needs 0006/0007")
+        from app.execution import jobs
+
+        hl, info, gw = self.hl_world()
+        rt = self.runtime(hl, info, gw)
+        sid, vid = self.strategy()
+        self.admin.fetchall("UPDATE strategies SET price_monthly_micro = 10000000 WHERE id = CAST(:s AS uuid)", {"s": sid})
+        u = self.user("lowbal")
+        sub = self.subscribe(u, sid, vid, addr("lowbal-" + u))
+        past = self.now - timedelta(days=1)
+        self.admin.fetchall("UPDATE subscriptions SET current_period_end = :t WHERE id = CAST(:s AS uuid)",
+                            {"t": past, "s": sub})
+        self.topup(u, 14_000_000)                                   # $14 = 140 % of the $10 need
+
+        def lows() -> list[tuple[str, int]]:
+            return [(r["kind"], int(r["payload"]["threshold_bps"])) for r in self.admin.fetchall(
+                """SELECT kind, payload FROM alerts WHERE user_id = CAST(:u AS uuid)
+                    AND kind IN ('balance_low', 'balance_empty') ORDER BY created_at, id""", {"u": u})]
+
+        settle_now = self.now + timedelta(minutes=1)
+        rep = jobs.settle_daily(db=self.exe, now=settle_now, runtime=rt)
+        self.assertEqual(rep["errors"], [], rep)
+        self.assertEqual(rep["renewals_charged"], 1, rep)
+        self.assertEqual(lows(), [("balance_low", 5000)])           # $14 → $4 = 40 %: crossed 50 % once
+        self.assertEqual(self.admin.fetchall("""SELECT count(*) AS n FROM events_outbox WHERE kind = 'subscription_renewed'
+                                                AND user_id = CAST(:u AS uuid)""", {"u": u})[0]["n"], 1)
+        jobs.settle_daily(db=self.exe, now=settle_now + timedelta(minutes=2), runtime=rt)
+        self.assertEqual(lows(), [("balance_low", 5000)])           # idempotent: nothing new
+        # plan renewal ($20 pro): need becomes $30; balance must cover the price → top up $16 → $20, renew → $0
+        self.topup(u, 16_000_000)
+        self.admin.fetchall("""UPDATE users SET plan = 'pro', plan_started_at = :t, plan_period_end = :t
+                               WHERE id = CAST(:u AS uuid)""", {"t": past, "u": u})
+        rep = jobs.settle_daily(db=self.exe, now=settle_now + timedelta(minutes=4), runtime=rt)
+        self.assertEqual(rep["plans_renewed"], 1, rep)
+        # $20 → $0 with a $30 need (66 % → 0 %): 50 %, 20 % and 0 % each fire once (the top-up re-armed 50 %)
+        self.assertEqual(sorted(lows()), sorted([("balance_low", 5000), ("balance_low", 5000), ("balance_low", 2000),
+                                                 ("balance_empty", 0)]))   # same created_at: order by value
+        jobs.settle_daily(db=self.exe, now=settle_now + timedelta(minutes=6), runtime=rt)
+        self.assertEqual(len(lows()), 4)
 
     def test_70_referral_tiers(self) -> None:
         from app.config import Economics, ReferralTier

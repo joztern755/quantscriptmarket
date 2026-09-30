@@ -52,7 +52,7 @@ ALLOWED_TIMEFRAMES = ("1h", "4h", "1d")
 TIMEFRAME_MS = {"1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
 MIN_LOOKBACK, MAX_LOOKBACK = 50, 1000
 MAX_MARKETS = 5
-PLATFORM_MAX_LEVERAGE = 5  # mirrors config.RiskLimits.platform_max_leverage; callers may pass theirs
+PLATFORM_MAX_LEVERAGE = 50  # mirrors config.RiskLimits.platform_max_leverage (owner: no platform cap); market max applies
 REQUIRED_CONSTANTS = ("MARKETS", "TIMEFRAME", "LOOKBACK", "MAX_LEVERAGE")
 WEIGHT_TOLERANCE = 1e-9
 

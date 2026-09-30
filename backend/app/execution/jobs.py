@@ -66,6 +66,7 @@ from .pg import (
     PgSignalRepo,
     PgSubscriptionRepo,
     PgUnitOfWork,
+    PgUserEvents,
     open_time_ms,
 )
 from .ports import AlertEvent
@@ -440,8 +441,9 @@ class Runtime:
         return self._treasury
 
     # ---- composed services ------------------------------------------------------------------------------------
-    def executor(self, db: PgDatabase, *, alerts: Any = None) -> Executor:
-        subs = PgSubscriptionRepo(db)
+    def executor(self, db: PgDatabase, *, alerts: Any = None, now: datetime | None = None) -> Executor:
+        """``now``: the tick's time — the alert-contacts entries gate is evaluated at it (default: the clock)."""
+        subs = PgSubscriptionRepo(db, clock=(lambda: now) if now is not None else self.clock)
         try:
             self._traded_coins = tuple(subs.traded_markets())
         except Exception:  # noqa: BLE001 - only narrows the gateway catalog; fall back to the validator dex
@@ -458,7 +460,7 @@ class Runtime:
             repo=PgSettlementRepo(db, self.economics), ledger=PgLedger(db), uow=PgUnitOfWork(db),
             profit_share=DomainProfitShare(self.economics), fees=DomainFees(self.economics),
             billing=DomainBilling(grace), referrals=PgReferralLookup(db, self.economics),
-            alerts=alerts or self.alerts(db), clock=self.clock)
+            alerts=alerts or self.alerts(db), clock=self.clock, events=PgUserEvents(db))
 
     def reconciler(self, db: PgDatabase, *, alerts: Any = None) -> Reconciler:
         return Reconciler(repo=PgReconcileRepo(db), positions=self.positions, builder_rewards=self.builder_rewards,
@@ -514,7 +516,7 @@ def run_tick(*, db: Any, now: datetime, runtime: Runtime | None = None, creator_
         except Exception as e:  # noqa: BLE001 - never block the executor on the sandbox
             log.error("creator_signals_failed", exc_info=True)
             out["creator_signals"] = {"error": type(e).__name__}
-    report = rt.executor(pdb, alerts=alerts).run_tick(now)
+    report = rt.executor(pdb, alerts=alerts, now=now).run_tick(now)
     out.update(report.as_dict())
     return out
 

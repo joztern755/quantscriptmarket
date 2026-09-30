@@ -1,5 +1,6 @@
 // #/dashboard[/:tab] — subscriptions (pause/resume/cancel/edit, step-up), positions, PnL per subscription,
-// fee balance + ledger + deposits (USDC UsdSend / Stripe Payment Element) + withdraw (step-up), alerts inbox.
+// fee balance + ledger + deposits (USDC UsdSend / Stripe Payment Element) + withdraw (step-up), alerts inbox (+ link to
+// #/alerts settings), platform plan (Free / Pro / Max from public config; POST /v1/me/plan with confirm + step-up).
 import type { PageContext } from "../core/router.js";
 import { h, mount, skeleton, errorState, emptyState, note, stat, kv, table, tabs, button, toast, confirmDialog, modal, field, badge, subStatusBadge, type Column } from "../core/ui.js";
 import { cancelButtons } from "../core/subscriptions.js";
@@ -8,8 +9,11 @@ import { appConfig } from "../core/config.js";
 import { loadStripe, stripeFeeNotice } from "../core/stripe.js";
 import { connectWallet, getConnectedWallet } from "../core/wallet.js";
 import { usdSend } from "../core/hl.js";
+import { getMe } from "../core/state.js";
+import { stepUp } from "../core/auth.js";
 import { fmtUsd, fmtLeverage, fmtDate, fmtDateTime, fmtRelative, fmtNum, shortAddr } from "../core/format.js";
-import type { Subscription, Position, Balance, LedgerRow, Alert, UsdcTypedDataOut, UsdcConfirmOut, StripeDepositOut, PayoutOut } from "./_shared/types.js";
+import type { Subscription, Position, Balance, LedgerRow, Alert, UsdcTypedDataOut, UsdcConfirmOut, StripeDepositOut, PayoutOut, PlanChangeOut, PlanKey } from "./_shared/types.js";
+import { parseContacts } from "./_shared/contacts.js";
 import { ensurePageCss, listOf, isAbortError, errCode, errMessage, isAddress, hlNum, usdInput, pageHead, panel, every, isRec, LOSS_WARNING } from "./_shared/util.js";
 
 export const title = "Dashboard";
@@ -19,11 +23,14 @@ const TABS = [
   { key: "positions", label: "Positions" },
   { key: "balance", label: "Fee balance" },
   { key: "alerts", label: "Alerts" },
+  { key: "plan", label: "Plan" },
 ];
 
 export async function render(root: HTMLElement, ctx: PageContext): Promise<void> {
   ensurePageCss();
-  const tab = TABS.some((t) => t.key === ctx.params.tab) ? (ctx.params.tab as string) : "overview";
+  // #/dashboard/<tab> or #/dashboard?tab=<tab>
+  const want = ctx.params.tab ?? ctx.query.get("tab") ?? "";
+  const tab = TABS.some((t) => t.key === want) ? want : "overview";
   const body = h("div", { class: "stack" });
   mount(
     root,
@@ -38,6 +45,7 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
   if (tab === "positions") return positionsTab(body, ctx);
   if (tab === "balance") return balanceTab(body, ctx);
   if (tab === "alerts") return alertsTab(body, ctx);
+  if (tab === "plan") return planTab(body, ctx);
   return overviewTab(body, ctx);
 }
 
@@ -45,17 +53,39 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
 async function overviewTab(body: HTMLElement, ctx: PageContext): Promise<void> {
   const kpis = h("div", { class: "stats" }, skeleton(2));
   const subsBox = h("div", { class: "stack" }, skeleton(6));
-  mount(body, kpis, panel(h("div", { class: "row between w-full" }, h("h2", null, "Subscriptions"), h("a", { class: "btn sm", href: "#/market" }, "Add strategy")), subsBox));
+  const setupBox = h("div");
+  mount(body, setupBox, kpis, panel(h("div", { class: "row between w-full" }, h("h2", null, "Subscriptions"), h("a", { class: "btn sm", href: "#/market" }, "Add strategy")), subsBox));
 
   const load = async (): Promise<void> => {
     mount(subsBox, skeleton(6));
     try {
-      const [subsRaw, bal, alertsRaw] = await Promise.all([
+      const [subsRaw, bal, alertsRaw, contactsRaw] = await Promise.all([
         api.get<unknown>("/subscriptions?limit=100", { signal: ctx.signal }),
         api.get<Balance>("/balance", { signal: ctx.signal }).catch(() => null),
         api.get<unknown>("/alerts", { signal: ctx.signal }).catch(() => null),
+        api.get<unknown>("/alerts/contacts", { signal: ctx.signal }).catch(() => null),
       ]);
       if (!ctx.isCurrent()) return;
+      // SPEC §12: Telegram + a confirmed email are required on every plan before a subscription can start.
+      const contacts = isRec(contactsRaw) ? parseContacts(contactsRaw) : null;
+      mount(
+        setupBox,
+        contacts && !contacts.ready
+          ? note(
+              h(
+                "span",
+                null,
+                h("b", null, "Set up alerts. "),
+                contacts.telegram.status === "blocked" || contacts.telegram.status === "stopped"
+                  ? "We can't reach you on Telegram any more — new entries on your subscriptions pause unless you link it again. "
+                  : "Link Telegram and confirm an email before your first subscription can start. ",
+                h("a", { href: "#/alerts" }, "Open alert settings"),
+                ".",
+              ),
+              contacts.telegram.status === "blocked" ? "bad" : "warn",
+            )
+          : null,
+      );
       const subs = listOf<Subscription>(subsRaw);
       const alerts = listOf<Alert>(alertsRaw);
       const live = subs.filter((x) => x.status !== "cancelled");
@@ -562,7 +592,14 @@ function withdrawPanel(ctx: PageContext, cfg: PublicConfig, getBal: () => Balanc
 // ------------------------------------------------------------------------------------------ alerts
 async function alertsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
   const box = h("div", { class: "stack" }, skeleton(6));
-  mount(body, panel("Alerts", box));
+  mount(
+    body,
+    panel(
+      h("div", { class: "row between w-full" }, h("h2", null, "Alerts"), h("a", { class: "btn sm", href: "#/alerts", id: "alert-settings-link" }, "Telegram & email settings")),
+      h("p", { class: "small muted" }, "Every alert also goes to Telegram; mandatory, security and money alerts are emailed too. Choose what you receive in ", h("a", { href: "#/alerts" }, "alert settings"), "."),
+      box,
+    ),
+  );
   const load = async (): Promise<void> => {
     try {
       const res = await api.get<unknown>("/alerts", { signal: ctx.signal });
@@ -606,3 +643,169 @@ function alertItem(ctx: PageContext, a: Alert, reload: () => void): HTMLElement 
   ) as HTMLElement;
 }
 
+
+// ------------------------------------------------------------------------------------------ plan
+const PLAN_NAMES: Record<string, string> = { free: "Free", pro: "Pro", max: "Max" };
+const PLAN_ORDER: Record<string, number> = { free: 0, pro: 1, max: 2 };
+const FEATURE_LABELS: Record<string, string> = {
+  marketplace: "Marketplace & subscriptions",
+  leaderboard: "Leaderboard",
+  free_posts: "Free posts",
+  paid_posts: "Buy paid posts",
+  email_telegram_alerts: "Telegram + email alerts",
+  csv_export: "CSV / tax export",
+  read_api: "Read API",
+};
+const planName = (k: string): string => PLAN_NAMES[k] ?? k;
+
+/** Features shown on a plan card. Alerts are included on every plan (SPEC §12), whatever the config lists. */
+function planFeatures(p: PublicConfig["plans"][number]): string[] {
+  const out = ["Telegram + email alerts"];
+  for (const f of p.features) {
+    if (f === "email_telegram_alerts") continue;
+    out.push(FEATURE_LABELS[f] ?? f.replace(/_/g, " "));
+  }
+  return out;
+}
+
+async function planTab(body: HTMLElement, ctx: PageContext): Promise<void> {
+  const box = h("div", { class: "stack" }, skeleton(6));
+  mount(body, box);
+  const load = async (force = false): Promise<void> => {
+    try {
+      const [cfg, me, bal, subsRaw] = await Promise.all([
+        publicConfig(),
+        force ? getMe(true) : Promise.resolve(ctx.me).then((m) => m ?? getMe()),
+        api.get<Balance>("/balance", { signal: ctx.signal }).catch(() => null),
+        api.get<unknown>("/subscriptions?limit=100", { signal: ctx.signal }).catch(() => null),
+      ]);
+      if (!ctx.isCurrent()) return;
+      const current = (me?.plan ?? "free") as string;
+      const live = listOf<Subscription>(subsRaw).filter((x) => x.status !== "cancelled").length;
+      const plans = [...cfg.plans].sort((a, b) => (PLAN_ORDER[a.key] ?? 9) - (PLAN_ORDER[b.key] ?? 9));
+      mount(
+        box,
+        panel(
+          h("div", { class: "row between w-full" }, h("h2", null, "Your plan"), h("span", { class: "row" }, "Current: ", badge(planName(current), "good"))),
+          h(
+            "p",
+            { class: "small muted" },
+            "Plans are paid monthly from your prepaid fee balance — never from your trading account. Switching charges the new plan's first month now; there is no proration or refund of the current month. Strategy subscriptions, profit share and builder fees are separate.",
+          ),
+          bal ? h("p", { class: "small" }, "Fee balance: ", h("b", { class: "mono" }, fmtUsd(bal.fee_balance_micro)), " · ", h("a", { href: "#/dashboard/balance" }, "Top up")) : null,
+          h(
+            "div",
+            { class: "cards plan-cards" },
+            ...plans.map((p) => {
+              const isCur = p.key === current;
+              const up = (PLAN_ORDER[p.key] ?? 0) > (PLAN_ORDER[current] ?? 0);
+              const tooMany = p.max_active_strategies !== null && live > p.max_active_strategies;
+              return h(
+                "div",
+                { class: ["panel", "stack", "tight", "plan-card", isCur && "current"], dataset: { plan: p.key } },
+                h("div", { class: "row between" }, h("h3", null, planName(p.key)), isCur ? badge("Current plan", "good") : null),
+                h("div", null, h("span", { class: "plan-price mono" }, p.price_monthly_micro > 0 ? fmtUsd(p.price_monthly_micro, { cents: false }) : "$0"), h("span", { class: "muted small" }, " / month")),
+                h("p", { class: "small" }, p.max_active_strategies === null ? "Unlimited active strategies" : `Up to ${p.max_active_strategies} active strateg${p.max_active_strategies === 1 ? "y" : "ies"}`),
+                h("ul", { class: "plan-feats small" }, ...planFeatures(p).map((f) => h("li", null, f))),
+                isCur
+                  ? null
+                  : tooMany
+                    ? h("p", { class: "small muted" }, `You have ${live} active subscriptions; cancel some to switch to ${planName(p.key)}.`)
+                    : h(
+                        "div",
+                        { class: "btns" },
+                        button(up ? `Upgrade to ${planName(p.key)}` : `Switch to ${planName(p.key)}`, {
+                          kind: up ? "primary" : "plain",
+                          onClick: () => changePlan(ctx, { key: p.key, price: p.price_monthly_micro, from: current, balance: bal }, () => void load(true)),
+                        }),
+                      ),
+              );
+            }),
+          ),
+          cfg._fallback ? note("Showing default plans — the live configuration could not be loaded.", "info") : null,
+        ),
+      );
+    } catch (err) {
+      if (isAbortError(err) || !ctx.isCurrent()) return;
+      mount(box, errorState(err, () => void load()));
+    }
+  };
+  await load();
+}
+
+function topUpPrompt(ctx: PageContext, plan: string, price: number, balance: number | null): void {
+  const short = balance === null ? null : Math.max(0, price - balance);
+  modal({
+    title: "Not enough fee balance",
+    body: h(
+      "div",
+      { class: "stack", id: "plan-topup" },
+      h("p", null, `${planName(plan)} costs ${fmtUsd(price)} per month, charged now from your prepaid fee balance.`),
+      balance !== null ? kv([["Fee balance", fmtUsd(balance)], ["Needed now", fmtUsd(price)], ["Top up at least", fmtUsd(short ?? price)]]) : null,
+      h("p", { class: "small muted" }, "Add funds with USDC on Hyperliquid or a card, then switch plans again."),
+    ),
+    actions: [
+      { label: "Not now", kind: "plain" },
+      { label: "Top up balance", kind: "primary", onClick: () => ctx.navigate("/dashboard/balance") },
+    ],
+  });
+}
+
+/** Confirm → step-up (fresh sign-in + TOTP; the api client would also do it on 401 step_up_required and retry once
+ *  with the same Idempotency-Key) → POST /v1/me/plan {plan} → 402 insufficient_balance → top-up prompt. */
+async function changePlan(ctx: PageContext, p: { key: string; price: number; from: string; balance: Balance | null }, onDone: () => void): Promise<void> {
+  const bal = p.balance?.fee_balance_micro ?? null;
+  if (p.price > 0 && bal !== null && bal < p.price) {
+    topUpPrompt(ctx, p.key, p.price, bal);
+    return;
+  }
+  const up = (PLAN_ORDER[p.key] ?? 0) > (PLAN_ORDER[p.from] ?? 0);
+  const ok = await confirmDialog({
+    title: `Switch to ${planName(p.key)}?`,
+    message: h(
+      "div",
+      { class: "stack tight" },
+      kv([
+        ["From", planName(p.from)],
+        ["To", planName(p.key)],
+        ["Charged now", p.price > 0 ? `${fmtUsd(p.price)} from your fee balance` : "Nothing"],
+        ["Renews", p.price > 0 ? "Monthly from your fee balance" : "—"],
+      ]),
+      h("p", { class: "small muted" }, up || p.price > 0
+        ? "No proration or refund of your current month. You'll be asked to confirm it's you."
+        : `Paid features end now and the current month is not refunded. You'll be asked to confirm it's you.`),
+    ),
+    confirmLabel: `Switch to ${planName(p.key)}`,
+  });
+  if (!ok) return;
+  let out: PlanChangeOut;
+  try {
+    await stepUp(p.price > 0 ? `Switching to ${planName(p.key)} charges ${fmtUsd(p.price)} to your fee balance, so we need a fresh sign-in.` : "Changing your plan needs a fresh sign-in.");
+    out = await api.post<PlanChangeOut>("/me/plan", { plan: p.key as PlanKey }, { signal: ctx.signal, idempotencyKey: newIdempotencyKey() });
+  } catch (err) {
+    const c = errCode(err);
+    if (c === "insufficient_balance") {
+      topUpPrompt(ctx, p.key, p.price, bal);
+      return;
+    }
+    if (c === "conflict") {
+      toast(errMessage(err), "warn", 7000);
+      onDone();
+      return;
+    }
+    if (c === "step_up_cancelled") {
+      toast("Plan not changed.", "info");
+      return;
+    }
+    throw err;
+  }
+  if (!ctx.isCurrent()) return;
+  toast(
+    out.charged_micro > 0
+      ? `You're on ${planName(String(out.plan))}. Charged ${fmtUsd(out.charged_micro)}; fee balance ${fmtUsd(out.fee_balance_micro)}.`
+      : `You're on ${planName(String(out.plan))}.`,
+    "good",
+    6000,
+  );
+  onDone();
+}

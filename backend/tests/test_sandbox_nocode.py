@@ -60,7 +60,7 @@ class SchemaTests(unittest.TestCase):
         cases = [
             (dict(markets=None), "markets"), (dict(markets=["BTC'); import os #"]), "markets[0]"),
             (dict(timeframe="5m"), "timeframe"), (dict(lookback=10), "lookback"),
-            (dict(max_leverage=9), "max_leverage"), (dict(bogus=1), "bogus"),
+            (dict(max_leverage=51), "max_leverage"), (dict(bogus=1), "bogus"),
             (dict(indicators={"a'b": {"type": "sma", "period": 3}}), "indicators.a'b"),
             (dict(indicators={"__class__": {"type": "sma", "period": 3}}), "indicators.__class__"),
             (dict(indicators={"x": {"type": "macd", "period": 3}}), "indicators.x.type"),

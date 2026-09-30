@@ -1,7 +1,13 @@
 """Provider-agnostic creator-KYC interface (SPEC §3 ``kyc_creators``, §12: creator KYC before listing / paid posts /
 payouts). Documents and biometrics stay at the provider; we keep only (provider, provider_ref, status).
 
-Statuses are the DB enum ``kyc_status``: ``pending`` | ``approved`` | ``rejected``.
+Statuses are the DB enum ``kyc_status``: ``pending`` | ``provider_approved`` | ``approved`` | ``rejected``.
+
+Owner decision (30 Sep 2026): creator KYC approval needs exactly ONE admin (not maker-checker).
+  * manual provider: one admin records the verdict (POST /v1/admin/users/{id}/kyc) → ``approved`` / ``rejected``;
+  * Sumsub: a GREEN verdict is stored as ``provider_approved`` — never auto-approved — and ONE admin confirms it
+    (same endpoint) → ``approved``. RED → ``rejected`` immediately (protective).
+Only ``approved`` unlocks listing, paid posts and payouts (listing and payouts keep their own two-admin rules).
 """
 from __future__ import annotations
 
@@ -13,7 +19,9 @@ from typing import Any, Mapping, Optional, Protocol
 from app.errors import AppError
 
 PENDING, APPROVED, REJECTED = "pending", "approved", "rejected"
-STATUSES = (PENDING, APPROVED, REJECTED)
+PROVIDER_APPROVED = "provider_approved"     # provider said GREEN; awaiting ONE admin's confirmation
+STATUSES = (PENDING, APPROVED, REJECTED)    # verdicts a provider can report (KycEvent.status)
+STORED_STATUSES = (PENDING, PROVIDER_APPROVED, APPROVED, REJECTED)   # DB enum kyc_status (0008)
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
@@ -107,14 +115,17 @@ class KycProvider(Protocol):
 def next_status(current: Optional[str], event: KycEvent) -> Optional[str]:
     """Status to store for ``event`` given the stored one; None = no change.
 
-    * provider verdicts win in both directions (approved → rejected is honoured: ongoing monitoring can revoke);
-    * an approval is NOT downgraded to pending by a routine "pending"/"on hold" notification — only by an explicit
-      reset/delete (``revoke``), which forces re-verification before any new listing or payout.
+    * a provider approval (GREEN) is stored as ``provider_approved`` — an admin confirms it (never auto-approved);
+      it never downgrades an admin-confirmed ``approved``;
+    * rejections win in both directions (approved → rejected is honoured: ongoing monitoring can revoke);
+    * an approval (either kind) is NOT downgraded to pending by a routine "pending"/"on hold" notification — only by
+      an explicit reset/delete (``revoke``), which forces re-verification before any new listing or payout.
     """
     if event.status not in STATUSES:
         return None
-    if current == event.status:
+    target = PROVIDER_APPROVED if event.status == APPROVED else event.status
+    if current == target or (current == APPROVED and target == PROVIDER_APPROVED):
         return None
-    if current == APPROVED and event.status == PENDING and not event.revoke:
+    if current in (APPROVED, PROVIDER_APPROVED) and target == PENDING and not event.revoke:
         return None
-    return event.status
+    return target

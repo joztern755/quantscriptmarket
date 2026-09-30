@@ -3,9 +3,12 @@
 RAW body; the signature is verified by the provider module before anything is read. The verdict is re-read from the
 provider's API (app.kyc.sumsub ``refetch``) and applied idempotently to ``kyc_creators`` only when the notification
 matches the stored (provider, provider_ref) for that user. A bad signature is 400; a provider/API failure is 5xx
-so the provider retries. Manual KYC (internal phase) has no webhook: verdicts go through POST
-/v1/admin/users/{id}/kyc (maker-checker). The approval unlocks listing, paid posts and payouts; payouts still need
-two admins.
+so the provider retries.
+
+Owner decision (30 Sep 2026): a GREEN verdict is stored as ``provider_approved`` — NEVER auto-approved — and ops are
+asked (``kyc_awaiting_admin``) for ONE admin to confirm via POST /v1/admin/users/{id}/kyc → ``approved``. RED →
+``rejected`` at once. Manual KYC has no webhook: one admin records the verdict on the same endpoint. Only
+``approved`` unlocks listing, paid posts and payouts (listing and payouts keep their two-admin rules).
 """
 from __future__ import annotations
 
@@ -56,6 +59,10 @@ def _apply(svc: Services, event: Any) -> dict[str, Any]:
                 if row["status"] == "approved":
                     svc.notifier.notify(conn, user_id=None, severity="warn", kind="kyc_approval_revoked",
                                         payload={"user_id": event.user_id, "status": new, "event": event.event_type})
+                if new == getattr(kyc_mod, "PROVIDER_APPROVED", "provider_approved"):
+                    svc.notifier.notify(conn, user_id=None, severity="warn", kind="kyc_awaiting_admin",
+                                        payload={"user_id": event.user_id, "provider": event.provider,
+                                                 "action": "confirm in the admin console (one admin)"})
         svc.audit.write(conn, actor=ACTOR, action="kyc.webhook", target=f"user:{event.user_id}",
                         payload={"provider": event.provider, "provider_ref": event.provider_ref,
                                  "event_type": event.event_type, "event_id": event.event_id,

@@ -11,13 +11,18 @@ payments, API). Keys match what app/jobs_data emits; alternatives in brackets ar
   daily_pnl_summary    date (YYYY-MM-DD), realized_pnl_micro, fees_micro, fills, closed_trades, lines (list[str])
   agent_expiring       days_left, valid_until_ms [expires_at], master [wallet] (short address) — app/jobs_data/agents
   agent_expired / agent_revoked   master [wallet / master_address], valid_until_ms, reason
-  builder_approval_missing        optional master [wallet]
+  builder_approval_missing        optional master [wallet], approved_tenths_bp, required_tenths_bp, where
+                                  (subscribe | builder_confirm | agent_confirm | daily_scan)
   balance_low / balance_empty        balance_micro, threshold_bps, need_micro
   subscription_past_due / subscription_reduce_only   strategy (name), optional subscription
-  profit_share_charged amount_micro, optional strategy, profit_micro, rate_bps
+  profit_share_charged amount_micro, optional strategy, profit_micro, rate_bps, period_start / period_end (ISO; the
+                       realized-PnL window settled), creator_micro, platform_micro — app/execution/settlement
   topup_credited / topup_failed / topup_held / stripe_refund / stripe_dispute   amount_micro, optional method
+  subscription_renewed amount_micro, strategy (name), period_end
   withdrawal_requested / withdrawal_sent / withdrawal_rejected                  amount_micro, optional request_id
-  new_device_login     optional device, country ; login_new_country / new_country_login: country
+                       (API POST /withdrawals + admin reject/sent), optional reason (rejected)
+  new_device_login     optional device (coarse "Chrome on macOS"), country, reason (new_device | new_country) —
+                       app/api/login_events ; login_new_country / new_country_login: country
   mfa_changed / mfa_reset   optional change
   market_paused        scope (coin or "all markets"), optional cause ; strategy_paused: strategy
   signal_stale         optional strategy ; telegram_unreachable: reason, pause_at ; alert_email_changed: email
@@ -211,7 +216,25 @@ def _profit_share(p: P, origin: str) -> tuple[str, str]:
         parts.append(f" on {p.usd('profit_micro')} of new profit above the high-water mark")
     if p.d.get("rate_bps") is not None:
         parts.append(f" at {p.pct_bps('rate_bps')}")
-    return "Profit share charged", "".join(parts) + "."
+    text = "".join(parts) + "."
+    start, end = _day(p.d.get("period_start")), _day(p.d.get("period_end"))
+    if end:
+        text += f" Period: {start} to {end} (UTC)." if start else f" Period: realized PnL up to {end} (UTC)."
+    return "Profit share charged", text
+
+
+def _day(v: Any) -> str:
+    """ISO timestamp/date → 'YYYY-MM-DD HH:MM' (or 'YYYY-MM-DD' at midnight); '' when missing/unparseable."""
+    if not isinstance(v, str) or not v:
+        return ""
+    from datetime import datetime, timezone
+    try:
+        d = datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if d.tzinfo is not None:
+        d = d.astimezone(timezone.utc)
+    return d.strftime("%Y-%m-%d") if (d.hour, d.minute) == (0, 0) else d.strftime("%Y-%m-%d %H:%M")
 
 
 def _simple(title: str, body: str) -> Tmpl:

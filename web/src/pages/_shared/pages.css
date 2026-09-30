@@ -110,3 +110,13 @@ textarea.code { font: 12.5px/1.5 var(--mono); min-height: 280px; tab-size: 4; wh
 .alert-item { display: flex; flex-direction: column; gap: 4px; padding: 10px 0; border-top: 1px solid var(--line); }
 .alert-item.unread .alert-title { font-weight: 600; }
 .break { overflow-wrap: anywhere; word-break: break-word; }
+
+/* plans (dashboard) */
+.plan-cards { grid-template-columns: repeat(auto-fill, minmax(min(100%, 220px), 1fr)); }
+.plan-card.current { border-color: var(--accent); }
+.plan-card h3 { font-size: 1.15rem; }
+.plan-price { font-size: 1.6rem; font-weight: 600; }
+.plan-feats { margin: 0; padding-left: 1.1em; display: grid; gap: 2px; }
+
+/* live equity (strategy page) */
+.equity-live .row h3 { font-size: 1rem; }

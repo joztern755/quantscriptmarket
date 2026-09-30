@@ -239,11 +239,17 @@ class MappingTests(unittest.TestCase):
 
     def test_next_status(self):
         ev = lambda status, revoke=False: KycEvent("sumsub", APPLICANT, USER, "t", status, revoke=revoke)  # noqa: E731
-        self.assertEqual(next_status("pending", ev("approved")), "approved")
-        self.assertIsNone(next_status("approved", ev("approved")))
+        # owner: a provider GREEN is never an approval by itself — ONE admin confirms provider_approved → approved
+        self.assertEqual(next_status("pending", ev("approved")), "provider_approved")
+        self.assertEqual(next_status("rejected", ev("approved")), "provider_approved")
+        self.assertIsNone(next_status("provider_approved", ev("approved")))       # redelivery
+        self.assertIsNone(next_status("approved", ev("approved")))                # never downgrades an admin approval
         self.assertEqual(next_status("approved", ev("rejected")), "rejected")
+        self.assertEqual(next_status("provider_approved", ev("rejected")), "rejected")
         self.assertIsNone(next_status("approved", ev("pending")))                 # routine pending never downgrades
+        self.assertIsNone(next_status("provider_approved", ev("pending")))
         self.assertEqual(next_status("approved", ev("pending", revoke=True)), "pending")
+        self.assertEqual(next_status("provider_approved", ev("pending", revoke=True)), "pending")
         self.assertEqual(next_status("rejected", ev("pending")), "pending")       # resubmission allowed
         self.assertIsNone(next_status("pending", ev("bogus")))
 

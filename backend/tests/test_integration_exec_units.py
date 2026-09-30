@@ -244,6 +244,51 @@ class JobHelpersTest(unittest.TestCase):
             SandboxClient("", "x", require_id_token=False).run("s", {}, now_ms=1)
 
 
+class ExecutorNotifierPolicyTest(unittest.TestCase):
+    """SPEC §12 email volume policy: the executor/settlement Notifier never emails USERS (the delivery worker does,
+    from the `alerts` rows, with mutes + confirmed contacts); ops email / Telegram paging stay."""
+
+    def test_build_notifier_emails_ops_only(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from app.alerts import notifier as n
+        from app.alerts.user_sinks import NoUserEmailContacts
+        from app.execution import jobs
+        from app.execution.pg import PgDatabase
+
+        sent: list[tuple[str, str]] = []
+        rows: list[str] = []
+
+        class Provider:
+            name = "fake"
+
+            def __init__(self, *a, **k):
+                pass
+
+            def send(self, to, subject, text):
+                sent.append((to, subject))
+
+        class Runner:
+            def fetchall(self, sql, params=None):
+                rows.append(sql)
+                return []
+
+        settings = SimpleNamespace(email_provider_api_key="k", email_from="alerts@aijalon.trade",
+                                   telegram_bot_token="", telegram_ops_chat_id="", ops_emails=("ops@aijalon.test",))
+        with mock.patch.object(n, "ResendProvider", Provider):
+            notif = jobs.build_notifier(settings, PgDatabase(Runner()), dedupe_store=n.InMemoryDedupeStore())
+        self.assertIsInstance(notif.contacts, NoUserEmailContacts)
+        notif.notify(n.Alert(kind="subscription_past_due", severity=n.Severity.WARN, user_id="u1", data={"x": 1}))
+        self.assertEqual(sent, [])                                    # warn user alert: in-app row only
+        self.assertTrue(any("INSERT INTO alerts" in q for q in rows))
+        notif.notify(n.Alert(kind="order_rejections_burst", severity=n.Severity.CRITICAL, user_id="u1",
+                             data={"subscription": "s", "count": 3, "coin": "-", "last_reason": "r"}))
+        self.assertEqual([to for to, _ in sent], ["ops@aijalon.test"])   # critical: ops only, never the user
+        notif.notify(n.Alert(kind="execution_error", severity=n.Severity.WARN, data={"error": "X"}))
+        self.assertEqual([to for to, _ in sent], ["ops@aijalon.test"] * 2)
+
+
 class JobEntrypointContractTest(unittest.TestCase):
     def test_api_adapter_finds_every_job_and_calls_with_db_now(self):
         import ast

@@ -20,6 +20,12 @@ For ``settle_date`` D (PnL cut-off = D 00:00 UTC):
 Ledger sign convention (SPEC §4): + debit / − credit, Σ per transaction = 0. The user fee balance is a
 liability, so the user's available balance is ``−balance(user:{id}:fee_balance)``.
 
+User events (``UserEventSink``, same DB transaction as the posting they describe — SPEC §12 alert kinds):
+- every posting on ``user:{id}:fee_balance`` (profit share, subscription renewal, plan renewal) calls
+  ``fee_balance_changed(prev, new)`` → low-balance alerts (50 / 20 / 0 % of the monthly need, once per crossing);
+- ``profit_share_charged`` per charge (amount, profit above the HWM, rate, strategy, settled period), dedup
+  ``profit_share_charged:{ledger key}``; ``subscription_renewed`` per paid renewal, dedup ``subscription_renewed:{key}``.
+
 Policy notes:
 - Profit share is charged in full even if it drives the fee balance negative (it is owed on profit already
   realised in the user's own account); the subscription then moves to past_due. Renewals are prepaid: they
@@ -50,6 +56,7 @@ from .ports import (
     SettlementRepo,
     SettlementSubscription,
     UnitOfWork,
+    UserEventSink,
 )
 
 log = get_logger("app.execution.settlement")
@@ -127,7 +134,7 @@ class Settlement:
     def __init__(self, *, repo: SettlementRepo, ledger: LedgerPoster, uow: UnitOfWork,
                  profit_share: ProfitShareCalculator, fees: FeeSplitter, billing: BillingPolicy,
                  referrals: ReferralLookup, alerts: AlertSink, clock: Clock, builder_page_size: int = 1000,
-                 created_by: str = "system:settlement") -> None:
+                 created_by: str = "system:settlement", events: UserEventSink | None = None) -> None:
         self.repo = repo
         self.ledger = ledger
         self.uow = uow
@@ -139,6 +146,7 @@ class Settlement:
         self.clock = clock
         self.page = builder_page_size
         self.created_by = created_by
+        self.events = events
 
     # --------------------------------------------------------------------------------------------------------- entry
 
@@ -205,10 +213,21 @@ class Settlement:
                          (ACC_PLATFORM_PROFIT_SHARE, -platform_amt)]
                 if creator_acct:
                     pairs.append((creator_acct, -creator_amt))
-                tx_id, _created = self.ledger.post_transaction(
+                prev = self._spendable(sub.user_id)
+                tx_id, created = self.ledger.post_transaction(
                     idempotency_key=key, kind="profit_share",
                     memo=f"profit share {settle_date.isoformat()} profit_micro={charge.profit_micro}",
                     lines=_lines(*pairs), created_by=self.created_by)
+                if created:
+                    self._balance_changed(sub.user_id, prev)
+                    self._event(sub.user_id, "profit_share_charged", "info", {
+                        "amount_micro": charge.total_micro, "profit_micro": charge.profit_micro,
+                        "rate_bps": self._profit_share_rate_bps(sub),
+                        "creator_micro": creator_amt, "platform_micro": platform_amt,
+                        "strategy_id": sub.strategy_id, "subscription_id": sub.id,
+                        "period_start": sub.pnl_cursor.isoformat() if sub.pnl_cursor else sub.created_at.isoformat(),
+                        "period_end": cutoff.isoformat(), "settle_date": settle_date.isoformat()},
+                        dedup=f"profit_share_charged:{key}")
             self.repo.save_profit_share(sub.id, settle_date, cum_pnl_micro=charge.new_cum_pnl_micro,
                                         hwm_micro=charge.new_hwm_micro, pnl_cursor=cutoff, ledger_tx_id=tx_id)
         report.profit_share_settled += 1
@@ -241,10 +260,16 @@ class Settlement:
                     pairs = [(fee_balance_account(sub.user_id), due), (ACC_PLATFORM_SUBSCRIPTION, -platform_amt)]
                     if creator_amt:
                         pairs.append((creator_payable_account(sub.creator_user_id), -creator_amt))  # type: ignore[arg-type]
-                    self.ledger.post_transaction(
+                    prev = self._spendable(sub.user_id)
+                    _tx, created = self.ledger.post_transaction(
                         idempotency_key=key, kind="subscription_renewal",
                         memo=f"subscription renewal period_end={sub.current_period_end.isoformat()}",
                         lines=_lines(*pairs), created_by=self.created_by)
+                    if created:
+                        self._balance_changed(sub.user_id, prev)
+                        self._event(sub.user_id, "subscription_renewed", "info", {
+                            "amount_micro": due, "strategy_id": sub.strategy_id, "subscription_id": sub.id,
+                            "period_end": new_end.isoformat()}, dedup=f"subscription_renewed:{key}")
                 self.repo.set_period_end(sub.id, new_end)
                 if status != sub.status or since != sub.past_due_since:
                     self.repo.set_status(sub.id, status, since)
@@ -274,11 +299,14 @@ class Settlement:
             new_end = self.billing.next_period_end(acct.anchor or acct.plan_period_end, max(now, acct.plan_period_end))
             with self.uow.atomic():
                 if price > 0:
-                    self.ledger.post_transaction(
+                    prev = self._spendable(acct.user_id)
+                    _tx, created = self.ledger.post_transaction(
                         idempotency_key=plan_key(acct.user_id, acct.plan_period_end), kind="plan_renewal",
                         memo=f"plan {acct.plan} renewal period_end={acct.plan_period_end.isoformat()}",
                         lines=_lines((fee_balance_account(acct.user_id), price), (ACC_PLATFORM_PLANS, -price)),
                         created_by=self.created_by)
+                    if created:
+                        self._balance_changed(acct.user_id, prev)
                 self.repo.set_plan_period(acct.user_id, new_end, None)
             report.plans_renewed += 1
             return
@@ -343,6 +371,35 @@ class Settlement:
         report.builder_fees_recognised_micro += fee
 
     # ---------------------------------------------------------------------------------------------------- helpers
+
+    def _spendable(self, user_id: str) -> int:
+        return -self.ledger.balance(fee_balance_account(user_id))
+
+    def _balance_changed(self, user_id: str, prev: int) -> None:
+        """Low-balance alerts for a fee-balance posting (same transaction). Never fails the money movement."""
+        if self.events is None:
+            return
+        try:
+            self.events.fee_balance_changed(user_id=user_id, prev_micro=prev, new_micro=self._spendable(user_id),
+                                            now=self.clock.now())
+        except Exception:
+            log.error("balance_hook_failed", exc_info=True, extra={"fields": {"user_id": user_id}})
+
+    def _event(self, user_id: str, kind: str, severity: str, payload: dict[str, Any], *, dedup: str) -> None:
+        if self.events is None:
+            return
+        try:
+            self.events.emit(user_id=user_id, kind=kind, severity=severity, payload=payload, dedup_key=dedup)
+        except Exception:
+            log.error("user_event_failed", exc_info=True, extra={"fields": {"kind": kind}})
+
+    def _profit_share_rate_bps(self, sub: SettlementSubscription) -> int:
+        """Total rate the user pays (domain.profit_share: on_top → creator % + platform %; carved_out → creator %)."""
+        econ = getattr(self.ps, "economics", None)
+        platform = int(getattr(econ, "platform_profit_share_bps", 0) or 0)
+        on_top = getattr(econ, "platform_profit_share_mode", "on_top") == "on_top"
+        creator = int(sub.profit_share_bps)
+        return creator + platform if on_top else creator
 
     def _fail(self, report: SettlementReport, what: str, exc: Exception, *, user_id: str | None = None) -> None:
         report.errors.append(f"{what}:{type(exc).__name__}")

@@ -6,7 +6,7 @@ import { h, mount, skeleton, errorState, emptyState, note, stat, kv, lineChart, 
 import { api, publicConfig } from "../core/api.js";
 import { feeSummary } from "../core/gate.js";
 import { fmtUsd, fmtPct, fmtBps, fmtNum, fmtDate, shortAddr } from "../core/format.js";
-import type { StrategyDetail, StrategyVersionPublic, ShowcaseWallet, Review, PostSummary } from "./_shared/types.js";
+import type { StrategyDetail, StrategyVersionPublic, ShowcaseWallet, Review, PostSummary, EquityOut, EquityPoint } from "./_shared/types.js";
 import { profitShare, builderSplit } from "./_shared/fees.js";
 import { backtestPanel } from "./_shared/backtest.js";
 import {
@@ -14,6 +14,8 @@ import {
   listOf,
   isAbortError,
   roiPct,
+  toMs,
+  isRec,
   strategyBadges,
   marketChips,
   explorerAddressUrl,
@@ -68,6 +70,7 @@ function draw(root: HTMLElement, ctx: PageContext, s: StrategyDetail): void {
   const reviewsBox = h("div", { class: "stack" }, skeleton(3));
   const postsBox = h("div", { class: "stack" }, skeleton(3));
   const feesBox = h("div", { class: "stack" }, skeleton(4));
+  const equityBox = h("div", { class: "stack equity-box" }, skeleton(4));
 
   mount(
     root,
@@ -96,7 +99,7 @@ function draw(root: HTMLElement, ctx: PageContext, s: StrategyDetail): void {
           s.timeframe ? [" · ", s.timeframe, " bars"] : null,
         ),
       ),
-      liveRecord(s),
+      liveRecord(s, equityBox),
       versionHistory(s),
       backtestPanel(s.backtest, { warning: s.backtest_warning, shortHistoryDays: s.short_history_days }),
       panel("Fees", feesBox),
@@ -133,12 +136,13 @@ function draw(root: HTMLElement, ctx: PageContext, s: StrategyDetail): void {
     );
   })();
 
+  void loadEquity(ctx, s, equityBox);
   void loadShowcase(ctx, s, showcaseBox);
   void loadReviews(ctx, s, reviewsBox);
   void loadPosts(ctx, s, postsBox);
 }
 
-function liveRecord(s: StrategyDetail): HTMLElement {
+function liveRecord(s: StrategyDetail, equityBox: HTMLElement): HTMLElement {
   const st = s.stats;
   const subs = st.subscribers;
   const hidden = st.pnl_micro === null || (subs !== null && subs < MIN_SUBSCRIBERS_FOR_STATS);
@@ -164,6 +168,113 @@ function liveRecord(s: StrategyDetail): HTMLElement {
     hidden && st.hidden_reason !== "not_live"
       ? note(`Aggregate $ made for users is hidden until the strategy has at least ${MIN_SUBSCRIBERS_FOR_STATS} subscribers, so no individual subscriber's results can be inferred.`, "info")
       : null,
+    equityBox,
+  );
+}
+
+// ------------------------------------------------------------------------------------------ live equity chart
+/** GET /v1/public/strategies/{slug}/equity → {points:[{t, pnl_micro, roi_bps}], hidden_reason}. Current version only;
+ *  version resets (live_since of every later version) are drawn as markers when they fall inside the range. */
+function parseEquity(raw: unknown): EquityOut {
+  const r = isRec(raw) ? raw : {};
+  const pts: EquityPoint[] = [];
+  for (const p of Array.isArray(r.points) ? r.points : []) {
+    if (!isRec(p)) continue;
+    const t = toMs(p.t);
+    const roi = typeof p.roi_bps === "number" && Number.isFinite(p.roi_bps) ? p.roi_bps : null;
+    const pnl = typeof p.pnl_micro === "number" && Number.isFinite(p.pnl_micro) ? p.pnl_micro : null;
+    if (Number.isFinite(t) && (roi !== null || pnl !== null)) pts.push({ t, roi_bps: roi, pnl_micro: pnl });
+  }
+  pts.sort((a, b) => a.t - b.t);
+  return { points: pts, hidden_reason: typeof r.hidden_reason === "string" && r.hidden_reason ? r.hidden_reason : null };
+}
+
+function hiddenText(reason: string): string {
+  if (reason === "not_live") return "The live chart starts once the current version is live and has real fills on Hyperliquid.";
+  if (reason === "too_few_subscribers") return `The live chart is hidden until the strategy has at least ${MIN_SUBSCRIBERS_FOR_STATS} subscribers, so no individual subscriber's results can be inferred.`;
+  return "The live chart is hidden right now.";
+}
+
+function resetMarkers(s: StrategyDetail): { t: number; label: string }[] {
+  return s.versions
+    .filter((v) => v.version > 1 && v.live_since)
+    .map((v) => ({ t: toMs(v.live_since), label: `v${v.version} live — performance reset` }))
+    .filter((m) => Number.isFinite(m.t));
+}
+
+async function loadEquity(ctx: PageContext, s: StrategyDetail, box: HTMLElement): Promise<void> {
+  let eq: EquityOut;
+  try {
+    eq = parseEquity(await api.get<unknown>(`/public/strategies/${encodeURIComponent(s.slug)}/equity`, { signal: ctx.signal }));
+  } catch (err) {
+    if (isAbortError(err) || !ctx.isCurrent()) return;
+    if (errCode(err) === "not_found") {
+      mount(box, h("p", { class: "small muted", dataset: { equity: "unavailable" } }, "The live chart isn't available for this strategy yet."));
+      return;
+    }
+    mount(box, errorState(err, () => void loadEquity(ctx, s, box)));
+    return;
+  }
+  if (!ctx.isCurrent()) return;
+  const provenNote = s.not_live_proven
+    ? note(`Not live-proven: ${typeof s.live_days === "number" ? `${fmtNum(s.live_days, 0)} day${s.live_days === 1 ? "" : "s"}` : "less than " + LIVE_PROVEN_DAYS + " days"} of live trading for this version (< ${LIVE_PROVEN_DAYS} days). Treat the live chart as early evidence only.`, "warn")
+    : null;
+  if (eq.hidden_reason || eq.points.length < 2) {
+    const msg = eq.hidden_reason ? hiddenText(eq.hidden_reason) : "Not enough live history for a chart yet — it appears after the first days of live fills.";
+    mount(box, h("div", { class: "equity-hidden", dataset: { equity: "hidden", reason: eq.hidden_reason ?? "empty" } }, note(msg, "info")), provenNote);
+    return;
+  }
+  const hasRoi = eq.points.some((p) => p.roi_bps !== null);
+  const hasPnl = eq.points.some((p) => p.pnl_micro !== null);
+  let mode: "roi" | "pnl" = hasRoi ? "roi" : "pnl";
+  const chartBox = h("div");
+  const markers = resetMarkers(s);
+  const draw = (): void => {
+    const pts = eq.points
+      .map((p) => ({ t: p.t, v: mode === "roi" ? (p.roi_bps === null ? NaN : p.roi_bps / 100) : p.pnl_micro === null ? NaN : p.pnl_micro / 1_000_000 }))
+      .filter((p) => Number.isFinite(p.v));
+    const last = pts[pts.length - 1]?.v ?? 0;
+    mount(
+      chartBox,
+      lineChart({
+        series: [{ name: mode === "roi" ? "Live ROI" : "Made for users", points: pts, tone: last >= 0 ? "good" : "bad" }],
+        baseline: 0,
+        markers,
+        yFormat: mode === "roi" ? (v) => fmtPct(v, { sign: true, digits: 1 }) : (v) => fmtUsd(Math.trunc(v * 1_000_000), { sign: true, compact: true }),
+        ariaLabel: mode === "roi" ? `Live ROI of ${s.name} since the current version went live` : `Aggregate PnL made for users by ${s.name} since the current version went live`,
+      }),
+    );
+  };
+  const seg: HTMLElement | null = hasRoi && hasPnl
+    ? h(
+        "div",
+        { class: "seg", role: "group", "aria-label": "Chart metric" },
+        ...(["roi", "pnl"] as const).map((k) => {
+          const b = h("button", { type: "button", "aria-pressed": String(mode === k), onclick: () => {
+            mode = k;
+            seg?.querySelectorAll("button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+            draw();
+          } }, k === "roi" ? "ROI %" : "$ made");
+          return b;
+        }),
+      )
+    : null;
+  draw();
+  mount(
+    box,
+    h(
+      "div",
+      { class: "stack tight equity-live", dataset: { equity: "shown" } },
+      h("div", { class: "row between" }, h("h3", null, "Live record"), seg),
+      chartBox,
+      h(
+        "p",
+        { class: "small muted" },
+        "Real fills on Hyperliquid for the current version, net of trading, builder and platform fees plus funding.",
+        markers.length ? " Vertical dashed lines mark version resets (a new version restarts the record)." : "",
+      ),
+    ),
+    provenNote,
   );
 }
 

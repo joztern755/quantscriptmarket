@@ -39,8 +39,36 @@ def sub(**kw) -> SettlementSubscription:
     return SettlementSubscription(**base)
 
 
+class FakeEvents:
+    """UserEventSink: records events (dedup like events_outbox) and the low-balance hook calls; the hook applies the
+    real threshold logic (app.alerts.delivery.low_balance_alerts) against a fixed monthly need."""
+
+    def __init__(self, need_micro: int = 0) -> None:
+        self.events: dict[str, dict] = {}
+        self.balance_calls: list[tuple[str, int, int]] = []
+        self.low: list[str] = []
+        self.need = need_micro
+
+    def emit(self, *, user_id, kind, severity, payload, dedup_key):
+        if dedup_key in self.events:
+            return False
+        self.events[dedup_key] = {"user_id": user_id, "kind": kind, "severity": severity, "payload": dict(payload)}
+        return True
+
+    def fee_balance_changed(self, *, user_id, prev_micro, new_micro, now):
+        from app.alerts.delivery import low_balance_alerts
+
+        self.balance_calls.append((user_id, prev_micro, new_micro))
+        kinds = [a["kind"] for a in low_balance_alerts(user_id, prev_micro, new_micro, self.need)]
+        self.low += kinds
+        return kinds
+
+    def of(self, kind):
+        return [e for e in self.events.values() if e["kind"] == kind]
+
+
 class Env:
-    def __init__(self, referrals=None):
+    def __init__(self, referrals=None, events=None):
         self.repo = FakeSettlementRepo()
         self.ledger = FakeLedger()
         self.uow = FakeUow()
@@ -48,7 +76,8 @@ class Env:
         self.clock = FakeClock(NOW)
         self.s = Settlement(repo=self.repo, ledger=self.ledger, uow=self.uow, profit_share=DomainProfitShare(),
                             fees=DomainFees(), billing=DomainBilling(72), referrals=FakeReferrals(referrals),
-                            alerts=self.alerts, clock=self.clock, builder_page_size=2)
+                            alerts=self.alerts, clock=self.clock, builder_page_size=2, events=events)
+        self.events = events
 
     def run(self, now: datetime, settle_date: date | None = None):
         self.clock.set(now)
@@ -163,6 +192,69 @@ class ProfitShareSettlementTest(unittest.TestCase):
         r = e.run(NOW)
         self.assertEqual(len(r.errors), 1)
         self.assertIn(profit_share_key("sub1", D1), e.ledger.txs)
+
+
+class UserEventsTest(unittest.TestCase):
+    """profit_share_charged per charge, subscription_renewed, and the low-balance hook after every fee-balance
+    posting (profit share, renewal, plan) — each exactly once across idempotent re-runs."""
+
+    def test_profit_share_charged_and_low_balance_once(self):
+        ev = FakeEvents(need_micro=usd(200))
+        e = Env(events=ev)
+        e.repo.subs["sub1"] = sub()
+        e.ledger.top_up("user1", usd(150))                      # 75 % of the need
+        e.repo.add_pnl("sub1", datetime(2026, 10, 1, 12, tzinfo=UTC), usd(1000))
+        r = e.run(NOW)
+        self.assertEqual(r.errors, [])
+        charged = ev.of("profit_share_charged")
+        self.assertEqual(len(charged), 1)
+        p = charged[0]["payload"]
+        self.assertEqual((charged[0]["user_id"], p["amount_micro"], p["profit_micro"], p["rate_bps"]),
+                         ("user1", usd(115), usd(1000), 1150))
+        self.assertEqual((p["creator_micro"], p["platform_micro"], p["strategy_id"]), (usd(100), usd(15), "s1"))
+        self.assertEqual((p["period_start"], p["period_end"]),
+                         (CREATED.isoformat(), datetime(2026, 10, 2, tzinfo=UTC).isoformat()))
+        self.assertEqual(ev.balance_calls, [("user1", usd(150), usd(35))])
+        self.assertEqual(ev.low, ["balance_low", "balance_low"])  # 75 % → 17.5 %: one alert per threshold (50, 20)
+        # re-run: nothing new (idempotent ledger key → no hook, no event)
+        e.repo.settled.clear()
+        e.repo.subs["sub1"] = sub()
+        e.run(NOW + timedelta(minutes=5))
+        self.assertEqual(len(ev.of("profit_share_charged")), 1)
+        self.assertEqual(len(ev.balance_calls), 1)
+
+    def test_renewal_and_plan_call_hook_and_emit_renewed(self):
+        ev = FakeEvents(need_micro=usd(100))
+        e = Env(events=ev)
+        due = datetime(2026, 10, 1, 12, tzinfo=UTC)
+        e.repo.subs["sub1"] = sub(price_monthly_micro=usd(30), current_period_end=due)
+        e.repo.plans["user1"] = PlanAccount(user_id="user1", plan="pro", price_monthly_micro=usd(20),
+                                            plan_period_end=due, past_due_since=None)
+        e.ledger.top_up("user1", usd(60))
+        r = e.run(NOW)
+        self.assertEqual((r.renewals_charged, r.plans_renewed), (1, 1), r)
+        self.assertEqual(ev.balance_calls, [("user1", usd(60), usd(30)), ("user1", usd(30), usd(10))])
+        self.assertEqual(ev.low, ["balance_low", "balance_low"])   # 60 → 30 % crosses 50 %; 30 → 10 % crosses 20 %
+        ren = ev.of("subscription_renewed")
+        self.assertEqual(len(ren), 1)
+        self.assertEqual(ren[0]["payload"]["amount_micro"], usd(30))
+        e.run(NOW + timedelta(minutes=5))
+        self.assertEqual(len(ev.balance_calls), 2)
+
+    def test_event_sink_failure_never_blocks_settlement(self):
+        class Broken:
+            def emit(self, **kw):
+                raise RuntimeError("down")
+
+            def fee_balance_changed(self, **kw):
+                raise RuntimeError("down")
+
+        e = Env(events=Broken())
+        e.repo.subs["sub1"] = sub()
+        e.ledger.top_up("user1", usd(500))
+        e.repo.add_pnl("sub1", datetime(2026, 10, 1, 12, tzinfo=UTC), usd(1000))
+        r = e.run(NOW)
+        self.assertEqual((r.errors, r.profit_share_charged_micro), ([], usd(115)))
 
 
 class RenewalStatusTest(unittest.TestCase):

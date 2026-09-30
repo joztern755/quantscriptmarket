@@ -65,7 +65,8 @@ class RiskLimits:
     max_mark_oracle_dev_bps: int = 200              # reject if mark vs oracle > 2%
     max_data_age_seconds: int = 60
     consecutive_reject_breaker: int = 3
-    platform_max_leverage: int = 5
+    platform_max_leverage: int = 50                 # owner: no platform leverage cap — ceiling only for input sanity;
+                                                    # each market's own max leverage (Hyperliquid meta) always applies
     min_order_notional_micro: int = usd(10)
     min_rebalance_pct_bps: int = 200                # skip deltas < 2% of allocation
     jitter_max_seconds: int = 600                   # per-user random delay 0–10 min (privacy)
@@ -108,9 +109,9 @@ class Settings:
     edge_auth_secret: str                           # shared secret header set by Cloudflare Transform Rule
     launch_phase: str                               # "internal" (allowlisted emails, small caps) | "public"
     allowlist_emails: tuple[str, ...]               # internal phase: only these emails may create accounts
-    max_allocation_per_user_micro: int              # cap per user across all subscriptions
-    max_total_platform_allocation_micro: int        # cap across all users
-    max_user_leverage: int                          # launch-phase leverage cap (≤ risk.platform_max_leverage)
+    max_allocation_per_user_micro: int | None       # None = no cap (owner 30 Sep 2026: no per-user cap)
+    max_total_platform_allocation_micro: int | None # None = no cap (owner: no platform total cap)
+    max_user_leverage: int | None                   # None = no launch cap; each market's own max leverage applies
     payouts_enabled: bool
     stripe_max_topup_micro: int
     feature_stripe_myr: bool                        # FPX / GrabPay need MYR; off until an FX source is chosen
@@ -145,6 +146,17 @@ class Settings:
 
 def _b(name: str, default: str) -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _opt_usd(name: str) -> int | None:
+    """Optional USD cap from env: unset, empty or 0 → None (no cap)."""
+    raw = os.environ.get(name, "").strip()
+    return usd(raw) if raw and raw != "0" else None
+
+
+def _opt_int(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw and raw != "0" else None
 
 
 # DRAFT list for counsel review (legal/jurisdiction.md). ISO 3166-1 alpha-2.
@@ -206,9 +218,9 @@ def get_settings() -> Settings:
         edge_auth_secret=os.environ.get("EDGE_AUTH_SECRET", ""),
         launch_phase=os.environ.get("LAUNCH_PHASE", "internal"),
         allowlist_emails=tuple(e.strip().lower() for e in os.environ.get("ALLOWLIST_EMAILS", "").split(",") if e.strip()),
-        max_allocation_per_user_micro=usd(os.environ.get("MAX_ALLOCATION_PER_USER_USD", "1000")),
-        max_total_platform_allocation_micro=usd(os.environ.get("MAX_TOTAL_PLATFORM_ALLOCATION_USD", "25000")),
-        max_user_leverage=int(os.environ.get("MAX_USER_LEVERAGE", "2")),
+        max_allocation_per_user_micro=_opt_usd("MAX_ALLOCATION_PER_USER_USD"),
+        max_total_platform_allocation_micro=_opt_usd("MAX_TOTAL_PLATFORM_ALLOCATION_USD"),
+        max_user_leverage=_opt_int("MAX_USER_LEVERAGE"),
         payouts_enabled=_b("PAYOUTS_ENABLED", "false"),
         stripe_max_topup_micro=usd(os.environ.get("STRIPE_MAX_TOPUP_USD", "10000")),
         feature_stripe_myr=_b("FEATURE_STRIPE_MYR", "false"),

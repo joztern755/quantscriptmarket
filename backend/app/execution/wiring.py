@@ -100,8 +100,9 @@ class RiskPlanner:
     def plan(self, inp: PlanInput) -> OrderPlan:
         sub, snap, pos, flags = inp.subscription, inp.snapshot, inp.position, inp.flags
         # SPEC §12: a closing subscription may only reduce (the billing state machine has no "closing" state;
-        # "reduce_only" is exactly its trading semantics: exits allowed, entries blocked).
-        status = "reduce_only" if sub.status == CLOSING_STATUS else sub.status
+        # "reduce_only" is exactly its trading semantics: exits allowed, entries blocked). Same for a user whose
+        # alert contacts are missing / lapsed past the grace (entries gate, SubscriptionView.entries_allowed).
+        status = "reduce_only" if (sub.status == CLOSING_STATUS or not sub.entries_allowed) else sub.status
         ctx = _risk.SubscriptionContext(
             allocation_micro=sub.allocation_micro, max_leverage_x100=sub.max_leverage_x100, status=status,
             current_position_notional_micro=pos.notional_micro, consecutive_rejects=sub.consecutive_rejections,

@@ -50,7 +50,7 @@ from .ports import (
 __all__ = [
     "PgDatabase", "PgSubscriptionRepo", "PgSignalRepo", "PgFlagRepo", "PgLockProvider", "PgSettlementRepo",
     "PgReconcileRepo", "PgReferralLookup", "PgUnitOfWork", "PgLedger", "PgAlertRepo", "PgMarketPauseFlags",
-    "PgContactDirectory", "PgReconciliationStore", "PgReferralTierRepo", "PgCreatorSignalRepo",
+    "PgContactDirectory", "PgReconciliationStore", "PgReferralTierRepo", "PgCreatorSignalRepo", "PgUserEvents",
     "as_datetime", "as_bytes", "json_dumps",
 ]
 
@@ -267,7 +267,8 @@ def _sub_view(r: Mapping[str, Any]) -> SubscriptionView:
         max_leverage_x100=int(r["max_leverage_x100"]), status=str(r["status"]), markets=_markets(r["markets"]),
         consecutive_rejections=int(r["consecutive_rejections"] or 0),
         strategy_max_leverage_x100=int(vml) * 100 if vml is not None else None,
-        past_due_since=as_datetime(r.get("past_due_since")))
+        past_due_since=as_datetime(r.get("past_due_since")),
+        entries_allowed=bool(r.get("entries_allowed", False)))
 
 
 def _order(r: Mapping[str, Any]) -> OrderRecord:
@@ -283,14 +284,35 @@ def _order(r: Mapping[str, Any]) -> OrderRecord:
 
 
 class PgSubscriptionRepo:
-    """``SubscriptionRepo`` over subscriptions / orders / subscription_bar_runs / subscription_targets."""
+    """``SubscriptionRepo`` over subscriptions / orders / subscription_bar_runs / subscription_targets.
 
-    def __init__(self, db: PgDatabase) -> None:
+    Every view carries ``entries_allowed`` = ``alert_contacts_entries_allowed(user, now)`` (0007, SPEC §12: confirmed
+    alert email AND a working Telegram link, or one that lapsed < 24 h ago), evaluated at the repo clock's ``now``.
+    FAIL CLOSED: if the function is missing (schema older than 0007) every view has ``entries_allowed = False``."""
+
+    def __init__(self, db: PgDatabase, *, clock: Any = None) -> None:
         self.db = db
+        self._now = (clock.now if clock is not None and hasattr(clock, "now")
+                     else clock if callable(clock) else (lambda: datetime.now(timezone.utc)))
+        self._gate: bool | None = None
+
+    def _cols(self) -> str:
+        if self._gate is None:
+            row = self.db.one("""SELECT to_regprocedure('alert_contacts_entries_allowed(uuid, timestamptz)')
+                                        IS NOT NULL AS ok""")
+            self._gate = bool(row and row["ok"])
+            if not self._gate:
+                log.error("entries_gate_missing", extra={"fields": {"note": "0007 not applied: entries blocked"}})
+        gate = ("alert_contacts_entries_allowed(s.user_id, CAST(:now AS timestamptz))" if self._gate
+                else "(CAST(:now AS timestamptz) IS NULL AND false)")
+        return f"{_SUB_VIEW_COLS}, {gate} AS entries_allowed"
+
+    def _now_ts(self) -> str | None:
+        return _ts(self._now())
 
     def due_subscriptions(self, strategy_version_id: str, bar_close: datetime, limit: int) -> Sequence[SubscriptionView]:
         rows = self.db.all(f"""
-            SELECT {_SUB_VIEW_COLS} {_SUB_VIEW_FROM}
+            SELECT {self._cols()} {_SUB_VIEW_FROM}
              WHERE s.strategy_version_id = CAST(:v AS uuid)
                AND s.status IN {_TRADABLE_SQL}
                AND s.master_address IS NOT NULL
@@ -301,19 +323,21 @@ class PgSubscriptionRepo:
                AND NOT EXISTS (SELECT 1 FROM subscription_bar_runs r
                                 WHERE r.subscription_id = s.id AND r.bar_close = CAST(:bar AS timestamptz))
              ORDER BY s.id
-             LIMIT CAST(:lim AS integer)""", v=strategy_version_id, bar=_ts(bar_close), lim=int(limit))
+             LIMIT CAST(:lim AS integer)""", v=strategy_version_id, bar=_ts(bar_close), lim=int(limit),
+            now=self._now_ts())
         return [_sub_view(r) for r in rows]
 
     def get_subscription(self, subscription_id: str) -> SubscriptionView | None:
-        r = self.db.one(f"SELECT {_SUB_VIEW_COLS} {_SUB_VIEW_FROM} WHERE s.id = CAST(:id AS uuid)", id=subscription_id)
+        r = self.db.one(f"SELECT {self._cols()} {_SUB_VIEW_FROM} WHERE s.id = CAST(:id AS uuid)", id=subscription_id,
+                        now=self._now_ts())
         return _sub_view(r) if r else None
 
     def closing_subscriptions(self, limit: int) -> Sequence[SubscriptionView]:
         rows = self.db.all(f"""
-            SELECT {_SUB_VIEW_COLS} {_SUB_VIEW_FROM}
+            SELECT {self._cols()} {_SUB_VIEW_FROM}
              WHERE s.status = CAST(:st AS subscription_status)
              ORDER BY s.status_changed_at, s.id
-             LIMIT CAST(:lim AS integer)""", st=CLOSING_STATUS, lim=int(limit))
+             LIMIT CAST(:lim AS integer)""", st=CLOSING_STATUS, lim=int(limit), now=self._now_ts())
         return [_sub_view(r) for r in rows]
 
     def finish_closing(self, subscription_id: str, now: datetime) -> bool:
@@ -499,6 +523,36 @@ class PgMarketPauseFlags:
             ON CONFLICT (key) DO UPDATE SET value = CAST('true' AS jsonb), updated_by = EXCLUDED.updated_by
              WHERE system_flags.value <> CAST('true' AS jsonb)""",
             k=f"new_entries_paused:{coin}", by=("system:" + reason)[:200])
+
+
+class PgUserEvents:
+    """``UserEventSink`` for settlement: ``events_outbox`` rows (the delivery worker adds the strategy name from
+    ``payload.strategy_id`` and sends them per the email policy) and the low-balance hook
+    (``app.alerts.delivery.on_balance_changed`` → ``alerts`` rows). Both run on the shared ``PgDatabase``, i.e. inside
+    the caller's ``atomic()`` transaction, each in a SAVEPOINT so a failure never poisons the money movement."""
+
+    def __init__(self, db: PgDatabase) -> None:
+        self.db = db
+
+    def emit(self, *, user_id: str, kind: str, severity: str, payload: Mapping[str, Any], dedup_key: str) -> bool:
+        with self.db.savepoint():
+            rows = self.db.all("""
+                INSERT INTO events_outbox (user_id, kind, severity, payload, dedup_key)
+                VALUES (CAST(:u AS uuid), CAST(:k AS text), CAST(:sev AS alert_severity), CAST(:p AS jsonb),
+                        CAST(:d AS text))
+                ON CONFLICT (dedup_key) DO NOTHING
+                RETURNING id""", u=user_id, k=kind, sev=severity, p=json_dumps(dict(payload)), d=dedup_key[:200])
+        return bool(rows)
+
+    def fee_balance_changed(self, *, user_id: str, prev_micro: int, new_micro: int, now: datetime) -> list[str]:
+        from app.alerts.delivery import on_balance_changed
+
+        try:
+            with self.db.savepoint():
+                return on_balance_changed(self.db, user_id, int(prev_micro), int(new_micro), now=now, raise_errors=True)
+        except Exception as e:  # noqa: BLE001 - alerts never block a ledger posting
+            log.warning("low_balance_hook_failed", extra={"fields": {"user_id": user_id, "error": type(e).__name__}})
+            return []
 
 
 class PgContactDirectory:

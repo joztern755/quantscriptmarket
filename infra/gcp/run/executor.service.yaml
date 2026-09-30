@@ -48,12 +48,12 @@ spec:
               cpu: "1"
               memory: 2Gi
           env:
+            # Every variable app/config.py reads for the executor role; table: docs/DEPLOY.md §5.3.
             - {name: APP_ENV, value: prod}
             - {name: SERVICE_ROLE, value: executor}
             - {name: GOOGLE_CLOUD_PROJECT, value: "${PROJECT_ID}"}
             - {name: FIREBASE_PROJECT_ID, value: "${PROJECT_ID}"}
             - {name: FIREBASE_AUTH_DOMAIN, value: "${WEB_DOMAIN}"}
-            - {name: OPS_EMAILS, value: "${OPS_EMAILS}"}
             - {name: EMAIL_FROM, value: "alerts@${WEB_DOMAIN}"}
             - {name: KMS_KEY_NAME, value: "${KMS_KEY_NAME}"}
             # IAM database auth through the sidecar: no password; the proxy injects the SA's OAuth token
@@ -64,14 +64,19 @@ spec:
             - {name: HL_IS_MAINNET, value: "true"}
             - {name: AGENT_NAME, value: aijalon}
             - {name: SANDBOX_URL, value: "${SANDBOX_URL}"}
+            - {name: SIGNALS_URL, value: "https://aijalon-terminal.web.app/signals.json"}   # = config.py default
             - {name: FEATURE_CREATOR_UPLOADS, value: "true"}
-            # internal endpoints must verify the OIDC token: audience = this service URL, email = scheduler SA
+            - {name: IN_HOUSE_LISTED, value: silver}
+            # internal endpoints verify the OIDC token: audience = this service URL, email = scheduler SA
             - {name: INTERNAL_AUDIENCE, value: "${EXECUTOR_URL}"}
             - {name: SCHEDULER_SA_EMAIL, value: "${SA_SCHEDULER}"}
-            - {name: IN_HOUSE_LISTED, value: silver}
+            # config.py checks the launch phase for every prod role (internal requires ALLOWLIST_EMAILS)
             - {name: LAUNCH_PHASE, value: "${LAUNCH_PHASE}"}
-            - {name: ALLOWLIST_EMAILS, value: "${ALLOWLIST_EMAILS}"}
             - {name: PAYOUTS_ENABLED, value: "${PAYOUTS_ENABLED}"}
+            - name: ALLOWLIST_EMAILS                                   # personal data -> Secret Manager
+              valueFrom: {secretKeyRef: {name: ALLOWLIST_EMAILS, key: latest}}
+            - name: OPS_EMAILS
+              valueFrom: {secretKeyRef: {name: OPS_EMAILS, key: latest}}
             - name: TELEGRAM_BOT_TOKEN
               valueFrom: {secretKeyRef: {name: TELEGRAM_BOT_TOKEN, key: latest}}
             - name: TELEGRAM_OPS_CHAT_ID
@@ -82,7 +87,7 @@ spec:
               valueFrom: {secretKeyRef: {name: SIGNALS_PUBKEY_B64, key: latest}}
             - name: AUDIT_PEPPER_B64
               valueFrom: {secretKeyRef: {name: AUDIT_PEPPER, key: latest}}
-            # required by app/config.py for every prod role today (see infra/gcp/env.sh note)
+            # the executor calls the sandbox (creator signals in the tick): X-Sandbox-Secret + Cloud Run IAM
             - name: SANDBOX_SHARED_SECRET
               valueFrom: {secretKeyRef: {name: SANDBOX_SHARED_SECRET, key: latest}}
             - name: BUILDER_ADDRESS

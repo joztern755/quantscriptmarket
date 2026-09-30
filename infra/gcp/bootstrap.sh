@@ -264,9 +264,15 @@ step_secrets() {
     IFS='|' read -r name readers gen <<<"${spec}"
     exists gcloud secrets describe "${name}" || \
       gcloud secrets create "${name}" --replication-policy=user-managed --locations="${REGION}" --labels=app=aijalon
-    if [[ "${gen}" == "1" ]] && [[ -z "$(gcloud secrets versions list "${name}" --filter='state=ENABLED' --format='value(name)' --limit=1)" ]]; then
-      log "  generating a random value for ${name}"
-      gen_secret_value "${name}" | gcloud secrets versions add "${name}" --data-file=- >/dev/null
+    if [[ "${gen}" == "1" || "${gen}" == "owner" ]] && \
+       [[ -z "$(gcloud secrets versions list "${name}" --filter='state=ENABLED' --format='value(name)' --limit=1)" ]]; then
+      if [[ "${gen}" == "1" ]]; then
+        log "  generating a random value for ${name}"
+        gen_secret_value "${name}" | gcloud secrets versions add "${name}" --data-file=- >/dev/null
+      else
+        log "  seeding ${name} with OWNER_EMAIL (replace it with the real list: DEPLOY.md §5)"
+        printf '%s' "${OWNER_EMAIL}" | gcloud secrets versions add "${name}" --data-file=- >/dev/null
+      fi
     fi
     for reader in ${readers}; do
       case "${reader}" in
@@ -282,7 +288,8 @@ step_secrets() {
   done
   local missing=()
   for spec in "${SECRETS_SPEC[@]}"; do
-    IFS='|' read -r name _ _ <<<"${spec}"
+    IFS='|' read -r name _ gen <<<"${spec}"
+    [[ "${gen}" == "opt" ]] && continue      # optional (KYC_* until KYC_PROVIDER=sumsub)
     [[ -n "$(gcloud secrets versions list "${name}" --filter='state=ENABLED' --format='value(name)' --limit=1)" ]] || missing+=("${name}")
   done
   ((${#missing[@]} == 0)) || warn "secrets still without a value (add them — DEPLOY.md §5): ${missing[*]}"

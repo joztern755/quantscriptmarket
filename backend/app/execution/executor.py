@@ -27,6 +27,9 @@ Per subscription:
   fault and would otherwise trip every subscriber at once (same contract as ``domain.risk``).
 - The subscription is re-read under the lock (``SubscriptionRepo.get_subscription``): a cancel that lands during a
   tick is honoured before anything is sent ("leave" → never touched again).
+- Alert-contacts entries gate (SPEC §12): ``SubscriptionView.entries_allowed`` False (no confirmed email / no working
+  Telegram link past the 24 h grace) → the subscription runs reduce-only for that tick, exactly like status
+  ``reduce_only``: exits and exposure reductions still run, nothing opens or grows.
 
 Closing subscriptions (SPEC §12, cancel with "close"): independent of signals, every tick builds a synthetic
 all-zero ``BarSignal`` (``source="closing"``) over the strategy's markets, keyed by a retry epoch
@@ -168,6 +171,7 @@ class TickReport:
     market_rejections: int = 0
     market_killed: int = 0
     reduce_only_skips: int = 0
+    contacts_gated: int = 0          # subscriptions run reduce-only because the user's alert contacts are missing
     no_market_data: int = 0
     unresolved_orders: int = 0
     closing_seen: int = 0
@@ -339,7 +343,11 @@ class Executor:
                 report.breaker_open += 1
                 return
 
-            reduce_only_sub = sub.status == "reduce_only" or tick.flags.new_entries_paused
+            # reduce-only for this tick: billing status, global entries pause, or the user's alert contacts are
+            # missing/lapsed (SPEC §12 entries gate — exits still run, no new or increased exposure)
+            reduce_only_sub = sub.status == "reduce_only" or tick.flags.new_entries_paused or not sub.entries_allowed
+            if not sub.entries_allowed:
+                tick.report.contacts_gated += 1
             coins = sorted(sig.weights_bps)
             positions = self.positions.positions(sub.trading_address, coins)
 

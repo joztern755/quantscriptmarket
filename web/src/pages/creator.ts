@@ -6,7 +6,7 @@ import { h, mount, skeleton, errorState, emptyState, note, stat, kv, table, tabs
 import { api, publicConfig, newIdempotencyKey, type PublicConfig } from "../core/api.js";
 import { LEGAL_SLUGS, legalDocHash } from "../core/gate.js";
 import { fmtUsd, fmtBps, fmtDate, fmtDateTime, fmtTenthsBp } from "../core/format.js";
-import type { CreatorStrategy, CreatorVersion, Earnings, NoCodeSpec } from "./_shared/types.js";
+import type { CreatorStrategy, CreatorVersion, CreatorPost, Earnings, NoCodeSpec, StrategyEarnings } from "./_shared/types.js";
 import { payoutForm } from "./_shared/payout.js";
 import { profitShare, subscriptionSplit, builderSplit, postSplit } from "./_shared/fees.js";
 import { backtestPanel } from "./_shared/backtest.js";
@@ -123,7 +123,7 @@ async function overviewTab(body: HTMLElement, ctx: PageContext): Promise<void> {
     mount(box, skeleton(6));
     try {
       const [list, e] = await Promise.all([loadMyStrategies(ctx), api.get<Earnings>("/creator/earnings", { signal: ctx.signal }).catch(() => null)]);
-      const subsBy = new Map((e?.by_strategy ?? []).map((x) => [x.strategy_id, x.active_subscribers]));
+      const subsBy = new Map((e?.by_strategy ?? []).map((x) => [x.strategy_id, x.active_subscribers ?? null]));
       if (!ctx.isCurrent()) return;
       mount(
         earn,
@@ -139,7 +139,7 @@ async function overviewTab(body: HTMLElement, ctx: PageContext): Promise<void> {
         { key: "markets", label: "Markets", value: (s) => s.markets.join(", "), hideOnMobile: true },
         { key: "price", label: "Price / mo", value: (s) => (typeof s.price_monthly_micro === "number" ? fmtUsd(s.price_monthly_micro) : "—"), align: "right", mono: true },
         { key: "ps", label: "Profit share", value: (s) => (typeof s.profit_share_bps === "number" ? fmtBps(s.profit_share_bps) : "—"), align: "right", mono: true },
-        { key: "subs", label: "Subscribers", value: (s) => String(subsBy.get(s.id) ?? 0), align: "right", mono: true },
+        { key: "subs", label: "Subscribers", value: (s) => { const n = subsBy.get(s.id); return typeof n === "number" ? String(n) : "—"; }, align: "right", mono: true },
         { key: "act", label: "", value: (s) => h("a", { class: "btn sm", href: `#/creator/upload?strategy=${encodeURIComponent(s.id)}` }, "Upload version") },
       ];
       mount(box, list.length ? table({ columns: cols, rows: list, rowKey: (s) => s.id }) : emptyState("No strategies yet", "Create your first strategy, then upload code or use the no-code builder.", h("a", { class: "btn primary", href: "#/creator/new" }, "New strategy")));
@@ -547,13 +547,47 @@ async function postsTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfig):
             title.value = "";
             bodyIn.value = "";
             drawPreview();
+            void loadPosts();
           },
         }),
       ),
     ),
-    panel("My posts", h("p", { class: "small muted" }, "Published posts appear on the public ", h("a", { href: "#/posts" }, "Posts"), " page. Free posts show a 280-character preview there; paid posts show only the title until bought.")),
+    panel(
+      "My posts",
+      h("p", { class: "small muted" }, "Published posts appear on the public ", h("a", { href: "#/posts" }, "Posts"), " page. Free posts show a 280-character preview there; paid posts show only the title until bought."),
+      listBox,
+    ),
   );
 
+  // GET /v1/creator/posts → Page<CreatorPost> (own posts, newest first)
+  const names = new Map(strategies.map((s) => [s.id, s]));
+  const loadPosts = async (): Promise<void> => {
+    try {
+      const res = await api.get<unknown>("/creator/posts?limit=100", { signal: ctx.signal });
+      if (!ctx.isCurrent()) return;
+      const posts = listOf<CreatorPost>(res).sort((a, b) => (Date.parse(b.published_at ?? "") || 0) - (Date.parse(a.published_at ?? "") || 0));
+      const cols: Column<CreatorPost>[] = [
+        { key: "t", label: "Title", value: (p) => h("a", { href: `#/posts/${encodeURIComponent(p.id)}`, class: "break" }, p.title), primary: true },
+        {
+          key: "s",
+          label: "Strategy",
+          value: (p) => {
+            const st = p.strategy_id ? names.get(p.strategy_id) : undefined;
+            return st ? (st.status === "listed" ? h("a", { href: `#/s/${encodeURIComponent(st.slug)}` }, st.name) : st.name) : h("span", { class: "muted" }, "—");
+          },
+          hideOnMobile: true,
+        },
+        { key: "p", label: "Price", value: (p) => (p.price_micro > 0 ? fmtUsd(p.price_micro) : badge("Free", "info")), align: "right", mono: true },
+        { key: "n", label: "Sales", value: (p) => (p.price_micro > 0 ? (typeof p.sales_count === "number" ? String(p.sales_count) : "—") : "n/a"), align: "right", mono: true },
+        { key: "d", label: "Published", value: (p) => (p.published_at ? fmtDate(p.published_at) : "Draft") },
+      ];
+      mount(listBox, posts.length ? table({ columns: cols, rows: posts, rowKey: (p) => p.id }) : emptyState("No posts yet", "Your published posts will be listed here."));
+    } catch (err) {
+      if (isAbortError(err) || !ctx.isCurrent()) return;
+      mount(listBox, errorState(err, () => void loadPosts()));
+    }
+  };
+  await loadPosts();
 }
 
 // ------------------------------------------------------------------------------------------ earnings
@@ -571,18 +605,7 @@ async function earningsTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfi
         stat("Payable", fmtUsd(e.payable_micro)),
         stat("Payouts pending", fmtUsd(e.payouts_pending_micro)),
       ),
-      panel(
-        "By strategy",
-        table({
-          columns: [
-            { key: "s", label: "Strategy", value: (r) => r.slug, primary: true },
-            { key: "a", label: "Active subscribers", value: (r) => String(r.active_subscribers), align: "right", mono: true },
-          ],
-          rows: e.by_strategy,
-          rowKey: (r) => r.strategy_id,
-          empty: "No strategies yet.",
-        }),
-      ),
+      panel("By strategy", earningsByStrategy(e.by_strategy)),
       panel("Request a payout", note("Payouts require verified identity (KYC) and are approved by two administrators, then sent as USDC on Hyperliquid.", "info"), payoutForm(ctx, cfg, "creator", e.payable_micro, () => void earningsTab(body, ctx, cfg))),
       panel(
         "Recent earnings",
@@ -603,4 +626,39 @@ async function earningsTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfi
     if (isAbortError(err) || !ctx.isCurrent()) return;
     mount(body, errorState(err, () => void earningsTab(body, ctx, cfg)));
   }
+}
+
+/** Per-strategy earnings by source (EarningsOut.by_strategy). Core `table` turns rows into cards below 640px. */
+function earningsByStrategy(rows: StrategyEarnings[]): HTMLElement {
+  const money = (v: number | null | undefined): Child => (typeof v === "number" ? fmtUsd(v) : "—");
+  const hasBreakdown = rows.some((r) => typeof r.total_micro === "number");
+  const total = (r: StrategyEarnings): number | null =>
+    typeof r.total_micro === "number" ? r.total_micro : typeof r.earned_micro === "number" ? r.earned_micro : null;
+  const cols: Column<StrategyEarnings>[] = [
+    {
+      key: "s",
+      label: "Strategy",
+      value: (r) => (r.name || r.slug ? h("span", { class: "break" }, r.name || r.slug || "") : h("span", { class: "muted" }, r.strategy_id ? "Strategy" : "Posts without a strategy")),
+      primary: true,
+    },
+  ];
+  if (rows.some((r) => typeof r.active_subscribers === "number")) {
+    cols.push({ key: "a", label: "Subscribers", value: (r) => (typeof r.active_subscribers === "number" ? String(r.active_subscribers) : "—"), align: "right", mono: true });
+  }
+  if (hasBreakdown) {
+    cols.push(
+      { key: "sub", label: "Subscriptions", value: (r) => money(r.subscription_micro), align: "right", mono: true },
+      { key: "ps", label: "Profit share", value: (r) => money(r.profit_share_micro), align: "right", mono: true },
+      { key: "b", label: "Builder fees", value: (r) => money(r.builder_micro), align: "right", mono: true },
+      { key: "p", label: "Posts", value: (r) => money(r.posts_micro), align: "right", mono: true },
+    );
+  }
+  cols.push({ key: "t", label: "Total", value: (r) => { const t = total(r); return t === null ? "—" : h("b", null, fmtUsd(t)); }, align: "right", mono: true });
+  const sorted = [...rows].sort((a, b) => (total(b) ?? -1) - (total(a) ?? -1));
+  return h(
+    "div",
+    { class: "stack tight earnings-by-strategy" },
+    table({ columns: cols, rows: sorted, rowKey: (r) => r.strategy_id ?? "no-strategy", empty: "No strategies yet." }),
+    hasBreakdown ? h("p", { class: "small muted" }, "Your share after the platform's cut, all time. Builder fees are your part of the builder fee on subscribers' orders; profit share is charged only above each subscriber's high-water mark.") : null,
+  );
 }

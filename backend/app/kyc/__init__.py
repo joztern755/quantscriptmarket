@@ -4,9 +4,9 @@
     parse_webhook(payload, headers)       -> KycEvent | None     (verified; None = nothing to act on)
     next_status(current, event)           -> new status | None
 
-Provider is chosen by KYC_PROVIDER: ``manual`` (default; internal phase — an admin records the verdict via
-POST /v1/admin/users/{id}/kyc, approval maker-checker) or ``sumsub`` (hosted verification link + signed webhook
-POST /v1/webhooks/kyc). Config keys (Settings fields when present, else env): KYC_PROVIDER, KYC_APP_TOKEN,
+Provider is chosen by KYC_PROVIDER: ``manual`` (default; internal phase — ONE admin records the verdict via
+POST /v1/admin/users/{id}/kyc) or ``sumsub`` (hosted verification link + signed webhook POST /v1/webhooks/kyc; a
+GREEN verdict becomes ``provider_approved`` and ONE admin confirms it → ``approved``; never auto-approved). Config keys (Settings fields when present, else env): KYC_PROVIDER, KYC_APP_TOKEN,
 KYC_SECRET_KEY, KYC_WEBHOOK_SECRET, KYC_LEVEL_NAME (optional KYC_API_BASE).
 """
 from __future__ import annotations
@@ -16,8 +16,10 @@ from typing import Any, Mapping, Optional
 from app.kyc.base import (
     APPROVED,
     PENDING,
+    PROVIDER_APPROVED,
     REJECTED,
     STATUSES,
+    STORED_STATUSES,
     KycConfig,
     KycEvent,
     KycNotConfigured,
@@ -27,7 +29,7 @@ from app.kyc.base import (
     next_status,
 )
 
-__all__ = ["APPROVED", "PENDING", "REJECTED", "STATUSES", "KycConfig", "KycEvent", "KycNotConfigured",
+__all__ = ["APPROVED", "PENDING", "PROVIDER_APPROVED", "REJECTED", "STATUSES", "STORED_STATUSES", "KycConfig", "KycEvent", "KycNotConfigured",
            "KycProvider", "KycSession", "KycWebhookError", "next_status", "get_provider", "create_session",
            "parse_webhook"]
 

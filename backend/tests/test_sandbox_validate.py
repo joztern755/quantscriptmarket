@@ -104,7 +104,7 @@ class ContractTests(unittest.TestCase):
             ('MARKETS = "BTC"', "bad_markets"),
             ('TIMEFRAME = "15m"', "bad_timeframe"), ('LOOKBACK = 49', "bad_lookback"),
             ('LOOKBACK = 1001', "bad_lookback"), ('LOOKBACK = 100.0', "bad_lookback"), ('LOOKBACK = True', "bad_lookback"),
-            ('MAX_LEVERAGE = 6', "bad_leverage"), ('MAX_LEVERAGE = 0.5', "bad_leverage"),
+            ('MAX_LEVERAGE = 51', "bad_leverage"), ('MAX_LEVERAGE = 0.5', "bad_leverage"),
             ('MAX_LEVERAGE = True', "bad_leverage"),
         ]
         base = {"MARKETS": 'MARKETS = ["BTC"]', "TIMEFRAME": 'TIMEFRAME = "1d"', "LOOKBACK": "LOOKBACK = 100", "MAX_LEVERAGE": "MAX_LEVERAGE = 1"}

@@ -17,7 +17,7 @@ Conventions:
 The on-call person does this, ideally after 01:00 UTC.
 
 1. **Signals** (`/internal/ingest-signals`): today's feed was received, its signature is valid, and it is not stale (≤ 36 h). Check the listed strategies' `as_of`. If it is missing or invalid, see §12.
-2. **Settlement** (`/internal/settle-daily`, 00:30 UTC): the job succeeded. There is one ledger transaction per active subscription for today's `settle_date`. Look for no duplicate-key errors, and any failures.
+2. **Settlement** (`/internal/settle-daily`, 00:30 UTC): the job succeeded. There is one ledger transaction per active subscription for today's `settle_date`. Look for no duplicate-key errors, and any failures. The pre-settlement data jobs succeeded too: `fills-ingest` 00:00–00:25 (incl. `fills-ingest-presettle`) and `funding-scan` 00:07. **No `fill_after_settlement` event** (§13.4).
 3. **Reconciliation report** (admin → Reconciliation):
    - Σ builder-fee ledger vs Hyperliquid builder rewards;
    - treasury USDC vs `treasury:hl_usdc` ledger;
@@ -39,7 +39,8 @@ The on-call person does this, ideally after 01:00 UTC.
    - new-country logins;
    - KMS decrypt volume vs baseline;
    - IAM changes (Cloud Audit Logs alert).
-9. Record "Daily check done, [anomalies]" in the ops log.
+9. **Data jobs and alert delivery** (§13): Scheduler shows no failing job; no new `candle_mismatch` (§13.5); `deliver-alerts` has no growing `retry`/`failed` backlog; count of users with a lapsed Telegram link (§13.2); agents expiring within 3 days on subscriptions with open positions (§13.1); balance of `suspense:usdc_unattributed` and every open `topup_held` event (§13.3).
+10. Record "Daily check done, [anomalies]" in the ops log.
 
 **Weekly:** review guard-rejection trends per market (thin HIP-3 markets); check Hyperliquid announcements (delistings, parameter changes, HIP-3 deployer notices); test restore a PITR clone (monthly, §8).
 
@@ -78,7 +79,7 @@ The executor reads `system_flags` once per tick. See the `backend/app/domain/ris
 
 1. Admin console → Flags → set the flag (for example `kill_switch_market:xyz:SILVER` = true). Give a reason. Step-up is required.
 2. **Fallback if the console or API is down** [VERIFY]: pause the executor schedule so no ticks run:
-   `gcloud scheduler jobs pause executor-tick --location=asia-southeast1 --project=$PROJECT`
+   `gcloud scheduler jobs pause tick --location=asia-southeast1 --project=$PROJECT`  (or `make pause-all` to stop every job)
    Then set the flag as soon as the API is back. Record the manual action in the ops log.
 3. Post in the ops chat: flag, time, reason, and incident id (open an incident if SEV2 or higher).
 4. User notice: the in-app banner shows automatically for flagged markets [DESIGN]; see INCIDENT_RESPONSE §5.
@@ -130,7 +131,7 @@ Schedule: creator and referrer payouts [monthly, on day ●]; user withdrawals o
 
 | Mismatch | Likely causes | Steps |
 |---|---|---|
-| Builder-fee ledger ≠ Hyperliquid builder rewards | Fill attribution lag; fills without our builder code; fee-field semantics ([VERIFY] SPEC §1.1); a missed fill ingest | Re-run fills ingest for the window (idempotent on `tid`); compare by coin and day; check `builder_fee_micro` vs on-chain. **If unexplained after 24 h, SEV3.** |
+| Builder-fee ledger ≠ Hyperliquid builder rewards | Fill attribution lag; fills without our builder code; fee-field semantics ([VERIFY] SPEC §1.1); a missed fill ingest; **the on-chain reader itself** — `builderRewards` (info `referral`) + `rewardsClaim` ledger updates are UNVERIFIED field names until the go-live check (GO_LIVE Gate B "Mainnet verification") | Re-run fills ingest for the window (idempotent on `tid`); compare by coin and day; check `builder_fee_micro` vs on-chain; compare the reader's figure with the Hyperliquid UI for the builder address. **If unexplained after 24 h, SEV3.** |
 | Treasury USDC ≠ ledger | Deposit not credited or double-credited; payout sent but not recorded; external transfer | Scan `usdSend` history for the treasury; match by tx hash to `deposits` and `payouts`; **hold all payouts** until resolved. **Any unexplained outflow is SEV1** (possible key compromise). |
 | Stripe balance ≠ `stripe:clearing` | Webhook missed or failed; refund or dispute not posted; processor fee mismatch (fees are passed to users; the credit must equal net) | Stripe dashboard → resend failed events (idempotent); post refunds and disputes; check the net-of-fee calculation |
 | Positions ≠ expected | User traded manually on the same account; partial fills; skipped deltas; liquidation | Check the user's fills; if it is a user action, note it on the subscription (it may affect PnL attribution). Liquidations: alert the user. |
@@ -160,7 +161,7 @@ Automatic rotation creates a new primary version. New encryptions use it. Old ci
 
 Targets: RPO ≤ 5 min, RTO ≤ 4 h (see DATA_PROTECTION §6).
 
-1. **Stop writers:** `kill_switch_global`; pause Scheduler jobs (tick, settle, reconcile, deposits scan). Set the API to maintenance mode (read-only) [DESIGN].
+1. **Stop writers:** `kill_switch_global`; pause every Scheduler job (`make pause-all`; job list: DEPLOY §14.1). Set the API to maintenance mode (read-only) [DESIGN].
 2. **Choose a timestamp** just before the corruption or incident (from the audit log or Cloud Logging).
 3. **Clone** to a new instance (never overwrite the original — it is evidence) [VERIFY flags]:
    `gcloud sql instances clone $SQL $SQL-restore-YYYYMMDDHHMM --point-in-time='2026-10-01T03:14:00Z' --project=$PROJECT`
@@ -234,7 +235,7 @@ Direct production DB or console access is only for SEV1/SEV2, when the tools are
 
 - **Signal feed stale or bad signature:** the strategy holds (no trades). Check the terminal GitHub Action run; confirm with the terminal owner. **Never** override signature verification. If the key has rotated, follow SECURITY §4 (dual-verify, then pin via maker-checker).
 - **Stripe webhook failures:** fix the cause; resend events from the Stripe dashboard (idempotent). Credited amount = gross − Stripe fee.
-- **USDC deposit not credited:** get the tx hash from the user; check that the sender is their verified master address and the destination is the treasury; run the deposits scan (idempotent). If the sender is unverified, get a verification signature and then credit manually (maker-checker).
+- **USDC deposit not credited:** get the tx hash from the user; check that the sender is their verified master address and the destination is the treasury; run the deposits scan (idempotent). If the sender was unverified (or the amount below the minimum) the transfer was booked to `suspense:usdc_unattributed` — release it per §13.3 (maker-checker).
 - **User reports unexpected trades:**
   1. check that the orders carry our `cloid` prefix;
   2. if ours, find the signal and guard trail;
@@ -242,3 +243,55 @@ Direct production DB or console access is only for SEV1/SEV2, when the tools are
   4. **if ours but unexplained, pause the subscription and treat it as a possible SEV2.**
 - **Admin account suspected compromised:** remove the admin role (the other admin); revoke sessions (Firebase: revoke refresh tokens); rotate that admin's hardware keys; review the audit log for their actions; SEV1 if any money or flag action looks suspicious.
 - **Creator script failing in the sandbox:** the circuit breaker pauses the strategy; notify the creator; the admin reviews.
+
+## 13. Data jobs, alerts and held funds
+
+Scheduler job list, schedules and ordering: DEPLOY §14.1 (`SCHEDULER_SPEC` in `infra/gcp/env.sh`). Every job is idempotent; re-run one with `gcloud scheduler jobs run <job> --location=asia-southeast1`. A failing job: read its executor log (`jsonPayload.job`), fix the cause, run it again — do not skip it.
+
+### 13.1 Agent approval expiring / expired / revoked
+
+`agent-expiry-scan` (every 6 h) reads `extraAgents` per master address and raises user alerts `agent_expiring` (14, 7, 3, 1 days left), `agent_expired` (critical) and `agent_revoked` (critical, after 2 consecutive scans without the agent). These are mandatory kinds (Telegram + e-mail, cannot be muted).
+- **An expired or revoked agent cannot place any order, not even a reduce-only exit.** The executor stops trading those subscriptions; their open positions stay open and unmanaged until the user re-approves (new agent via the site) or closes them on Hyperliquid.
+- Daily: list active subscriptions whose agent expires within 3 days **and** that hold a position; contact those users directly (support e-mail) in addition to the automatic reminders.
+- A sudden batch of `agent_revoked` events for many users at once is more likely a reader or Hyperliquid API problem than real revocations: check `extraAgents` by hand for two affected masters before telling anyone; one scan miss only raises an ops event.
+- Never re-approve on a user's behalf (it needs their master wallet).
+
+### 13.2 Telegram unreachable
+
+User side: a Telegram 403 / "chat not found", or the user blocking/stopping the bot, marks the link **lapsed** and queues the mandatory `telegram_unreachable` alert (e-mail). **After 24 h without a working link, new entries pause for that user's subscriptions** (exits continue). The user fixes it at **#/alerts** (re-link; unblocking the bot re-activates the link). Nothing for ops to do per user.
+
+Platform side (many users lapse at once, or nobody receives Telegram alerts):
+1. `getWebhookInfo` (DEPLOY §10.1 — read the token from Secret Manager, never print it): `last_error_message`, `pending_update_count`, URL, `allowed_updates`.
+2. Bot token revoked or regenerated in BotFather → `add_secret TELEGRAM_BOT_TOKEN`, redeploy api + executor, `setWebhook` again.
+3. Webhook 401s → `TELEGRAM_WEBHOOK_SECRET` differs from what was registered: run `setWebhook` with the current secret.
+4. Webhook 403 at the edge → Telegram's IP ranges changed: update the allow-list in `infra/cloudflare/dns.sh` and re-run `make dns`.
+5. Ops group silent → the bot was removed from the group, or the group was upgraded to a supergroup (its chat id changes to `-100…`): re-add the bot / `add_secret TELEGRAM_OPS_CHAT_ID` with the new id, redeploy. Ops alerts still reach `OPS_EMAILS` by e-mail meanwhile.
+6. If Telegram is down for > 24 h platform-wide, the automatic entries pause will hit every user: decide (IC) whether to accept it; do **not** disable the gate in code.
+
+### 13.3 Held USDC deposits: `suspense:usdc_unattributed` release (maker-checker)
+
+`deposits-scan` books a treasury transfer it cannot credit (sender not a verified wallet, amount below the minimum, …) **once**: debit `treasury:hl_usdc` / credit `suspense:usdc_unattributed` (kind `deposit_held`, key `usdc_hl:{hash}`) and raises the ops event `topup_held` (and the user's `topup_held` alert when the sender is known). A later wallet verification does **not** credit it automatically (the key is taken).
+1. **Maker** (Admin A): identify the owner — the user proves control of the sending address (signed message via wallet verification) or it is refunded to the sender; record the tx hash, amount, sender and evidence in the ops log.
+2. **Checker** (Admin B ≠ A) reviews the evidence.
+3. Post **one** ledger transaction, idempotency key `suspense_release:{hash}`: debit `suspense:usdc_unattributed` / credit `user:{id}:fee_balance` for the held amount (or, for a refund, debit `suspense:usdc_unattributed` / credit `treasury:hl_usdc` together with the treasury `usdSend` back to the sender through the payout procedure §5).
+4. **[GAP — backend]** there is no admin-console action for step 3 yet. Until it exists, do not improvise SQL (the ledger is hash-chained and append-only): leave the funds in suspense (they are safe and fully booked) and tell the user the credit is pending review.
+5. Daily: `suspense:usdc_unattributed` balance = Σ open held items; any unexplained balance is a reconciliation mismatch (§6).
+
+### 13.4 `fill_after_settlement` (critical)
+
+Meaning: `fills-ingest` stored one of our fills whose time is at or before the subscription's `pnl_cursor` — its day was already settled, so its PnL (and profit share) was not counted and never will be automatically.
+1. Find the fill (`fills` by `tid`), subscription, day and `net_pnl_micro`; check why it arrived late (Scheduler history of `fills-ingest` / `fills-ingest-presettle` before 00:30, Hyperliquid outage, `fills-ingest` errors).
+2. Compute the profit-share difference (HWM included) the fill would have made. If ≥ $1 or ever repeating, SEV3: correct with a **new** ledger transaction (maker-checker, §6), memo = fill `tid` + settle date; notify the user if their charge changes.
+3. Prevent a repeat: if `fills-ingest` is failing or behind (cursor older than a few minutes), **pause `settle-daily` until it has caught up**, then run `settle-daily` by hand (idempotent; it settles yesterday by default). For an older missed day the executor is not reachable from outside, so set the date on the job temporarily: `gcloud scheduler jobs update http settle-daily --location=asia-southeast1 --message-body='{"settle_date":"YYYY-MM-DD"}'` → `gcloud scheduler jobs run settle-daily …` → set `--message-body='{}'` back (verify with `describe`). Settle missed days in date order.
+
+### 13.5 `candle_mismatch`
+
+`candles-sync` re-fetched a closed candle that differs from the stored one. Stored closed candles are immutable: the new value is **not** written. Stored candles feed **creator signals in the tick** (stored first, the API only for missing bars — `app/execution/jobs.py _bars_for`), backtests and the listing-history rule, so a wrong stored candle can change a live creator signal.
+1. Compare the stored row, the API's current value and the Hyperliquid UI for that coin/interval/open time.
+2. A one-off venue correction: note it in the ops log; leave the stored candle (it is what backtests recorded) unless the review decides otherwise — any change is a reviewed migration, never an in-place edit.
+3. If the stored value is wrong and a listed creator strategy trades that coin/interval: `new_entries_paused:{coin}` (one admin) while the review decides; check the strategy's recent signals for that bar.
+4. Many mismatches at once (a whole interval or coin): suspect our code (e.g. a candle stored before it closed) or an API change — SEV3, pause `candles-sync`, fix, then resume.
+
+### 13.6 First-sync candle backfill
+
+The first `candles-sync` run backfills ~5,000 candles per series across every perp market at 1h/4h/1d; each call is bounded, so the backfill spreads over **~40 calls (~7 h)**. Until it finishes, backtests fall back to the API and a strategy's "history days" may read low. Listing needs ≥ 180 days on every market (SPEC §12).

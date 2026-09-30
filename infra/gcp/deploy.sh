@@ -26,10 +26,22 @@ export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 
 : "${GIT_SHA:=$(git -C "${REPO_ROOT}" rev-parse HEAD)}"
 : "${DEPLOY_STATE:=${RUNNER_TEMP:-/tmp}/aijalon-deploy.state}"
+# Plain (non-secret) runtime settings rendered into infra/gcp/run/*.yaml. deploy.yml passes the GitHub environment
+# variables of the same name; an unset/empty variable takes the default below (= app/config.py defaults).
+# ALLOWLIST_EMAILS / OPS_EMAILS are Secret Manager secrets (personal data), not variables. Table: DEPLOY.md §5.3.
 : "${LAUNCH_PHASE:=internal}"
-: "${ALLOWLIST_EMAILS:=${OWNER_EMAIL}}"
 : "${PAYOUTS_ENABLED:=false}"
-: "${OPS_EMAILS:=${ALERT_EMAIL}}"
+# caps: 0 = no cap (owner 30 Sep 2026, SPEC §12 "No caps"); a positive value re-introduces a cap without a code change
+: "${MAX_ALLOCATION_PER_USER_USD:=0}"
+: "${MAX_TOTAL_PLATFORM_ALLOCATION_USD:=0}"
+: "${MAX_USER_LEVERAGE:=0}"
+: "${STRIPE_MAX_TOPUP_USD:=10000}"
+: "${STRIPE_FEE_ESTIMATE_BPS:=0}"            # 0 = no pre-payment fee estimate shown [CONFIRM from Stripe MY pricing]
+: "${STRIPE_FEE_ESTIMATE_FIXED_USD:=0}"
+: "${STRIPE_API_VERSION:=}"                  # empty = the Stripe account's default API version
+: "${KYC_PROVIDER:=manual}"                  # manual | sumsub
+: "${KYC_LEVEL_NAME:=}"                      # sumsub only
+: "${TELEGRAM_BOT_USERNAME:=}"               # required (preflight): BotFather username, e.g. aijalon_alerts_bot
 : "${SANDBOX_DOCKERFILE:=sandbox/Dockerfile}"
 : "${SANDBOX_CONTEXT:=.}"               # build context for the sandbox image, relative to the repo root
 GIT_SHA_SHORT="${GIT_SHA:0:12}"
@@ -44,7 +56,9 @@ export_render_env() {
   export PROJECT_ID REGION GIT_SHA_SHORT VPC RUN_SUBNET RUN_NET_TAG SANDBOX_VPC SANDBOX_SUBNET SANDBOX_NET_TAG \
     SANDBOX_EXEC_ENV SANDBOX_CONNECTOR SA_API SA_EXECUTOR SA_SANDBOX SA_SCHEDULER SA_MIGRATOR KMS_KEY_NAME DB_NAME \
     WEB_DOMAIN API_DOMAIN SQL_CONNECTION_NAME CLOUDSQL_PROXY_IMAGE DB_MIGRATOR_USER MIGRATE_CMD \
-    LAUNCH_PHASE ALLOWLIST_EMAILS PAYOUTS_ENABLED STRIPE_PUBLISHABLE_KEY OPS_EMAILS
+    LAUNCH_PHASE PAYOUTS_ENABLED STRIPE_PUBLISHABLE_KEY MAX_ALLOCATION_PER_USER_USD \
+    MAX_TOTAL_PLATFORM_ALLOCATION_USD MAX_USER_LEVERAGE STRIPE_MAX_TOPUP_USD STRIPE_FEE_ESTIMATE_BPS \
+    STRIPE_FEE_ESTIMATE_FIXED_USD STRIPE_API_VERSION KYC_PROVIDER KYC_LEVEL_NAME TELEGRAM_BOT_USERNAME
   DB_IAM_USER_API_URLENC="$(urlenc_at "${DB_IAM_USER_API}")"
   DB_IAM_USER_EXECUTOR_URLENC="$(urlenc_at "${DB_IAM_USER_EXECUTOR}")"
   BACKEND_IMAGE="$(state_get BACKEND_IMAGE)"
@@ -68,6 +82,20 @@ cmd_preflight() {
   fi
   [[ -n "${DB_PRIVATE_IP:-}" ]] || { warn "DB_PRIVATE_IP (GitHub variable) is empty"; bad=1; }
   [[ "${STRIPE_PUBLISHABLE_KEY:-}" =~ ^pk_(live|test)_ ]] || { warn "STRIPE_PUBLISHABLE_KEY (GitHub variable) missing"; bad=1; }
+  [[ "${TELEGRAM_BOT_USERNAME}" =~ ^[A-Za-z][A-Za-z0-9_]{3,30}[Bb][Oo][Tt]$ ]] \
+    || { warn "TELEGRAM_BOT_USERNAME (GitHub variable) missing/invalid — BotFather username without @ (DEPLOY.md §5.1)"; bad=1; }
+  [[ "${LAUNCH_PHASE}" == "internal" || "${LAUNCH_PHASE}" == "public" ]] || { warn "LAUNCH_PHASE must be internal|public"; bad=1; }
+  [[ "${PAYOUTS_ENABLED}" == "true" || "${PAYOUTS_ENABLED}" == "false" ]] || { warn "PAYOUTS_ENABLED must be true|false"; bad=1; }
+  [[ "${KYC_PROVIDER}" == "manual" || "${KYC_PROVIDER}" == "sumsub" ]] || { warn "KYC_PROVIDER must be manual|sumsub"; bad=1; }
+  if [[ "${KYC_PROVIDER}" == "sumsub" && -z "${KYC_LEVEL_NAME}" ]]; then warn "KYC_PROVIDER=sumsub needs KYC_LEVEL_NAME"; bad=1; fi
+  local n
+  for n in MAX_ALLOCATION_PER_USER_USD MAX_TOTAL_PLATFORM_ALLOCATION_USD MAX_USER_LEVERAGE STRIPE_MAX_TOPUP_USD \
+           STRIPE_FEE_ESTIMATE_BPS STRIPE_FEE_ESTIMATE_FIXED_USD; do
+    [[ "${!n}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { warn "${n}='${!n}' is not a non-negative number"; bad=1; }
+  done
+  [[ "${MAX_USER_LEVERAGE}" =~ ^[0-9]+$ ]] && (( MAX_USER_LEVERAGE <= 50 )) \
+    || { warn "MAX_USER_LEVERAGE must be an integer 0 (no cap) .. 50 (RiskLimits.platform_max_leverage)"; bad=1; }
+  [[ -n "${STRIPE_API_VERSION}" ]] || warn "STRIPE_API_VERSION empty: Stripe uses the account default (pin it to the webhook endpoint's version)"
   python3 "${REPO_ROOT}/infra/csp_sync.py" check >/dev/null || { warn "firebase.json CSP != infra/csp.txt"; bad=1; }
   ((bad == 0)) || die "preflight failed"
   log "preflight ok"
@@ -77,7 +105,9 @@ cmd_images() {
   log "build + push images for ${GIT_SHA_SHORT}"
   gcloud auth configure-docker "${AR_HOST}" --quiet >/dev/null
   local tag="${BACKEND_IMAGE_REPO}:${GIT_SHA}"
-  docker build --file "${REPO_ROOT}/backend/Dockerfile" --tag "${tag}" \
+  # BuildKit is required: backend/Dockerfile copies /srv/legal (LEGAL_DIR) from the named build context `legal`,
+  # and sandbox/Dockerfile uses COPY --chmod
+  DOCKER_BUILDKIT=1 docker build --file "${REPO_ROOT}/backend/Dockerfile" --tag "${tag}" \
     --build-context "legal=${REPO_ROOT}/legal" \
     --label "org.opencontainers.image.revision=${GIT_SHA}" "${REPO_ROOT}/backend"
   docker push "${tag}" >/dev/null
@@ -86,7 +116,7 @@ cmd_images() {
   state_set BACKEND_IMAGE "${d}"; log "backend = ${d}"
   if [[ -f "${REPO_ROOT}/${SANDBOX_DOCKERFILE}" ]]; then
     tag="${SANDBOX_IMAGE_REPO}:${GIT_SHA}"
-    docker build --file "${REPO_ROOT}/${SANDBOX_DOCKERFILE}" --tag "${tag}" \
+    DOCKER_BUILDKIT=1 docker build --file "${REPO_ROOT}/${SANDBOX_DOCKERFILE}" --tag "${tag}" \
       --label "org.opencontainers.image.revision=${GIT_SHA}" "${REPO_ROOT}/${SANDBOX_CONTEXT}"
     docker push "${tag}" >/dev/null
     d="$(docker inspect --format='{{index .RepoDigests 0}}' "${tag}")"
