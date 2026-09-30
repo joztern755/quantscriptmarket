@@ -17,8 +17,7 @@ import json
 from datetime import datetime
 from typing import Any, Iterable, Optional
 
-from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+from contextlib import nullcontext
 
 Cursor = Optional[tuple[datetime, str]]
 
@@ -31,8 +30,9 @@ _USER_COLS = ("id, created_at, firebase_uid, email, display_name, role::text AS 
 _AGENT_COLS = ("id, created_at, user_id, master_address, agent_address, agent_name, status::text AS status, "
                "approved_at, revoked_at")
 _SUB_COLS = ("s.id, s.created_at, s.user_id, s.strategy_id, s.strategy_version_id, s.trading_address, "
-             "s.allocation_micro, s.max_leverage_x100, s.status::text AS status, s.current_period_end, "
-             "s.hwm_micro, s.cum_pnl_micro, s.cancelled_at")
+             "s.master_address, s.allocation_micro, s.max_leverage_x100, s.status::text AS status, "
+             "s.current_period_end, s.hwm_micro, s.cum_pnl_micro, s.cancel_positions::text AS cancel_positions, "
+             "s.cancelled_at")
 _STRAT_COLS = ("st.id, st.created_at, st.slug, st.name, st.owner_user_id, st.in_house, st.markets, st.timeframe, "
                "st.price_monthly_micro, st.profit_share_bps, st.status::text AS status, st.description")
 _VERSION_COLS = ("v.id, v.created_at, v.strategy_id, v.version, v.code_hash, v.params, v.markets, v.timeframe, "
@@ -50,17 +50,31 @@ def _j(obj: Any) -> str:
 class SqlStore:
     # ------------------------------------------------------------------------------------------ helpers
     @staticmethod
-    def _one(conn: Any, sql: str, **params: Any) -> Optional[dict[str, Any]]:
-        row = conn.execute(text(sql), params).mappings().first()
-        return dict(row) if row is not None else None
+    def _runner(conn: Any) -> Any:
+        """A SqlRunner (has fetchall; e.g. tests' psql runner) or a SQLAlchemy Connection (prod)."""
+        if hasattr(conn, "fetchall"):
+            return conn
+        from app.db.engine import SqlAlchemyRunner  # raises DbError(sqlstate) on database errors
+        return SqlAlchemyRunner(conn)
+
+    def _all(self, conn: Any, sql: str, **params: Any) -> list[dict[str, Any]]:
+        return [dict(r) for r in self._runner(conn).fetchall(sql, params)]
+
+    def _one(self, conn: Any, sql: str, **params: Any) -> Optional[dict[str, Any]]:
+        rows = self._all(conn, sql, **params)
+        return rows[0] if rows else None
+
+    def _exec(self, conn: Any, sql: str, **params: Any) -> int:
+        """Returns the number of RETURNING rows (statements that need a count say `RETURNING id`)."""
+        return len(self._all(conn, sql, **params))
 
     @staticmethod
-    def _all(conn: Any, sql: str, **params: Any) -> list[dict[str, Any]]:
-        return [dict(r) for r in conn.execute(text(sql), params).mappings().all()]
-
-    @staticmethod
-    def _exec(conn: Any, sql: str, **params: Any) -> int:
-        return conn.execute(text(sql), params).rowcount
+    def savepoint(conn: Any) -> Any:
+        begin_nested = getattr(conn, "begin_nested", None)
+        if begin_nested is not None:
+            return begin_nested()
+        sp = getattr(conn, "savepoint", None)
+        return sp() if sp is not None else nullcontext()
 
     # ------------------------------------------------------------------------------------------ idempotency
     def idem_claim(self, conn: Any, *, user_id: str, key: str, scope: str, fingerprint: str) -> Optional[dict]:
@@ -138,7 +152,8 @@ class SqlStore:
                    p=plan, e=period_end, id=user_id)
 
     def set_user_status(self, conn: Any, user_id: str, status: str) -> int:
-        return self._exec(conn, "UPDATE users SET status = :s WHERE id = CAST(:id AS uuid)", s=status, id=user_id)
+        return self._exec(conn, "UPDATE users SET status = :s WHERE id = CAST(:id AS uuid) RETURNING id",
+                          s=status, id=user_id)
 
     def record_login_country(self, conn: Any, user_id: str, country: str) -> bool:
         """True when this country is new for the user AND the user had logged in from another country before."""
@@ -418,17 +433,19 @@ class SqlStore:
                                    AND s.status::text IN ('pending', 'active', 'past_due', 'reduce_only', 'closing')""", a=address)
 
     def insert_subscription(self, conn: Any, *, user_id: str, strategy_id: str, version_id: str, trading_address: str,
-                            allocation_micro: int, max_leverage_x100: int, status: str,
+                            master_address: str, allocation_micro: int, max_leverage_x100: int, status: str,
                             current_period_end: datetime) -> dict:
         row = self._one(conn, f"""
             WITH s AS (
-                INSERT INTO subscriptions (user_id, strategy_id, strategy_version_id, trading_address, allocation_micro,
-                                           max_leverage_x100, status, current_period_end)
-                VALUES (CAST(:u AS uuid), CAST(:sid AS uuid), CAST(:vid AS uuid), :a, :alloc, :lev, :st, :pe)
+                INSERT INTO subscriptions (user_id, strategy_id, strategy_version_id, trading_address, master_address,
+                                           allocation_micro, max_leverage_x100, status, current_period_end)
+                VALUES (CAST(:u AS uuid), CAST(:sid AS uuid), CAST(:vid AS uuid), :a, :m, :alloc, :lev,
+                        CAST(:st AS subscription_status), :pe)
                 RETURNING *)
             SELECT {_SUB_COLS}, st.slug AS strategy_slug, st.name AS strategy_name
               FROM s JOIN strategies st ON st.id = s.strategy_id""",
-                        u=user_id, sid=strategy_id, vid=version_id, a=trading_address, alloc=allocation_micro,
+                        u=user_id, sid=strategy_id, vid=version_id, a=trading_address, m=master_address,
+                        alloc=allocation_micro,
                         lev=max_leverage_x100, st=status, pe=current_period_end)
         assert row is not None
         return row
@@ -453,12 +470,18 @@ class SqlStore:
                                          THEN now() ELSE status_changed_at END
             WHERE id = CAST(:id AS uuid)""", alloc=allocation_micro, lev=max_leverage_x100, st=status, id=sub_id)
 
-    def end_subscription(self, conn: Any, sub_id: str, *, status: str, now: datetime) -> None:
-        """status 'cancelled' (leave positions) or 'closing' (executor flattens, then cancels)."""
-        self._exec(conn, """UPDATE subscriptions SET status = CAST(:s AS subscription_status), status_changed_at = :t,
-                                   cancelled_at = CASE WHEN :s2 = 'cancelled' THEN CAST(:t AS timestamptz) ELSE cancelled_at END
-                            WHERE id = CAST(:id AS uuid) AND status::text <> 'cancelled'""",
-                   s=status, s2=status, t=now, id=sub_id)
+    def end_subscription(self, conn: Any, sub_id: str, *, positions: str, now: datetime) -> Optional[dict]:
+        """SPEC §12: positions 'close' → status 'closing' (executor flattens, then marks cancelled);
+        'leave' → 'cancelled' now. Returns the updated row, or None if it was already cancelled."""
+        return self._one(conn, """
+            UPDATE subscriptions
+               SET cancel_positions = CAST(:p AS cancel_positions_mode),
+                   status = CASE WHEN :p2 = 'close' THEN CAST('closing' AS subscription_status)
+                                 ELSE CAST('cancelled' AS subscription_status) END,
+                   status_changed_at = :t,
+                   cancelled_at = CASE WHEN :p3 = 'close' THEN cancelled_at ELSE CAST(:t2 AS timestamptz) END
+             WHERE id = CAST(:id AS uuid) AND status <> 'cancelled'
+            RETURNING id, status::text AS status""", p=positions, p2=positions, p3=positions, t=now, t2=now, id=sub_id)
 
     def list_subscriptions(self, conn: Any, user_id: str, limit: int, cursor: Cursor) -> list[dict]:
         return self._all(conn, f"""
@@ -487,28 +510,6 @@ class SqlStore:
         row = self._one(conn, "SELECT id FROM ledger_accounts WHERE code = :c", c=code)
         return str(row["id"]) if row else None
 
-    def ensure_account(self, conn: Any, *, code: str, kind: str, owner_user_id: Optional[str],
-                       non_negative: bool) -> None:
-        self._exec(conn, """
-            INSERT INTO ledger_accounts (code, kind, owner_user_id, non_negative)
-            VALUES (:c, :k, CAST(:o AS uuid), :nn) ON CONFLICT (code) DO NOTHING""",
-                   c=code, k=kind, o=owner_user_id, nn=non_negative)
-
-    def raw_balance(self, conn: Any, code: str) -> int:
-        row = self._one(conn, """SELECT coalesce(sum(e.amount_micro), 0)::bigint AS b
-                                 FROM ledger_entries e JOIN ledger_accounts a ON a.id = e.account_id
-                                 WHERE a.code = :c""", c=code)
-        return int(row["b"]) if row else 0
-
-    def ledger_post(self, conn: Any, *, idempotency_key: str, kind: str, memo: str, created_by: str,
-                    entries: list[tuple[str, int]]) -> str:
-        """SQL fallback over the DB's ledger_post() (the one supported write path)."""
-        payload = _j([{"account": a, "amount_micro": int(m)} for a, m in entries])
-        row = self._one(conn, "SELECT tx_id FROM ledger_post(:k, :kind, :memo, :by, CAST(:e AS jsonb))",
-                        k=idempotency_key, kind=kind, memo=memo, by=created_by, e=payload)
-        assert row is not None
-        return str(row["tx_id"])
-
     def ledger_history(self, conn: Any, code: str, limit: int, cursor: Cursor) -> list[dict]:
         return self._all(conn, """
             SELECT t.id, t.id AS tx_id, t.created_at, t.kind, t.memo, e.amount_micro AS raw_amount_micro
@@ -534,27 +535,34 @@ class SqlStore:
                AND (CAST(:cts AS timestamptz) IS NULL OR (created_at, id) < (CAST(:cts AS timestamptz), CAST(:cid AS uuid)))
              ORDER BY created_at DESC, id DESC LIMIT :lim""", u=user_id, lim=limit + 1, **_c(cursor))
 
-    def insert_pending_deposit(self, conn: Any, *, user_id: str, method: str, external_ref: str,
-                               amount_micro: int) -> None:
+    def insert_pending_deposit(self, conn: Any, *, user_id: str, method: str, external_ref: str, amount_micro: int,
+                               currency: str = "USD", amount_minor: Optional[int] = None) -> None:
         self._exec(conn, """
-            INSERT INTO deposits (user_id, method, external_ref, amount_micro, status)
-            VALUES (CAST(:u AS uuid), :m, :r, :a, 'pending') ON CONFLICT (external_ref) DO NOTHING""",
-                   u=user_id, m=method, r=external_ref, a=amount_micro)
+            INSERT INTO deposits (user_id, method, external_ref, amount_micro, currency, amount_minor, status)
+            VALUES (CAST(:u AS uuid), CAST(:m AS deposit_method), :r, :a, :cur, :minor, 'pending')
+            ON CONFLICT (external_ref) DO NOTHING""",
+                   u=user_id, m=method, r=external_ref, a=amount_micro, cur=currency.upper(), minor=amount_minor)
 
     def mark_deposit_credited(self, conn: Any, *, user_id: str, method: str, external_ref: str, amount_micro: int,
-                              tx_id: str) -> dict:
-        row = self._one(conn, """
-            INSERT INTO deposits (user_id, method, external_ref, amount_micro, status, credited_tx_id)
-            VALUES (CAST(:u AS uuid), :m, :r, :a, 'credited', CAST(:tx AS uuid))
+                              tx_id: str, withdrawable: bool, fee_micro: int = 0, currency: Optional[str] = None,
+                              amount_minor: Optional[int] = None, meta: Optional[dict] = None) -> dict:
+        cols = ("id, created_at, method::text AS method, external_ref, amount_micro, status::text AS status, "
+                "withdrawable")
+        row = self._one(conn, f"""
+            INSERT INTO deposits (user_id, method, external_ref, amount_micro, currency, amount_minor, fee_micro,
+                                  withdrawable, status, credited_tx_id, meta)
+            VALUES (CAST(:u AS uuid), CAST(:m AS deposit_method), :r, :a, coalesce(CAST(:cur AS text), 'USD'), :minor,
+                    :fee, :w, 'credited', CAST(:tx AS uuid), CAST(:meta AS jsonb))
             ON CONFLICT (external_ref) DO UPDATE
-               SET status = 'credited', credited_tx_id = EXCLUDED.credited_tx_id, amount_micro = EXCLUDED.amount_micro
+               SET status = 'credited', credited_tx_id = EXCLUDED.credited_tx_id, amount_micro = EXCLUDED.amount_micro,
+                   fee_micro = EXCLUDED.fee_micro, withdrawable = EXCLUDED.withdrawable,
+                   amount_minor = coalesce(EXCLUDED.amount_minor, deposits.amount_minor), meta = EXCLUDED.meta
              WHERE deposits.status <> 'credited' AND deposits.user_id = EXCLUDED.user_id
-            RETURNING id, created_at, method::text AS method, external_ref, amount_micro, status::text AS status""",
-                        u=user_id, m=method, r=external_ref, a=amount_micro, tx=tx_id)
+            RETURNING {cols}""", u=user_id, m=method, r=external_ref, a=amount_micro,
+                        cur=(currency or None) and currency.upper(), minor=amount_minor, fee=fee_micro, w=withdrawable,
+                        tx=tx_id, meta=_j(meta or {}))
         if row is None:
-            row = self._one(conn, """SELECT id, created_at, method::text AS method, external_ref, amount_micro,
-                                            status::text AS status FROM deposits WHERE external_ref = :r""",
-                            r=external_ref)
+            row = self._one(conn, f"SELECT {cols} FROM deposits WHERE external_ref = :r", r=external_ref)
         assert row is not None
         return row
 
@@ -566,7 +574,7 @@ class SqlStore:
         """USDC-funded credits minus non-rejected withdrawals. Card credits are spend-only (never withdrawable)."""
         row = self._one(conn, """
             SELECT (SELECT coalesce(sum(amount_micro), 0) FROM deposits
-                     WHERE user_id = CAST(:u AS uuid) AND method = 'usdc_hl' AND status = 'credited')
+                     WHERE user_id = CAST(:u AS uuid) AND withdrawable AND status = 'credited')
                  - (SELECT coalesce(sum(amount_micro), 0) FROM withdrawals
                      WHERE beneficiary_user_id = CAST(:u AS uuid) AND status <> 'rejected') AS w""", u=user_id)
         return max(0, int(row["w"])) if row else 0
@@ -639,30 +647,32 @@ class SqlStore:
 
     def payout_approve_1(self, conn: Any, kind: str, payout_id: str, admin_id: str, now: datetime) -> int:
         sql_w = """UPDATE withdrawals SET status = 'approved_1', maker_admin = CAST(:a AS uuid), maker_approved_at = :t
-                   WHERE id = CAST(:id AS uuid) AND status = 'requested'"""
+                   WHERE id = CAST(:id AS uuid) AND status = 'requested' RETURNING id"""
         sql_p = """UPDATE payouts SET status = 'approved_1', maker_admin = CAST(:a AS uuid), maker_approved_at = :t
-                   WHERE id = CAST(:id AS uuid) AND status = 'requested'"""
+                   WHERE id = CAST(:id AS uuid) AND status = 'requested' RETURNING id"""
         return self._exec(conn, sql_w if kind == "withdrawal" else sql_p, a=admin_id, t=now, id=payout_id)
 
     def payout_approve_2(self, conn: Any, kind: str, payout_id: str, admin_id: str, now: datetime) -> int:
         sql_w = """UPDATE withdrawals SET status = 'approved_2', checker_admin = CAST(:a AS uuid), checker_approved_at = :t
-                   WHERE id = CAST(:id AS uuid) AND status = 'approved_1' AND maker_admin <> CAST(:a AS uuid)"""
+                   WHERE id = CAST(:id AS uuid) AND status = 'approved_1' AND maker_admin <> CAST(:a AS uuid)
+                   RETURNING id"""
         sql_p = """UPDATE payouts SET status = 'approved_2', checker_admin = CAST(:a AS uuid), checker_approved_at = :t
-                   WHERE id = CAST(:id AS uuid) AND status = 'approved_1' AND maker_admin <> CAST(:a AS uuid)"""
+                   WHERE id = CAST(:id AS uuid) AND status = 'approved_1' AND maker_admin <> CAST(:a AS uuid)
+                   RETURNING id"""
         return self._exec(conn, sql_w if kind == "withdrawal" else sql_p, a=admin_id, t=now, id=payout_id)
 
     def payout_reject(self, conn: Any, kind: str, payout_id: str, admin_id: str, reason: str) -> int:
         sql_w = """UPDATE withdrawals SET status = 'rejected', rejected_by = CAST(:a AS uuid), reject_reason = :r
-                   WHERE id = CAST(:id AS uuid) AND status IN ('requested', 'approved_1', 'approved_2')"""
+                   WHERE id = CAST(:id AS uuid) AND status IN ('requested', 'approved_1', 'approved_2') RETURNING id"""
         sql_p = """UPDATE payouts SET status = 'rejected', rejected_by = CAST(:a AS uuid), reject_reason = :r
-                   WHERE id = CAST(:id AS uuid) AND status IN ('requested', 'approved_1', 'approved_2')"""
+                   WHERE id = CAST(:id AS uuid) AND status IN ('requested', 'approved_1', 'approved_2') RETURNING id"""
         return self._exec(conn, sql_w if kind == "withdrawal" else sql_p, a=admin_id, r=reason, id=payout_id)
 
     def payout_mark_sent(self, conn: Any, kind: str, payout_id: str, tx_hash: str, ledger_tx_id: str) -> int:
         sql_w = """UPDATE withdrawals SET status = 'sent', tx_hash = :h, ledger_tx_id = CAST(:tx AS uuid)
-                   WHERE id = CAST(:id AS uuid) AND status = 'approved_2'"""
+                   WHERE id = CAST(:id AS uuid) AND status = 'approved_2' RETURNING id"""
         sql_p = """UPDATE payouts SET status = 'sent', tx_hash = :h, ledger_tx_id = CAST(:tx AS uuid)
-                   WHERE id = CAST(:id AS uuid) AND status = 'approved_2'"""
+                   WHERE id = CAST(:id AS uuid) AND status = 'approved_2' RETURNING id"""
         return self._exec(conn, sql_w if kind == "withdrawal" else sql_p, h=tx_hash, tx=ledger_tx_id, id=payout_id)
 
     def tx_hash_used(self, conn: Any, tx_hash: str) -> bool:
@@ -685,7 +695,8 @@ class SqlStore:
 
     def ack_user_alert(self, conn: Any, alert_id: str, user_id: str, now: datetime) -> int:
         return self._exec(conn, """UPDATE alerts SET acked_at = :t, acked_by = CAST(:u AS uuid)
-                                   WHERE id = CAST(:id AS uuid) AND user_id = CAST(:u AS uuid) AND acked_at IS NULL""",
+                                   WHERE id = CAST(:id AS uuid) AND user_id = CAST(:u AS uuid) AND acked_at IS NULL
+                                   RETURNING id""",
                           t=now, u=user_id, id=alert_id)
 
     def admin_list_alerts(self, conn: Any, *, severity: Optional[str], unacked_only: bool, ops_only: bool,
@@ -700,7 +711,8 @@ class SqlStore:
 
     def admin_ack_alert(self, conn: Any, alert_id: str, admin_id: str, now: datetime) -> int:
         return self._exec(conn, """UPDATE alerts SET acked_at = :t, acked_by = CAST(:a AS uuid)
-                                   WHERE id = CAST(:id AS uuid) AND acked_at IS NULL""", t=now, a=admin_id, id=alert_id)
+                                   WHERE id = CAST(:id AS uuid) AND acked_at IS NULL RETURNING id""",
+                          t=now, a=admin_id, id=alert_id)
 
     # ------------------------------------------------------------------------------------------ reviews / posts
     def upsert_review(self, conn: Any, *, strategy_id: str, user_id: str, rating: int, body: Optional[str],
@@ -758,7 +770,7 @@ class SqlStore:
     def insert_strategy(self, conn: Any, *, owner_user_id: str, slug: str, name: str, description: Optional[str],
                         markets: list[str], timeframe: str, price_monthly_micro: int, profit_share_bps: int) -> Optional[dict]:
         try:
-            with conn.begin_nested():
+            with self.savepoint(conn):
                 return self._one(conn, f"""
                     WITH st AS (
                         INSERT INTO strategies (slug, name, owner_user_id, in_house, markets, timeframe,
@@ -767,8 +779,9 @@ class SqlStore:
                         RETURNING *)
                     SELECT {_STRAT_COLS} FROM st""", slug=slug, name=name, o=owner_user_id, m=list(markets), tf=timeframe,
                                  p=price_monthly_micro, ps=profit_share_bps, d=description)
-        except IntegrityError as e:
-            if getattr(getattr(e, "orig", None), "sqlstate", None) == "23505":
+        except Exception as e:  # noqa: BLE001 - only a unique violation is expected here
+            from app.db.engine import sqlstate_of
+            if sqlstate_of(e) == "23505":
                 return None  # slug taken
             raise
 
@@ -815,7 +828,8 @@ class SqlStore:
 
     def publish_version(self, conn: Any, version_id: str, now: datetime) -> int:
         return self._exec(conn, """UPDATE strategy_versions SET published_at = :t, live_since = :t
-                                   WHERE id = CAST(:id AS uuid) AND published_at IS NULL""", t=now, id=version_id)
+                                   WHERE id = CAST(:id AS uuid) AND published_at IS NULL RETURNING id""",
+                          t=now, id=version_id)
 
     def active_subscribers_by_strategy(self, conn: Any, owner_id: str) -> list[dict]:
         return self._all(conn, """
@@ -848,10 +862,22 @@ class SqlStore:
         return self._one(conn, sql, k=key)
 
     def set_flag(self, conn: Any, key: str, value: Any, by: str) -> None:
+        """Apply now (protective direction, or a checked pending change). Clears any pending proposal."""
         self._exec(conn, """
             INSERT INTO system_flags (key, value, updated_by) VALUES (:k, CAST(:v AS jsonb), :by)
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by,
                 pending_value = NULL, pending_by = NULL, pending_at = NULL""", k=key, v=_j(value), by=by)
+
+    def propose_flag(self, conn: Any, key: str, value: Any, by: str, now: datetime) -> bool:
+        """Maker step for lifting a switch (existing flag only). False if a proposal is already pending."""
+        return self._exec(conn, """
+            UPDATE system_flags SET pending_value = CAST(:v AS jsonb), pending_by = :by, pending_at = :t
+             WHERE key = :k AND pending_value IS NULL
+            RETURNING key""", k=key, v=_j(value), by=by, t=now) > 0
+
+    def clear_flag_proposal(self, conn: Any, key: str) -> int:
+        return self._exec(conn, """UPDATE system_flags SET pending_value = NULL, pending_by = NULL, pending_at = NULL
+                                   WHERE key = :k AND pending_value IS NOT NULL RETURNING key""", k=key)
 
     def list_changes(self, conn: Any, status: Optional[str], limit: int, cursor: Cursor) -> list[dict]:
         return self._all(conn, """
@@ -903,5 +929,6 @@ class SqlStore:
     def pause_subscriptions_of_strategy(self, conn: Any, strategy_id: str) -> int:
         """Delist → live subscriptions go reduce_only (exits allowed, no new entries)."""
         return self._exec(conn, """UPDATE subscriptions SET status = 'reduce_only', status_changed_at = now()
-                                   WHERE strategy_id = CAST(:id AS uuid) AND status IN ('pending', 'active', 'past_due')""",
+                                   WHERE strategy_id = CAST(:id AS uuid) AND status IN ('pending', 'active', 'past_due')
+                                   RETURNING id""",
                           id=strategy_id)
