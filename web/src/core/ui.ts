@@ -78,8 +78,11 @@ export function h(tag: string, attrs?: Attrs | null, ...children: Child[]): HTML
   return el;
 }
 
+// Allowlist (SECURITY L9): <animate>/<set>/<use>/<a>/<foreignObject>/<script> could write href or load content.
+const SVG_TAGS = new Set(["svg", "g", "path", "line", "polyline", "polygon", "circle", "ellipse", "rect", "text", "tspan", "title", "desc", "clipPath", "defs", "linearGradient", "stop"]);
+
 export function svg(tag: string, attrs?: Attrs | null, ...children: Child[]): SVGElement {
-  if (/^(script|foreignObject)$/i.test(tag)) throw new Error(`svg(): <${tag}> not allowed`);
+  if (!SVG_TAGS.has(tag)) throw new Error(`svg(): <${tag}> not allowed`);
   const el = document.createElementNS(SVG_NS, tag) as SVGElement;
   applyAttrs(el, attrs);
   appendChildren(el, children);

@@ -2,10 +2,14 @@
 
 Version upload (step-up, 1 MB body, ≤ 64 KB code): no-code spec → Python (app.sandbox.nocode) → STATIC validation
 here (app.sandbox.validate: AST allowlist, never executes) → markets checked against live Hyperliquid meta →
-walk-forward backtest in the sandbox service (no egress; this process fetches the candles and sends them) →
-code sealed with the encrypt-only KMS envelope (AAD = "strategy_code:{strategy_id}:{code_hash}"; the executor
-needs the same AAD to open it) → strategy_versions row (unpublished) → strategy 'review'. An admin listing
-(maker-checker) publishes the version and resets the live record (live_since).
+walk-forward backtest in the sandbox service (no egress; this process fetches the candles and sends them; the
+sandbox runs the script TWICE in fresh processes and rejects non-deterministic output) → code sealed with the
+encrypt-only envelope under the DEDICATED ``creator-code`` KMS key (record AAD =
+``app.security.kms.creator_code_aad(strategy_id, code_hash)``; the executor needs the same AAD to open it) →
+strategy_versions row (unpublished) → strategy 'review'. An admin listing (maker-checker) publishes the version and
+resets the live record (live_since).
+Markets must be validator perps or on a TRUSTED builder dex (SPEC §12, table trusted_dexes; checked at create,
+upload, listing proposal and listing approval — before any Hyperliquid call is made for the named dex).
 KYC is required before a creator strategy can be listed, before paid posts, and before payouts.
 """
 from __future__ import annotations
@@ -92,6 +96,13 @@ def _check_terms(svc: Services, profit_share_bps: Optional[int], price_micro: Op
         raise ValidationFailed("price must be ≥ 0")
 
 
+def require_trusted_markets(conn: Any, svc: Services, markets: list[str], *, what: str = "markets") -> None:
+    """SPEC §12 trusted builder dexes (REVIEW_TRADING_KEYS F1): 422 ``untrusted_dex`` unless every market is a validator
+    perp or on an active trusted_dexes row. Re-read on every call (an admin removal applies immediately)."""
+    from app.strategies.dexes import require_trusted
+    require_trusted(markets, svc.store.trusted_dexes(conn), what=what)
+
+
 def _owned(conn: Any, svc: Services, ctx: AuthCtx, strategy_id: str, *, for_update: bool = False) -> dict:
     st = svc.store.get_strategy(conn, strategy_id, for_update=for_update)
     if st is None or (str(st.get("owner_user_id")) != ctx.user_id and ctx.role != "admin") or st["in_house"]:
@@ -110,6 +121,8 @@ def my_strategies(ctx: AuthCtx = Depends(creator_user), svc: Services = Depends(
 def create_strategy(body: S.CreatorStrategyIn, ctx: AuthCtx = Depends(creator_user),
                     svc: Services = Depends(get_services)) -> S.CreatorStrategyOut:
     _check_terms(svc, body.profit_share_bps, body.price_monthly_micro)
+    with svc.db.begin() as conn:   # before any Hyperliquid call: never fetch the meta of a dex an attacker names
+        require_trusted_markets(conn, svc, list(body.markets))
     unknown = svc.hl.unknown_coins(list(body.markets))
     if unknown:
         raise ValidationFailed("unknown Hyperliquid markets", markets=unknown)
@@ -171,6 +184,8 @@ def upload_version(strategy_id: UUID, body: S.VersionUploadIn, ctx: AuthCtx = De
     if not set(markets) <= set(st["markets"] or []) or meta["timeframe"] != st["timeframe"]:
         raise ValidationFailed("script MARKETS/TIMEFRAME must match the strategy",
                                strategy_markets=list(st["markets"] or []), strategy_timeframe=st["timeframe"])
+    with svc.db.begin() as conn:   # the allowlist may have changed since the strategy was created
+        require_trusted_markets(conn, svc, markets)
     unknown = svc.hl.unknown_coins(markets)
     if unknown:
         raise ValidationFailed("unknown Hyperliquid markets", markets=unknown)
@@ -181,8 +196,9 @@ def upload_version(strategy_id: UUID, body: S.VersionUploadIn, ctx: AuthCtx = De
             report["history_days"] = hd      # public "Short history (N days)" flag + admin ≥180-day listing check
     raw = code.encode("utf-8")
     code_hash = hashlib.sha256(raw).hexdigest()
-    ciphertext, key_version = svc.code_vault.seal(raw, f"strategy_code:{sid}:{code_hash}".encode())
-    params: dict[str, Any] = {"source": body.source, "kms_key_version": key_version}
+    from app.security.kms import creator_code_aad   # lazy: app.api imports without the crypto stack
+    ciphertext, key_version = svc.code_vault.seal(raw, creator_code_aad(sid, code_hash))
+    params: dict[str, Any] = {"source": body.source, "kms_key_version": key_version, "kms_key_purpose": "creator-code"}
     if body.source == "nocode":
         params["nocode_spec"] = body.spec
     with svc.db.begin() as conn:

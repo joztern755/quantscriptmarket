@@ -25,6 +25,8 @@ ACC_WITHDRAWALS_PENDING = "withdrawals:pending"   # liability: user money on its
 ACC_PAYOUTS_PENDING = "payouts:pending"           # liability: creator/referrer money on its way out
 ACC_TREASURY = "treasury:hl_usdc"
 ACC_STRIPE_CLEARING = "stripe:clearing"
+ACC_SUSPENSE_USDC = "suspense:usdc_unattributed"   # liability: USDC received but not attributable (deposits-scan)
+ACC_REFUNDS_PENDING = "refunds:usdc_pending"       # liability: held USDC approved for refund, not yet sent
 
 
 def fee_balance(user_id: str) -> str:
@@ -50,7 +52,7 @@ def account_spec(code: str) -> tuple[str, bool, Optional[str]]:
         return "revenue", False, None
     if code in (ACC_TREASURY, ACC_STRIPE_CLEARING, "builder:hl_receivable"):
         return "asset", False, None
-    if code in (ACC_WITHDRAWALS_PENDING, ACC_PAYOUTS_PENDING, "suspense:usdc_unattributed"):
+    if code in (ACC_WITHDRAWALS_PENDING, ACC_PAYOUTS_PENDING, ACC_SUSPENSE_USDC, ACC_REFUNDS_PENDING):
         return "liability", False, None
     raise ValueError(f"unknown ledger account shape: {code}")
 
@@ -202,3 +204,32 @@ def apply_debit(conn: Any, svc: Any, instr: Any, *, actor: str) -> Optional[str]
             "user_id": instr.user_id, "external_ref": instr.external_ref, "amount_micro": instr.amount_micro}})
         return None
     return tx
+
+
+# ---------------------------------------------------------------------------------------------- held USDC (suspense)
+def suspense_release_key(tx_hash: str) -> str:
+    """ONE release per held transfer, whatever the outcome (attribute or refund): the key cannot be reused."""
+    return f"suspense_release:{tx_hash.lower()}"
+
+
+def release_suspense_to_user(conn: Any, svc: Any, *, tx_hash: str, user_id: str, amount: int, actor: str) -> str:
+    """Approved attribution (maker-checker): suspense ↓ (debit), the user's fee balance ↑ (credit). The caller also
+    writes the deposits row (usdc_hl, withdrawable) so the credit counts as USDC-funded."""
+    return post(conn, svc, key=suspense_release_key(tx_hash), kind="suspense_release",
+                memo=f"held USDC attributed {tx_hash[:12]}", created_by=actor,
+                entries=[(ACC_SUSPENSE_USDC, amount), (fee_balance(user_id), -amount)])
+
+
+def release_suspense_to_refund(conn: Any, svc: Any, *, tx_hash: str, amount: int, actor: str) -> str:
+    """Approved refund (maker-checker): suspense ↓, refunds payable ↑ — until the treasury usdSend is recorded."""
+    return post(conn, svc, key=suspense_release_key(tx_hash), kind="suspense_refund",
+                memo=f"held USDC to refund {tx_hash[:12]}", created_by=actor,
+                entries=[(ACC_SUSPENSE_USDC, amount), (ACC_REFUNDS_PENDING, -amount)])
+
+
+def settle_suspense_refund(conn: Any, svc: Any, *, tx_hash: str, refund_tx_hash: str, amount: int, actor: str) -> str:
+    """The refund usdSend left the treasury (verified on-chain): refunds payable ↓, treasury asset ↓."""
+    return post(conn, svc, key=f"suspense_refund:{tx_hash.lower()}:sent", kind="suspense_refund_sent",
+                memo=f"usdSend {refund_tx_hash}", created_by=actor,
+                entries=[(ACC_REFUNDS_PENDING, amount), (ACC_TREASURY, -amount)])
+

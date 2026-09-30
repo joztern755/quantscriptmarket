@@ -72,8 +72,8 @@ CREATE TABLE suspense_releases (
     sent_at              timestamptz,
     CONSTRAINT suspense_releases_four_eyes CHECK (checker_admin IS NULL OR checker_admin <> maker_admin),
     CONSTRAINT suspense_releases_target CHECK ((action = 'attribute') = (user_id IS NOT NULL)),
-    CONSTRAINT suspense_releases_not_self CHECK (maker_admin IS DISTINCT FROM user_id
-                                                 AND checker_admin IS DISTINCT FROM user_id),
+    CONSTRAINT suspense_releases_not_self CHECK (user_id IS NULL OR (maker_admin <> user_id
+                                                                     AND checker_admin IS DISTINCT FROM user_id)),
     CONSTRAINT suspense_releases_decided CHECK ((status = 'proposed') = (decided_at IS NULL)),
     CONSTRAINT suspense_releases_approved CHECK (status NOT IN ('approved', 'sent')
                                                  OR (checker_admin IS NOT NULL AND release_tx_id IS NOT NULL)),

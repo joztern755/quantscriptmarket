@@ -10,7 +10,7 @@
 // the exchange verifies an EIP-712 hash built from the typed fields, so JSON key order should not
 // affect validity — but check against the SDK before go-live.
 
-import { publicConfig, ApiError } from "./api.js";
+import { api, publicConfig, ApiError } from "./api.js";
 import { appConfig } from "./config.js";
 import { microToDecimal, toMicro, type MicroLike } from "./format.js";
 import { isAddress } from "./keccak.js";
@@ -251,26 +251,14 @@ function hlUrl(path: "/exchange" | "/info"): string {
   return `${appConfig().hlApiUrl}${path}`;
 }
 
-export async function postExchange(body: { action: Record<string, unknown>; nonce: number; signature: { r: string; s: string; v: number } }): Promise<HlResult> {
-  let res: Response;
-  try {
-    res = await fetch(hlUrl("/exchange"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: body.action, nonce: body.nonce, signature: body.signature }),
-      credentials: "omit",
-      referrerPolicy: "no-referrer",
-      cache: "no-store",
-    });
-  } catch {
-    throw new ApiError(0, "network_error", "Couldn't reach Hyperliquid. Your signature was not submitted.");
-  }
-  const textBody = await res.text();
-  let json: unknown = null;
-  try {
-    json = JSON.parse(textBody);
-  } catch { /* non-JSON error */ }
-  if (!res.ok) return { ok: false, status: "err", response: json ?? textBody, error: `Hyperliquid HTTP ${res.status}: ${textBody.slice(0, 200)}` };
+/** Only these user-signed actions may go through our relay (the server refuses everything else anyway). */
+export const RELAYABLE_ACTIONS: readonly string[] = ["approveAgent", "approveBuilderFee", "usdSend"];
+
+type ExchangeBody = { action: Record<string, unknown>; nonce: number; signature: { r: string; s: string; v: number } };
+
+/** Hyperliquid /exchange HTTP status + body → HlResult (shared by the direct call and the relay). */
+export function interpretExchange(status: number, textBody: string, json: unknown): HlResult {
+  if (status < 200 || status >= 300) return { ok: false, status: "err", response: json ?? textBody, error: `Hyperliquid HTTP ${status}: ${textBody.slice(0, 200)}` };
   const j = (json ?? {}) as { status?: string; response?: unknown };
   if (j.status === "ok") {
     // Some actions nest per-item errors (e.g. {"response":{"type":"default"}} is success).
@@ -281,6 +269,61 @@ export async function postExchange(body: { action: Record<string, unknown>; nonc
   }
   const err = typeof j.response === "string" ? j.response : JSON.stringify(j.response ?? textBody).slice(0, 300);
   return { ok: false, status: "err", response: j.response, error: err };
+}
+
+/**
+ * Submit a user-signed action. Direct POST to Hyperliquid /exchange first; if that fails at the NETWORK level (fetch
+ * throws: offline, DNS, or a CORS/preflight refusal — Hyperliquid's CORS for our origin is UNVERIFIED, DEPLOY §16)
+ * and the action is one of RELAYABLE_ACTIONS, the SAME body goes to our authenticated relay
+ * (POST /v1/hl/exchange-relay), which validates it against the server's expectations and forwards it unchanged.
+ * An HTTP error from Hyperliquid is an answer, not a network failure: it is never retried through the relay.
+ */
+export async function postExchange(body: ExchangeBody): Promise<HlResult> {
+  const payload: ExchangeBody = { action: body.action, nonce: body.nonce, signature: body.signature };
+  let res: Response;
+  try {
+    res = await fetch(hlUrl("/exchange"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      cache: "no-store",
+    });
+  } catch {
+    return relayExchange(payload);
+  }
+  const textBody = await res.text();
+  let json: unknown = null;
+  try {
+    json = JSON.parse(textBody);
+  } catch { /* non-JSON error */ }
+  return interpretExchange(res.status, textBody, json);
+}
+
+/** Fallback path of postExchange (exported for tests): our relay, same body, Hyperliquid's answer passed through. */
+export async function relayExchange(payload: ExchangeBody): Promise<HlResult> {
+  const kind = String(payload.action.type ?? "");
+  if (!RELAYABLE_ACTIONS.includes(kind)) throw new ApiError(0, "network_error", "Couldn't reach Hyperliquid. Your signature was not submitted.");
+  let out: { upstream_status?: number; response?: unknown };
+  try {
+    out = await api.post<{ upstream_status?: number; response?: unknown }>("/hl/exchange-relay", payload, { stepUp: false });
+  } catch (err) {
+    if (err instanceof ApiError && (err.status === 0 || err.code === "network_error")) {
+      throw new ApiError(0, "network_error", "Couldn't reach Hyperliquid or the aijalon relay. Your signature was not submitted.");
+    }
+    throw err;
+  }
+  const status = typeof out.upstream_status === "number" ? out.upstream_status : 502;
+  const json = typeof out.response === "string" ? null : out.response ?? null;
+  const text = typeof out.response === "string" ? out.response : JSON.stringify(out.response ?? "");
+  const r = interpretExchange(status, text, json);
+  // The direct POST may have reached Hyperliquid even though the browser could not read the answer (CORS): the
+  // relayed copy is then refused as a reused nonce. Say so instead of implying nothing happened.
+  if (!r.ok && /nonce/i.test(r.error ?? "")) {
+    return { ...r, error: `${r.error} — the first attempt may already have gone through; check the status before signing again.` };
+  }
+  return r;
 }
 
 export async function hlInfo<T>(body: Record<string, unknown>): Promise<T> {

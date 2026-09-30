@@ -18,6 +18,7 @@ const TABS = [
   { key: "flags", label: "Kill switches" },
   { key: "approvals", label: "Approvals" },
   { key: "payouts", label: "Payouts" },
+  { key: "held", label: "Held deposits" },
   { key: "strategies", label: "Strategies" },
   { key: "alerts", label: "Alerts" },
   { key: "recon", label: "Reconciliation" },
@@ -46,7 +47,7 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
       body,
     ),
   );
-  const fn = { flags: flagsTab, approvals: approvalsTab, payouts: payoutsTab, strategies: strategiesTab, alerts: alertsTab, recon: reconTab, users: usersTab }[tab as "flags"] ?? flagsTab;
+  const fn = { flags: flagsTab, approvals: approvalsTab, payouts: payoutsTab, held: heldTab, strategies: strategiesTab, alerts: alertsTab, recon: reconTab, users: usersTab }[tab as "flags"] ?? flagsTab;
   await fn(body, ctx);
 }
 
@@ -377,6 +378,178 @@ async function payoutsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
         note(`Two different admins must approve before sending. The final UsdSend is signed here with the treasury hardware wallet (${cfg.treasury_address ? shortAddr(cfg.treasury_address) : "not configured"}); any other connected wallet is refused.`, "info"),
         panel("Queue", table({ columns: cols, rows: open, rowKey: (p) => p.id, empty: "Queue is empty." })),
         panel("Recent", table({ columns: cols.filter((c) => c.key !== "a").concat([{ key: "tx", label: "Tx", value: (p) => (p.tx_hash ? h("span", { class: "mono" }, shortAddr(p.tx_hash, 10, 6)) : "—") }]), rows: done.slice(0, 50), rowKey: (p) => p.id, empty: "Nothing yet." })),
+      );
+    },
+  );
+}
+
+// ------------------------------------------------------------------------------------------ held deposits
+/** HeldDepositOut: a treasury USDC transfer booked to suspense:usdc_unattributed by deposits-scan. */
+interface HeldDeposit {
+  tx_hash: string;
+  held_tx_id: string;
+  amount_micro: number;
+  sender_address: string | null;
+  reason: string | null;
+  transfer_time: string | null;
+  created_at: string;
+  release_id: string | null;
+  release_status: string | null;
+  release_action: string | null;
+}
+
+/** SuspenseReleaseOut (maker-checker release of one held transfer). */
+interface SuspenseRelease {
+  id: string;
+  created_at: string;
+  tx_hash: string;
+  amount_micro: number;
+  action: "attribute" | "refund";
+  user_id: string | null;
+  sender_address: string;
+  sender_source: string;
+  evidence: string;
+  status: "proposed" | "approved" | "sent" | "rejected";
+  maker_admin: string;
+  checker_admin: string | null;
+  decision_reason: string | null;
+  refund_tx_hash: string | null;
+}
+
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const EVIDENCE = /^[\s\S]{5,1000}$/;
+
+/**
+ * RUNBOOK §13.3 — release of held USDC (maker-checker). Admin A proposes: attribute the transfer to the user whose
+ * VERIFIED wallet sent it (server-checked), or refund it to the on-chain sender. Admin B approves (never the maker) →
+ * ONE ledger posting out of suspense. A refund is then signed here with the treasury hardware wallet (usdSend to the
+ * recorded sender) and its tx hash recorded (verified on-chain by the server).
+ */
+async function heldTab(body: HTMLElement, ctx: PageContext): Promise<void> {
+  const box = h("div", { class: "stack" });
+  mount(body, box);
+  const cfg = await publicConfig();
+  if (!ctx.isCurrent()) return;
+  await loadInto(
+    box,
+    ctx,
+    async () => {
+      const [held, rel] = await Promise.all([
+        api.get<{ items: HeldDeposit[]; suspense_balance_micro: number }>("/admin/held-deposits?open=true&limit=100", { signal: ctx.signal }),
+        api.get<Page<SuspenseRelease>>("/admin/held-deposits/releases?limit=100", { signal: ctx.signal }),
+      ]);
+      return { held: held.items ?? [], balance: held.suspense_balance_micro ?? 0, releases: listOf<SuspenseRelease>(rel) };
+    },
+    ({ held, balance, releases }, reload) => {
+      const relBase = (r: SuspenseRelease): string => `/admin/held-deposits/releases/${encodeURIComponent(r.id)}`;
+      const propose = async (d: HeldDeposit, action: "attribute" | "refund"): Promise<void> => {
+        let userId: string | null = null;
+        if (action === "attribute") {
+          userId = await promptDialog({ title: "Attribute to a user", message: "The sending address must already be one of this user's VERIFIED wallets (they prove control with a signed message). The server refuses otherwise.", label: "User id (uuid)", pattern: UUID_RE });
+          if (!userId) return;
+        }
+        let sender: string | null = d.sender_address;
+        if (!sender) {
+          sender = await promptDialog({ title: "Sender address", message: "This transfer was held before senders were recorded. Give the on-chain sender (Hyperliquid explorer); the server verifies it against the transfer.", label: "Sender (0x…)", pattern: /^0x[0-9a-fA-F]{40}$/ });
+          if (!sender) return;
+        }
+        const evidence = await promptDialog({ title: action === "attribute" ? "Evidence of ownership" : "Refund reason", message: "Ops-log reference and what proves the owner (audit log, 5–1000 characters).", label: "Evidence", pattern: EVIDENCE });
+        if (!evidence) return;
+        const summary = kv([["Transfer", h("span", { class: "mono break" }, d.tx_hash)], ["Amount", fmtUsd(d.amount_micro)], ["Sender", h("span", { class: "mono break" }, sender)],
+          action === "attribute" ? ["Credit to user", h("span", { class: "mono" }, String(userId))] : ["Refund to", h("span", { class: "mono break" }, sender)]]);
+        if (!(await confirmDialog({ title: action === "attribute" ? "Propose attribution?" : "Propose refund?", message: summary, confirmLabel: "Propose" }))) return;
+        await api.post(`/admin/held-deposits/${encodeURIComponent(d.tx_hash)}/release`,
+          { action, user_id: userId, sender_address: d.sender_address ? null : sender!.toLowerCase(), evidence },
+          { signal: ctx.signal, idempotencyKey: `held-propose-${d.tx_hash.slice(2, 34)}-${action}` });
+        toast("Proposed. A second, different admin must approve.", "good");
+        reload();
+      };
+      const decide = async (r: SuspenseRelease, verb: "approve" | "reject"): Promise<void> => {
+        const what = r.action === "attribute" ? `credit ${fmtUsd(r.amount_micro)} to user ${shortAddr(r.user_id ?? "", 8, 4)}` : `refund ${fmtUsd(r.amount_micro)} to ${shortAddr(r.sender_address)}`;
+        const reason = await askReason(verb === "approve" ? `Approve: ${what}` : "Reject this proposal");
+        if (!reason) return;
+        await api.post(`${relBase(r)}/${verb}`, { reason }, { signal: ctx.signal, idempotencyKey: `held-${verb}-${r.id}` });
+        toast(verb === "approve" ? "Approved and posted to the ledger." : "Rejected.", "good");
+        reload();
+      };
+      const recordRefund = async (r: SuspenseRelease, txHash: string, timeMs: number): Promise<void> => {
+        await api.post(`${relBase(r)}/sent`, { tx_hash: txHash, time_ms: timeMs }, { signal: ctx.signal, idempotencyKey: `held-sent-${r.id}-${txHash.slice(2, 18)}` });
+        toast("Refund recorded.", "good");
+        reload();
+      };
+      const signRefund = async (r: SuspenseRelease): Promise<void> => {
+        if (!isAddress(r.sender_address)) throw new Error("Invalid refund destination.");
+        const treasury = cfg.treasury_address;
+        if (cfg._fallback || !isAddress(treasury)) throw new Error("The treasury address is not configured / config unavailable. Nothing was signed.");
+        const w = getConnectedWallet() ?? (await connectWallet());
+        if (!w) return;
+        if (w.address.toLowerCase() !== treasury.toLowerCase()) {
+          throw new Error(`The connected wallet ${shortAddr(w.address)} is not the treasury ${shortAddr(treasury)}. Connect the treasury hardware wallet; nothing was signed.`);
+        }
+        if (!(await confirmDialog({ title: "Refund USDC from treasury?", message: kv([["Amount", fmtUsd(r.amount_micro)], ["To (original sender)", h("span", { class: "mono break" }, r.sender_address)], ["From (treasury)", h("span", { class: "mono break" }, treasury)]]), confirmLabel: "Sign in wallet", danger: true }))) return;
+        const td = await api.post<{ release: SuspenseRelease; payload: { typed_data?: unknown }; exchange_url: string }>(`${relBase(r)}/typed-data`, { signature_chain_id: await w.chainIdHex() }, { signal: ctx.signal });
+        if (td.release.sender_address.toLowerCase() !== r.sender_address.toLowerCase() || td.release.amount_micro !== r.amount_micro) throw new Error("The refund changed on the server. Reload and check again.");
+        const res = await usdSend(w, { destination: r.sender_address, amountMicro: r.amount_micro, serverTypedData: td.payload.typed_data, expectDestination: r.sender_address });
+        if (!res.ok) throw new Error(`Hyperliquid rejected the transfer: ${res.error ?? "unknown error"}`);
+        const sentAt = res.nonce ?? Date.now();
+        toast("Refund submitted. Looking up the transaction hash…", "info");
+        const hash = (await findSendHash(treasury, r.sender_address, r.amount_micro, sentAt)) ??
+          (await promptDialog({ title: "Transaction hash", message: "Couldn't find the transfer automatically. Paste its hash from the Hyperliquid explorer (treasury address).", label: "Tx hash (0x…64 hex)", pattern: /^0x[0-9a-fA-F]{64}$/ }));
+        if (!hash) return;
+        await recordRefund(r, hash.toLowerCase(), sentAt);
+      };
+      const heldAction = (d: HeldDeposit): HTMLElement => {
+        if (d.release_id) return badge(`${d.release_action ?? "release"} ${d.release_status ?? ""}`.trim(), "warn");
+        return h("div", { class: "btns" },
+          button("Attribute…", { kind: "primary", onClick: () => propose(d, "attribute") }),
+          button("Refund…", { kind: "ghost", onClick: () => propose(d, "refund") }));
+      };
+      const relAction = (r: SuspenseRelease): HTMLElement => {
+        if (r.status === "proposed") {
+          if (r.maker_admin === meId(ctx)) return h("span", { class: "small muted" }, "Waiting for a second admin");
+          if (r.user_id && r.user_id === meId(ctx)) return h("span", { class: "small muted" }, "Credits you — another admin must decide");
+          return h("div", { class: "btns" },
+            button("Approve", { kind: "primary", onClick: () => decide(r, "approve") }),
+            button("Reject", { kind: "ghost", onClick: () => decide(r, "reject") }));
+        }
+        if (r.status === "approved" && r.action === "refund") {
+          return h("div", { class: "btns" },
+            button("Sign & send refund (treasury wallet)", { kind: "primary", onClick: () => signRefund(r) }),
+            button("Record tx hash…", {
+              kind: "ghost",
+              onClick: async () => {
+                const hash = await promptDialog({ title: "Record a sent refund", message: "Only if the usdSend was already submitted from the treasury.", label: "Tx hash (0x…64 hex)", pattern: /^0x[0-9a-fA-F]{64}$/ });
+                if (hash) await recordRefund(r, hash.toLowerCase(), Date.now());
+              },
+            }));
+        }
+        return h("span", { class: "small muted" }, r.refund_tx_hash ? shortAddr(r.refund_tx_hash, 10, 6) : r.status);
+      };
+      const heldCols: Column<HeldDeposit>[] = [
+        { key: "tx", label: "Transfer", value: (d) => h("span", { class: "mono", title: d.tx_hash }, shortAddr(d.tx_hash, 10, 6)), primary: true },
+        { key: "amt", label: "Amount", value: (d) => fmtUsd(d.amount_micro), align: "right", mono: true },
+        { key: "from", label: "Sender", value: (d) => (d.sender_address ? h("span", { class: "mono", title: d.sender_address }, shortAddr(d.sender_address)) : h("span", { class: "small muted" }, "not recorded")) },
+        { key: "why", label: "Held because", value: (d) => d.reason ?? "—", hideOnMobile: true },
+        { key: "at", label: "Held", value: (d) => fmtRelative(d.created_at), hideOnMobile: true },
+        { key: "a", label: "", value: heldAction },
+      ];
+      const relCols: Column<SuspenseRelease>[] = [
+        { key: "tx", label: "Transfer", value: (r) => h("span", { class: "mono", title: r.tx_hash }, shortAddr(r.tx_hash, 10, 6)), primary: true },
+        { key: "act", label: "Action", value: (r) => (r.action === "attribute" ? h("span", null, "credit user ", h("span", { class: "mono" }, shortAddr(r.user_id ?? "", 8, 4))) : h("span", null, "refund to ", h("span", { class: "mono" }, shortAddr(r.sender_address)))) },
+        { key: "amt", label: "Amount", value: (r) => fmtUsd(r.amount_micro), align: "right", mono: true },
+        { key: "st", label: "Status", value: (r) => badge(r.status, r.status === "sent" || (r.status === "approved" && r.action === "attribute") ? "good" : r.status === "rejected" ? "bad" : "warn") },
+        { key: "ev", label: "Evidence", value: (r) => h("span", { class: "small break" }, r.evidence), hideOnMobile: true },
+        { key: "mk", label: "Maker / checker", value: (r) => `${shortAddr(r.maker_admin, 8, 4)} / ${r.checker_admin ? shortAddr(r.checker_admin, 8, 4) : "—"}`, hideOnMobile: true },
+        { key: "a", label: "", value: relAction },
+      ];
+      const openRel = releases.filter((r) => r.status === "proposed" || (r.status === "approved" && r.action === "refund"));
+      const doneRel = releases.filter((r) => !openRel.includes(r));
+      mount(
+        box,
+        note(`Held USDC (suspense) ${fmtUsd(balance)} = sum of open held transfers. Release is maker-checker: one admin proposes, a different admin approves; the ledger moves only on approval. Refunds go back to the recorded on-chain sender and are signed with the treasury hardware wallet (${cfg.treasury_address ? shortAddr(cfg.treasury_address) : "not configured"}).`, "info"),
+        panel("Held transfers", table({ columns: heldCols, rows: held, rowKey: (d) => d.tx_hash, empty: "No held deposits." })),
+        panel("Releases in progress", table({ columns: relCols, rows: openRel, rowKey: (r) => r.id, empty: "Nothing pending." })),
+        panel("Recent releases", table({ columns: relCols.filter((c) => c.key !== "a").concat([{ key: "tx2", label: "Refund tx", value: (r) => (r.refund_tx_hash ? h("span", { class: "mono" }, shortAddr(r.refund_tx_hash, 10, 6)) : "—") }]), rows: doneRel.slice(0, 50), rowKey: (r) => r.id, empty: "Nothing yet." })),
       );
     },
   );

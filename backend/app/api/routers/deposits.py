@@ -4,13 +4,16 @@ Stripe: POST /deposits/stripe creates a PaymentIntent (Idempotency-Key → Strip
 returns the same PaymentIntent). Nothing is credited here: only the signed webhook credits (webhooks.py), net
 of the actual Stripe fee when fees are passed to the user (app.payments.stripe_pay).
 USDC: POST /deposits/usdc/typed-data returns the usdSend typed data (destination = OUR treasury from config,
-never from the client); the browser signs and posts it to Hyperliquid. POST /deposits/usdc/confirm only nudges a
-scan of the TREASURY's on-chain ledger for transfers from the user's verified wallets; credits are idempotent
-on the transfer hash (usdc_hl:{hash}).
+never from the client); the browser signs and posts it to Hyperliquid. POST /deposits/usdc/confirm makes NO
+Hyperliquid call (REVIEW_AUTH_API F1: a user loop could otherwise download the treasury's whole ledger on our shared
+IP and starve the executor): it records a scan request (deposit_scan_requests, lookback clamped server-side to
+max(now − 48 h, the wallet's verification time)) and returns what the deposits-scan job (every 5 min, single-flight,
+cursor) has ALREADY credited to this user since then. Credits are idempotent on the transfer hash (usdc_hl:{hash}).
 """
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -90,33 +93,34 @@ def usdc_typed_data(body: S.UsdcTypedDataIn, ctx: AuthCtx = Depends(consented_us
                               exchange_url=s.hl_api_url.rstrip("/") + "/exchange")
 
 
+#: server-side cap on how far back a confirm may ask the scan to look (REVIEW_AUTH_API F1)
+CONFIRM_MAX_LOOKBACK = timedelta(hours=48)
+
+
 @router.post("/usdc/confirm", response_model=S.UsdcConfirmOut, dependencies=[user_limit("deposit_usdc_confirm", 10, 60)])
 def usdc_confirm(body: S.UsdcConfirmIn, ctx: AuthCtx = Depends(consented_user),
                  key: str = Depends(idempotency_key), svc: Services = Depends(get_services)):
+    now = svc.now()
     with svc.db.begin() as conn:
-        wallets = [w["address"] for w in svc.store.list_wallets(conn, ctx.user_id) if w.get("verified_at")]
+        wallets = {w["address"]: w["verified_at"] for w in svc.store.list_wallets(conn, ctx.user_id)
+                   if w.get("verified_at")}
     if body.from_address:
         if body.from_address not in wallets:
             raise Forbidden("verify ownership of this wallet first")
-        wallets = [body.from_address]
+        wallets = {body.from_address: wallets[body.from_address]}
     if not wallets:
         raise Forbidden("verify a wallet first")
-    since = body.time_ms - 5 * 60_000 if body.time_ms else None
-    detections = svc.usdc.detect(senders=wallets, since_ms=since)   # on-chain, outside the DB transaction
+    # lookback = max(now − 48 h, earliest verification of the wallets in question); a client time only narrows it
+    since = max(now - CONFIRM_MAX_LOOKBACK, min(wallets.values()))
+    if body.time_ms:
+        client = datetime.fromtimestamp(body.time_ms / 1000, tz=timezone.utc) - timedelta(minutes=5)
+        since = max(since, min(client, now))
+    since = min(since, now)
 
     def work(conn: Any) -> S.UsdcConfirmOut:
-        credited: list[S.DepositOut] = []
-        for det in detections:
-            outcome = svc.usdc.credit_from_detection(det, lambda a: svc.store.user_for_verified_wallet(conn, a))
-            for alert in getattr(outcome, "alerts", []) or []:
-                svc.notifier.notify_alert(conn, alert)
-            instr = getattr(outcome, "credit", None)
-            if instr is None or instr.user_id != ctx.user_id:
-                continue
-            row = ledger_ops.apply_credit(conn, svc, instr, actor=ctx.actor)
-            credited.append(_deposit_out(row))
-            svc.audit.write(conn, actor=ctx.actor, action="deposit.usdc.credit", target=f"hl_tx:{instr.external_ref}",
-                            payload={"amount_micro": instr.amount_micro}, ip_hash=ctx.ip_hash)
+        svc.store.request_deposit_scan(conn, ctx.user_id, since=since, now=now)   # wake-up hint; no HL call here
+        credited = [_deposit_out(r) for r in svc.store.list_deposits(conn, ctx.user_id, 100, None)
+                    if r.get("method") == "usdc_hl" and r.get("status") == "credited" and r["created_at"] >= since]
         return S.UsdcConfirmOut(credited=credited, fee_balance_micro=ledger_ops.spendable(conn, svc, ctx.user_id))
 
     return run_idempotent(svc, user_id=ctx.user_id, key=key, scope="POST /deposits/usdc/confirm", payload=body,

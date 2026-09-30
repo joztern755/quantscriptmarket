@@ -962,7 +962,9 @@ def _on_charge_refunded(out: WebhookOutcome, ch: dict, prev: Mapping[str, Any], 
         credit_account=STRIPE_CLEARING,
         kind="stripe_refund",
         memo=f"Stripe refund on {ch_id} (cumulative {cum} {record.currency} minor)",
-        meta={"payment_intent": record.payment_intent_id, "cumulative_minor": cum, "event_id": out.event_id},
+        meta={"payment_intent": record.payment_intent_id, "cumulative_minor": cum, "event_id": out.event_id,
+              # REVIEW_MONEY L1: the API marks the deposits row 'reversed' once the whole top-up went back
+              "full_reversal": cum >= record.amount_minor},
     ))
     out.alerts.append(_ops_alert("stripe_refund_ops", Severity.CRITICAL, f"stripe_refund:{ch_id}:{cum}",
                                  charge=ch_id, user=record.user_id, amount_micro=debit))
@@ -1003,7 +1005,8 @@ def _on_dispute_created(out: WebhookOutcome, dp: dict, lookup: DepositLookup | N
         credit_account=STRIPE_CLEARING,
         kind="stripe_dispute",
         memo=f"Stripe dispute {dp_id} on {ch_id} ({str(dp.get('reason', ''))[:40]})",
-        meta={"payment_intent": record.payment_intent_id, "status": dp.get("status"), "event_id": out.event_id},
+        meta={"payment_intent": record.payment_intent_id, "status": dp.get("status"), "event_id": out.event_id,
+              "full_reversal": amount >= record.amount_minor},
     ))
     out.alerts.append(_ops_alert("stripe_dispute_ops", Severity.CRITICAL, f"stripe_dispute:{dp_id}", dispute=dp_id,
                                  reason=str(dp.get("reason", "unknown")), charge=ch_id, user=record.user_id, amount_micro=debit))

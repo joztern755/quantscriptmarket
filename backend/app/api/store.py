@@ -696,8 +696,12 @@ class SqlStore:
         return self._exec(conn, sql_w if kind == "withdrawal" else sql_p, h=tx_hash, tx=ledger_tx_id, id=payout_id)
 
     def tx_hash_used(self, conn: Any, tx_hash: str) -> bool:
+        """A treasury usdSend hash already recorded for a withdrawal, a payout or a held-deposit refund (0009)."""
         row = self._one(conn, """SELECT EXISTS (SELECT 1 FROM withdrawals WHERE tx_hash = :h)
-                                     OR EXISTS (SELECT 1 FROM payouts WHERE tx_hash = :h) AS used""", h=tx_hash)
+                                     OR EXISTS (SELECT 1 FROM payouts WHERE tx_hash = :h)
+                                     OR (to_regclass('public.suspense_releases') IS NOT NULL
+                                         AND EXISTS (SELECT 1 FROM suspense_releases WHERE refund_tx_hash = lower(:h)))
+                                     AS used""", h=tx_hash)
         return bool(row and row["used"])
 
     # ------------------------------------------------------------------------------------------ alerts
@@ -1009,3 +1013,128 @@ class SqlStore:
                                    WHERE strategy_id = CAST(:id AS uuid) AND status IN ('pending', 'active', 'past_due')
                                    RETURNING id""",
                           id=strategy_id)
+
+    # ------------------------------------------------------------------------------------------ held USDC (0009)
+    # suspense:usdc_unattributed release, maker-checker (app/api/suspense.py; RUNBOOK §13.3). A held transfer is the
+    # deposits-scan ledger transaction kind deposit_held, key usdc_hl:{hash}; usdc_held_deposits has its sender.
+    _HELD_SELECT = """
+        SELECT t.id AS held_tx_id, t.created_at, t.id, substr(t.idempotency_key, 9) AS tx_hash,
+               (-e.amount_micro)::bigint AS amount_micro, t.memo, h.sender_address, h.reason, h.transfer_time,
+               r.id AS release_id, r.status AS release_status, r.action AS release_action
+          FROM ledger_transactions t
+          JOIN ledger_entries e ON e.tx_id = t.id
+          JOIN ledger_accounts a ON a.id = e.account_id AND a.code = 'suspense:usdc_unattributed'
+          LEFT JOIN usdc_held_deposits h ON h.held_tx_id = t.id
+          LEFT JOIN LATERAL (SELECT x.id, x.status, x.action FROM suspense_releases x
+                              WHERE x.tx_hash = substr(t.idempotency_key, 9) AND x.status <> 'rejected'
+                              ORDER BY x.created_at DESC LIMIT 1) r ON true
+         WHERE t.kind = 'deposit_held' AND t.idempotency_key LIKE 'usdc\\_hl:%' AND e.amount_micro < 0"""
+    _RELEASE_COLS = ("id, created_at, tx_hash, held_tx_id, amount_micro, action, user_id, sender_address, sender_source, "
+                     "evidence, status, maker_admin, checker_admin, decided_at, decision_reason, release_tx_id, "
+                     "refund_tx_hash, refund_ledger_tx_id, sent_by, sent_at")
+
+    def list_held_deposits(self, conn: Any, *, open_only: bool, limit: int, cursor: Cursor) -> list[dict]:
+        """Held transfers, newest first. ``open_only``: not yet released (no release, or one still proposed)."""
+        return self._all(conn, self._HELD_SELECT + """
+           AND (NOT CAST(:open AS boolean) OR r.id IS NULL OR r.status = 'proposed')
+           AND (CAST(:cts AS timestamptz) IS NULL OR (t.created_at, t.id) < (CAST(:cts AS timestamptz), CAST(:cid AS uuid)))
+         ORDER BY t.created_at DESC, t.id DESC LIMIT :lim""", open=bool(open_only), lim=limit + 1, **_c(cursor))
+
+    def get_held_deposit(self, conn: Any, tx_hash: str) -> Optional[dict]:
+        return self._one(conn, self._HELD_SELECT + " AND t.idempotency_key = :k", k="usdc_hl:" + tx_hash.lower())
+
+    def suspense_balance(self, conn: Any) -> int:
+        """Normal (credit-side) balance of suspense:usdc_unattributed = USDC held, not yet released."""
+        row = self._one(conn, """SELECT coalesce(-sum(e.amount_micro), 0)::bigint AS s FROM ledger_entries e
+                                   JOIN ledger_accounts a ON a.id = e.account_id
+                                  WHERE a.code = 'suspense:usdc_unattributed'""")
+        return int(row["s"]) if row else 0
+
+    def insert_suspense_release(self, conn: Any, *, tx_hash: str, held_tx_id: str, amount_micro: int, action: str,
+                                user_id: Optional[str], sender_address: str, sender_source: str, evidence: str,
+                                maker: str) -> Optional[dict]:
+        """None when a live (non-rejected) release for this transfer exists (partial unique index)."""
+        return self._one(conn, f"""
+            INSERT INTO suspense_releases (tx_hash, held_tx_id, amount_micro, action, user_id, sender_address,
+                                           sender_source, evidence, maker_admin)
+            VALUES (:h, CAST(:ht AS uuid), :a, :ac, CAST(:u AS uuid), :s, :src, :ev, CAST(:m AS uuid))
+            ON CONFLICT (tx_hash) WHERE status <> 'rejected' DO NOTHING
+            RETURNING {self._RELEASE_COLS}""", h=tx_hash.lower(), ht=held_tx_id, a=int(amount_micro), ac=action,
+                         u=user_id, s=sender_address.lower(), src=sender_source, ev=evidence, m=maker)
+
+    def get_suspense_release(self, conn: Any, release_id: str, *, for_update: bool = False) -> Optional[dict]:
+        sql = f"SELECT {self._RELEASE_COLS} FROM suspense_releases WHERE id = CAST(:id AS uuid)"
+        return self._one(conn, sql + (" FOR UPDATE" if for_update else ""), id=release_id)
+
+    def list_suspense_releases(self, conn: Any, status: Optional[str], limit: int, cursor: Cursor) -> list[dict]:
+        return self._all(conn, f"""
+            SELECT {self._RELEASE_COLS} FROM suspense_releases
+             WHERE (CAST(:st AS text) IS NULL OR status = CAST(:st AS text))
+               AND (CAST(:cts AS timestamptz) IS NULL OR (created_at, id) < (CAST(:cts AS timestamptz), CAST(:cid AS uuid)))
+             ORDER BY created_at DESC, id DESC LIMIT :lim""", st=status, lim=limit + 1, **_c(cursor))
+
+    def approve_suspense_release(self, conn: Any, release_id: str, *, checker: str, now: datetime, reason: str,
+                                 release_tx_id: str) -> Optional[dict]:
+        """None unless still proposed and checker ≠ maker (four-eyes; the DB CHECK enforces it too)."""
+        return self._one(conn, f"""
+            UPDATE suspense_releases SET status = 'approved', checker_admin = CAST(:c AS uuid), decided_at = :t,
+                   decision_reason = :r, release_tx_id = CAST(:tx AS uuid)
+             WHERE id = CAST(:id AS uuid) AND status = 'proposed' AND maker_admin <> CAST(:c AS uuid)
+            RETURNING {self._RELEASE_COLS}""", c=checker, t=now, r=reason, tx=release_tx_id, id=release_id)
+
+    def reject_suspense_release(self, conn: Any, release_id: str, *, checker: str, now: datetime,
+                                reason: str) -> Optional[dict]:
+        return self._one(conn, f"""
+            UPDATE suspense_releases SET status = 'rejected', checker_admin = CAST(:c AS uuid), decided_at = :t,
+                   decision_reason = :r
+             WHERE id = CAST(:id AS uuid) AND status = 'proposed' AND maker_admin <> CAST(:c AS uuid)
+            RETURNING {self._RELEASE_COLS}""", c=checker, t=now, r=reason, id=release_id)
+
+    def mark_suspense_refund_sent(self, conn: Any, release_id: str, *, refund_tx_hash: str, ledger_tx_id: str,
+                                  admin: str, now: datetime) -> Optional[dict]:
+        return self._one(conn, f"""
+            UPDATE suspense_releases SET status = 'sent', refund_tx_hash = :h, refund_ledger_tx_id = CAST(:tx AS uuid),
+                   sent_by = CAST(:a AS uuid), sent_at = :t
+             WHERE id = CAST(:id AS uuid) AND status = 'approved' AND action = 'refund'
+            RETURNING {self._RELEASE_COLS}""", h=refund_tx_hash.lower(), tx=ledger_tx_id, a=admin, t=now, id=release_id)
+
+
+    # ------------------------------------------------------------------------------------------ trusted dexes (0012)
+    # SPEC §12 / REVIEW_TRADING_KEYS F1: SQL lives in app.strategies.dexes (shared with the executor + signal ingest).
+    def trusted_dexes(self, conn: Any) -> frozenset[str]:
+        """Active builder dexes plus the validator dex ''. Raises on DB errors (callers fail closed)."""
+        from app.strategies.dexes import load_trusted
+        return load_trusted(self._runner(conn))
+
+    def list_trusted_dexes(self, conn: Any) -> list[dict]:
+        from app.strategies.dexes import list_dexes
+        return list_dexes(self._runner(conn))
+
+    def add_trusted_dex(self, conn: Any, dex: str, *, by: str, reason: str) -> Optional[dict]:
+        from app.strategies.dexes import add_dex
+        return add_dex(self._runner(conn), dex, by=by, reason=reason)
+
+    def remove_trusted_dex(self, conn: Any, dex: str, *, by: str, reason: str) -> Optional[dict]:
+        from app.strategies.dexes import remove_dex
+        return remove_dex(self._runner(conn), dex, by=by, reason=reason)
+
+    def strategies_on_dex(self, conn: Any, dex: str) -> list[dict]:
+        """Strategies (any status but delisted) with at least one market on builder dex ``dex``."""
+        return self._all(conn, """
+            SELECT st.id, st.slug, st.status::text AS status, st.markets FROM strategies st
+             WHERE st.status::text <> 'delisted'
+               AND EXISTS (SELECT 1 FROM unnest(st.markets) AS m(coin)
+                            WHERE position(':' in m.coin) > 0 AND split_part(m.coin, ':', 1) = CAST(:d AS text))
+             ORDER BY st.slug""", d=dex)
+
+    # ------------------------------------------------------------------------------------------ deposit scan requests
+    def request_deposit_scan(self, conn: Any, user_id: str, *, since: datetime, now: datetime) -> None:
+        """AUTH F1: POST /deposits/usdc/confirm records a wake-up hint instead of scanning Hyperliquid inline."""
+        self._exec(conn, """
+            INSERT INTO deposit_scan_requests (user_id, requested_at, since, served_at)
+            VALUES (CAST(:u AS uuid), CAST(:t AS timestamptz), CAST(:s AS timestamptz), NULL)
+            ON CONFLICT (user_id) DO UPDATE SET requested_at = EXCLUDED.requested_at,
+                   since = LEAST(CASE WHEN deposit_scan_requests.served_at IS NULL THEN deposit_scan_requests.since
+                                      ELSE EXCLUDED.since END, EXCLUDED.since),
+                   served_at = NULL
+            RETURNING user_id""", u=user_id, t=now, s=since)

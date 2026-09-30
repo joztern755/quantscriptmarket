@@ -220,8 +220,14 @@ class LedgerAdapter:
 # Keys (ENCRYPT ONLY — the API process never builds a decryptor)
 # =============================================================================================================
 class _Encryptor:
-    def __init__(self, settings: Settings) -> None:
+    """Lazy encrypt-only envelope. ``factory``: ``make_encryptor`` (agent-keys KMS key) or ``make_code_encryptor``
+    (the DEDICATED creator-code KMS key, REVIEW_TRADING_KEYS F2) — never one instance for both secret classes."""
+
+    def __init__(self, settings: Settings, factory: str = "make_encryptor") -> None:
+        if factory not in ("make_encryptor", "make_code_encryptor"):
+            raise ValueError("unknown encryptor factory")
         self._settings = settings
+        self._factory = factory
         self._enc: Any = None
         self._lock = threading.Lock()
 
@@ -229,7 +235,7 @@ class _Encryptor:
         if self._enc is None:
             with self._lock:
                 if self._enc is None:
-                    self._enc = _require("app.security.kms").make_encryptor(self._settings)
+                    self._enc = getattr(_require("app.security.kms"), self._factory)(self._settings)
         return self._enc
 
 
@@ -244,6 +250,8 @@ class AgentKeyAdapter:
 
 
 class CodeVaultAdapter:
+    """Creator strategy code, sealed under the creator-code KMS key (``_Encryptor(s, "make_code_encryptor")``)."""
+
     def __init__(self, enc: _Encryptor) -> None:
         self._enc = enc
 
@@ -278,19 +286,44 @@ class TypedDataAdapter:
         return req.public_view()
 
 
-class HlInfoAdapter:
-    """Read-only Hyperliquid /info via app.hl.info.InfoClient (retries, size caps, shape checks live there)."""
+#: longest an API request waits for room in the shared Hyperliquid budget before failing (503) — user requests
+#: never queue behind a minute window the way data jobs do
+API_HL_MAX_WAIT_SECONDS = 2.0
 
-    def __init__(self, settings: Settings) -> None:
+
+class HlInfoAdapter:
+    """Read-only Hyperliquid /info via app.hl.info.InfoClient (retries, size caps, shape checks live there).
+
+    Every call (each HTTP attempt, retries included) is charged to the shared per-egress-IP weight budget in Postgres
+    (``app.hl.budget``, table hl_rate_budget) in the low-priority ``jobs`` pool with a short wait
+    (``API_HL_MAX_WAIT_SECONDS``): when the budget is spent the request fails with ``HlBudgetExhausted`` (503) instead
+    of pushing the IP into Hyperliquid 429s (REVIEW_AUTH_API F1). The API has its OWN egress IP (``HL_EGRESS_KEY=api``,
+    infra/gcp NAT split), so user-triggered reads can never spend the executor's budget. Without a database handle
+    (tests) or with ``HL_SHARED_BUDGET=false`` no accounting is done."""
+
+    def __init__(self, settings: Settings, db: Any = None) -> None:
         self._url = settings.hl_api_url
+        self._settings = settings
+        self._db = db
         self._client: Any = None
         self._lock = threading.Lock()
+
+    def _rate_hook(self) -> Any:
+        limits = getattr(self._settings, "hl_limits", None)
+        if self._db is None or limits is None or not getattr(limits, "shared_budget", False):
+            return None
+        budget = _mod("app.hl.budget")
+        if budget is None:
+            return None
+        return budget.BudgetHook(budget.HlRateBudget(self._db, limits), limits, default_pool=budget.POOL_JOBS,
+                                 max_wait_seconds=API_HL_MAX_WAIT_SECONDS)
 
     def client(self) -> Any:
         if self._client is None:
             with self._lock:
                 if self._client is None:
-                    self._client = _require("app.hl.info").InfoClient(self._url, timeout=8.0, max_retries=2)
+                    self._client = _require("app.hl.info").InfoClient(self._url, timeout=8.0, max_retries=2,
+                                                                      rate_hook=self._rate_hook())
         return self._client
 
     def extra_agents(self, user: str) -> list[dict[str, Any]]:
@@ -333,6 +366,11 @@ class HlInfoAdapter:
             except (TypeError, ValueError):
                 continue
         return False
+
+    def relay_exchange(self, body: dict[str, Any]) -> tuple[int, Any]:
+        """Forward an already-VALIDATED user-signed action unchanged to Hyperliquid /exchange (app.hl.relay; the
+        route validates first). Returns (upstream HTTP status, parsed body)."""
+        return _require("app.hl.relay").forward_exchange(self._url.rstrip("/") + "/exchange", body)
 
     def unknown_coins(self, coins: list[str]) -> list[str]:
         mk = _require("app.hl.markets")
@@ -392,10 +430,16 @@ class UsdcAdapter:
         out.update({"source": req.source, "destination": req.destination})
         return out
 
+    #: never scan the treasury ledger further back than this from an API process (REVIEW_AUTH_API F1)
+    MAX_LOOKBACK_MS = 48 * 3600 * 1000
+
     def detect(self, *, senders: list[str], since_ms: Optional[int]) -> list[Any]:
         """USDC transfers from `senders` (the user's verified wallets) into the treasury, from the TREASURY's
-        on-chain ledger (app.hl.deposits.detect_deposits) — never from anything the client says."""
-        start = since_ms if since_ms else int((time.time() - 2 * 86400) * 1000)
+        on-chain ledger (app.hl.deposits.detect_deposits) — never from anything the client says. The lookback is
+        clamped to 48 h (a client-supplied time can never make us download the treasury's whole history). NOT used
+        by POST /deposits/usdc/confirm any more (that only records a scan request; deposits-scan books transfers)."""
+        floor = int(time.time() * 1000) - self.MAX_LOOKBACK_MS
+        start = max(int(since_ms), floor) if since_ms else floor
         updates = self._hl.ledger_updates(self._s.treasury_address, start)
         scan = _require("app.hl.deposits").detect_deposits(
             updates, treasury_address=self._s.treasury_address, verified_wallets=senders, since_ms=start)
@@ -736,9 +780,10 @@ def build_services(settings: Optional[Settings] = None) -> Services:
     cfg = api_config(s)
     from app.api.store import SqlStore  # imports SQLAlchemy; kept lazy so tests with fakes need no DB libs
     store = SqlStore()
-    enc = _Encryptor(s)
-    hl = HlInfoAdapter(s)
+    enc = _Encryptor(s)                                   # agent-keys KMS key (agent private keys only)
+    code_enc = _Encryptor(s, "make_code_encryptor")      # creator-code KMS key (creator strategy code only)
     db = SqlDatabase(s)
+    hl = HlInfoAdapter(s, db)
     return Services(
         settings=s,
         db=db,
@@ -753,7 +798,7 @@ def build_services(settings: Optional[Settings] = None) -> Services:
         usdc=UsdcAdapter(s, hl),
         notifier=NotifierAdapter(s, store),
         sandbox=SandboxAdapter(s, cfg, db),
-        code_vault=CodeVaultAdapter(enc),
+        code_vault=CodeVaultAdapter(code_enc),
         kyc=KycAdapter(),
         jobs=JobsAdapter(),
         ratelimit=RateLimitAdapter(),

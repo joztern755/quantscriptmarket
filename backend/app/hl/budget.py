@@ -19,6 +19,19 @@ charges the newer window (never resets it backwards).
 
 Failure policy: if the budget table cannot be reached the call is ALLOWED (fail open, logged at most once a minute):
 the budget is a courtesy limiter; Hyperliquid's own 429 + ``InfoClient`` backoff remain the hard stop.
+
+Interface (how to budget a new caller — keep to these four entry points):
+* ``budget = HlRateBudget(db, settings.hl_limits)`` — ``db``: a ``DatabasePort`` (``begin()``) or a ``SqlRunner``.
+* Wrap an ``InfoClient``: ``InfoClient(url, rate_hook=BudgetHook(budget, settings.hl_limits, default_pool=POOL_JOBS))``
+  — every request is then charged automatically (``budget`` may also be a zero-arg callable returning the budget or
+  None, for late binding). A refused JOBS-pool request raises ``HlBudgetExhausted`` (an ``ExternalServiceError``)
+  after waiting up to ``HlLimits.max_wait_seconds``; the TICK pool is never refused.
+* Per-block pool override: ``with budget_pool(POOL_JOBS): ...`` (contextvar; same thread / task only).
+* Manual charging: ``budget.try_acquire(weight, pool, force=False) -> Charge(granted=…)`` and
+  ``budget.acquire_wait(weight, pool, deadline=<time.monotonic() value>) -> bool``; weights from
+  ``settings.hl_limits.weight(request_type)`` / ``.extra_weight(request_type, n_items)``.
+The data jobs use it through ``app.jobs_data.hl.WeightPacer(shared=budget)`` / ``make_pacer``; the executor through
+``Runtime.info`` (``app.execution.jobs``).
 """
 from __future__ import annotations
 

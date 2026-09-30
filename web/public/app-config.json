@@ -9,8 +9,29 @@
     "projectId": "REPLACE_ME",
     "appId": "REPLACE_ME"
   },
+  "trust": {
+    "_comment": "SIGNING TRUST ANCHORS (docs/SECURITY.md H1, DEPLOY.md \u00a712). Change ONLY by a reviewed PR after the key ceremony; the web app refuses to sign anything that disagrees with these values, and refuses entirely while a value is REPLACE_ME.",
+    "hlChain": "Mainnet",
+    "agentName": "aijalon",
+    "builderAddress": "REPLACE_ME",
+    "treasuryAddress": "REPLACE_ME",
+    "maxBuilderFeeTenthsBp": 100,
+    "agentAttestPublicKeySpki": "REPLACE_ME",
+    "kycRedirectHosts": [
+      "in.sumsub.com"
+    ]
+  },
   "fallback": {
-    "restricted_jurisdictions": ["US", "CU", "IR", "KP", "SY", "RU", "BY", "MM"],
+    "restricted_jurisdictions": [
+      "US",
+      "CU",
+      "IR",
+      "KP",
+      "SY",
+      "RU",
+      "BY",
+      "MM"
+    ],
     "legal_versions": {
       "terms": "draft-2026-09-30",
       "risk": "draft-2026-09-30",

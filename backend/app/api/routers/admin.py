@@ -10,6 +10,13 @@ Maker-checker policy (SPEC §5.6 "all admin actions maker-checker"):
   * Creator KYC (owner decision 30 Sep 2026): ONE admin decides, step-up + audit-logged, never via admin_changes.
     Manual provider: pending/rejected → approved. Sumsub: only a provider GREEN (``provider_approved``) can be
     confirmed → approved. Rejection is immediate. An admin cannot approve their own KYC.
+Held USDC deposits (suspense:usdc_unattributed, RUNBOOK §13.3): maker-checker release (/admin/held-deposits…;
+logic in app/api/suspense.py) — attribute to the user whose verified wallet sent it, or refund to the sender with a
+hardware-wallet usdSend recorded like a payout. Refunds are NOT gated by PAYOUTS_ENABLED (it returns the sender's own
+money; still two admins + hardware wallet + on-chain verification).
+Trusted builder dexes (SPEC §12, owner 30 Sep 2026; REVIEW_TRADING_KEYS F1): ONE admin adds a dex (step-up,
+audit-logged, ops alert); removal is immediate (protective) and pauses new entries on the dex's markets from the next
+executor tick (exits keep running). Listing proposals and approvals re-check every market against the allowlist.
 Payout execution: after approved_2 an admin requests the usdSend typed data, signs it in the browser with the
 hardware treasury wallet, posts it to Hyperliquid, then records the tx hash here; we verify it on-chain before
 settling the ledger hold against treasury:hl_usdc.
@@ -30,12 +37,14 @@ from app.api.deps import (
     admin_user,
     decode_cursor_or_422,
     get_services,
+    idempotency_key,
     next_cursor,
     require_payouts_enabled,
+    run_idempotent,
     user_limit,
 )
 from app.api.routers.alerts import alert_out
-from app.api.routers.creator import history_days_for, version_out
+from app.api.routers.creator import history_days_for, require_trusted_markets, version_out
 from app.api.validation import micro_to_usd_string
 from app.errors import Conflict, Forbidden, NotFound, ValidationFailed
 
@@ -141,6 +150,14 @@ def list_changes(status: Optional[Literal["pending", "approved", "rejected"]] = 
     return S.Page[S.ChangeOut](items=[_change_out(r) for r in rows], next_cursor=nxt)
 
 
+def _require_trusted_or_conflict(conn: Any, svc: Services, markets: list[str]) -> None:
+    """SPEC §12: a strategy version is listed only when every market is a validator perp or on a trusted dex."""
+    try:
+        require_trusted_markets(conn, svc, markets, what="strategy markets")
+    except ValidationFailed as e:
+        raise Conflict(e.message, **(e.details if isinstance(e.details, dict) else {})) from None
+
+
 def _apply_change(conn: Any, svc: Services, ctx: AuthCtx, ch: dict) -> None:
     kind, payload = ch["kind"], ch.get("payload") or {}
     if kind == "strategy_list":
@@ -151,6 +168,7 @@ def _apply_change(conn: Any, svc: Services, ctx: AuthCtx, ch: dict) -> None:
             raise Conflict("strategy or version no longer exists")
         if st["price_monthly_micro"] is None or st["profit_share_bps"] is None:
             raise Conflict("set a price and profit share before listing")
+        _require_trusted_or_conflict(conn, svc, list(ver.get("markets") or st["markets"] or []))
         if not st["in_house"]:
             kyc = svc.store.get_kyc(conn, str(st["owner_user_id"]))
             if not kyc or kyc["status"] != "approved":
@@ -374,6 +392,7 @@ def list_strategy(strategy_id: UUID, body: S.StrategyListIn, ctx: AuthCtx = Depe
             raise NotFound("strategy or version not found")
         if st["status"] == "delisted":
             raise Conflict("delisted strategies cannot be relisted")
+        _require_trusted_or_conflict(conn, svc, list(ver.get("markets") or st["markets"] or []))
         return _propose(conn, svc, ctx, kind="strategy_list", target=f"strategy:{strategy_id}",
                         payload={"version_id": str(body.version_id), "version": ver["version"]}, reason=body.reason)
 
@@ -539,3 +558,181 @@ def reconciliation(ctx: AuthCtx = Depends(admin_user), svc: Services = Depends(g
         except InputError:
             generated = None
     return S.ReconciliationOut(report=report, generated_at=generated)
+
+
+# ============================================================================================ held USDC deposits
+# suspense:usdc_unattributed release, maker-checker (app/api/suspense.py; RUNBOOK §13.3). Every POST: step-up +
+# Idempotency-Key (replays return the first response) + audit log; the proposing admin can never decide.
+def _release_out(r: dict) -> S.SuspenseReleaseOut:
+    from app.api import suspense
+    return S.SuspenseReleaseOut(**suspense.release_out(r))
+
+
+@router.get("/held-deposits", response_model=S.HeldDepositsOut)
+def list_held_deposits(open: bool = Query(True), limit: int = Query(50, ge=1, le=100),
+                       cursor: Optional[str] = Query(None, max_length=200), ctx: AuthCtx = Depends(admin_user),
+                       svc: Services = Depends(get_services)) -> S.HeldDepositsOut:
+    from app.api import suspense
+    cur = decode_cursor_or_422(cursor)
+    with svc.db.begin() as conn:
+        rows, nxt = next_cursor(suspense.list_held(conn, svc, open_only=open, limit=limit, cursor=cur), limit)
+        balance = svc.store.suspense_balance(conn)
+    return S.HeldDepositsOut(items=[S.HeldDepositOut(**suspense.held_out(r)) for r in rows], next_cursor=nxt,
+                             suspense_balance_micro=balance)
+
+
+@router.get("/held-deposits/releases", response_model=S.Page[S.SuspenseReleaseOut])
+def list_suspense_releases(status: Optional[Literal["proposed", "approved", "sent", "rejected"]] = Query(None),
+                           limit: int = Query(50, ge=1, le=100), cursor: Optional[str] = Query(None, max_length=200),
+                           ctx: AuthCtx = Depends(admin_user),
+                           svc: Services = Depends(get_services)) -> S.Page[S.SuspenseReleaseOut]:
+    cur = decode_cursor_or_422(cursor)
+    with svc.db.begin() as conn:
+        rows, nxt = next_cursor(svc.store.list_suspense_releases(conn, status, limit, cur), limit)
+    return S.Page[S.SuspenseReleaseOut](items=[_release_out(r) for r in rows], next_cursor=nxt)
+
+
+@router.post("/held-deposits/{tx_hash}/release", response_model=S.SuspenseReleaseOut, status_code=201,
+             dependencies=[user_limit("admin_suspense", 30, 3600)])
+def propose_suspense_release(body: S.SuspenseReleaseIn, tx_hash: str = Path(..., pattern=r"^0x[0-9a-fA-F]{64}$"),
+                             ctx: AuthCtx = Depends(admin_step_up), key: str = Depends(idempotency_key),
+                             svc: Services = Depends(get_services)):
+    """Maker (admin A): attribute the held transfer to the user whose VERIFIED wallet sent it, or refund it to the
+    sender. Transfers held before the sender was recorded: ``sender_address`` is verified on-chain here first."""
+    from app.api import suspense
+    h = suspense.norm_hash(tx_hash)
+    verified: Optional[str] = None
+    with svc.db.begin() as conn:
+        held = suspense.held_or_404(conn, svc, h)
+    if held.get("sender_address") is None and body.sender_address:
+        treasury = (svc.settings.treasury_address or "").lower()
+        if treasury and svc.hl.find_usd_send(sender=body.sender_address, destination=treasury,
+                                             amount_micro=int(held["amount_micro"]), tx_hash=h):
+            verified = body.sender_address.lower()
+
+    def work(conn: Any) -> S.SuspenseReleaseOut:
+        return _release_out(suspense.propose(
+            conn, svc, ctx, tx_hash=h, action=body.action, user_id=str(body.user_id) if body.user_id else None,
+            sender_address=body.sender_address, evidence=body.evidence, onchain_verified_sender=verified))
+
+    return run_idempotent(svc, user_id=ctx.user_id, key=key, scope=f"POST /admin/held-deposits/{h}/release",
+                          payload=body, work=work, status_code=201)
+
+
+@router.post("/held-deposits/releases/{release_id}/approve", response_model=S.SuspenseReleaseOut,
+             dependencies=[user_limit("admin_suspense", 30, 3600)])
+def approve_suspense_release(release_id: UUID, body: S.DecisionIn, ctx: AuthCtx = Depends(admin_step_up),
+                             key: str = Depends(idempotency_key), svc: Services = Depends(get_services)):
+    """Checker (admin B ≠ A): ONE ledger transaction out of suspense (key suspense_release:{hash})."""
+    from app.api import suspense
+
+    def work(conn: Any) -> S.SuspenseReleaseOut:
+        return _release_out(suspense.approve(conn, svc, ctx, release_id=str(release_id), reason=body.reason))
+
+    return run_idempotent(svc, user_id=ctx.user_id, key=key,
+                          scope=f"POST /admin/held-deposits/releases/{release_id}/approve", payload=body, work=work)
+
+
+@router.post("/held-deposits/releases/{release_id}/reject", response_model=S.SuspenseReleaseOut,
+             dependencies=[user_limit("admin_suspense", 30, 3600)])
+def reject_suspense_release(release_id: UUID, body: S.DecisionIn, ctx: AuthCtx = Depends(admin_step_up),
+                            key: str = Depends(idempotency_key), svc: Services = Depends(get_services)):
+    from app.api import suspense
+
+    def work(conn: Any) -> S.SuspenseReleaseOut:
+        return _release_out(suspense.reject(conn, svc, ctx, release_id=str(release_id), reason=body.reason))
+
+    return run_idempotent(svc, user_id=ctx.user_id, key=key,
+                          scope=f"POST /admin/held-deposits/releases/{release_id}/reject", payload=body, work=work)
+
+
+@router.post("/held-deposits/releases/{release_id}/typed-data", response_model=S.SuspenseRefundTypedDataOut)
+def suspense_refund_typed_data(release_id: UUID, body: S.PayoutTypedDataIn, ctx: AuthCtx = Depends(admin_step_up),
+                               svc: Services = Depends(get_services)) -> S.SuspenseRefundTypedDataOut:
+    """usdSend typed data for an APPROVED refund (destination = the recorded on-chain sender; hardware wallet)."""
+    from app.api import suspense
+    with svc.db.begin() as conn:
+        rel, payload = suspense.refund_typed_data(conn, svc, ctx, release_id=str(release_id),
+                                                  signature_chain_id=body.signature_chain_id)
+    return S.SuspenseRefundTypedDataOut(release=_release_out(rel), payload=payload,
+                                        exchange_url=svc.settings.hl_api_url.rstrip("/") + "/exchange")
+
+
+@router.post("/held-deposits/releases/{release_id}/sent", response_model=S.SuspenseReleaseOut,
+             dependencies=[user_limit("admin_suspense", 30, 3600)])
+def suspense_refund_sent(release_id: UUID, body: S.PayoutSentIn, ctx: AuthCtx = Depends(admin_step_up),
+                         key: str = Depends(idempotency_key), svc: Services = Depends(get_services)):
+    """Record the refund usdSend: verified on-chain (treasury → sender, this hash, exact amount) before posting."""
+    from app.api import suspense
+    tx_hash = body.tx_hash.lower()
+    with svc.db.begin() as conn:
+        rel = suspense.check_refund_sendable(conn, svc, release_id=str(release_id), refund_tx_hash=tx_hash)
+    if not svc.hl.find_usd_send(sender=svc.settings.treasury_address, destination=str(rel["sender_address"]),
+                                amount_micro=int(rel["amount_micro"]), tx_hash=tx_hash):
+        raise ValidationFailed("transfer not found on Hyperliquid for this amount and destination (yet)")
+
+    def work(conn: Any) -> S.SuspenseReleaseOut:
+        return _release_out(suspense.record_refund_sent(conn, svc, ctx, release_id=str(release_id),
+                                                        refund_tx_hash=tx_hash, time_ms=body.time_ms))
+
+    return run_idempotent(svc, user_id=ctx.user_id, key=key,
+                          scope=f"POST /admin/held-deposits/releases/{release_id}/sent", payload=body, work=work)
+
+
+# ============================================================================================ trusted builder dexes
+# SPEC §12 (owner, 30 Sep 2026) / REVIEW_TRADING_KEYS F1. SQL + policy: app/strategies/dexes.py (shared with the
+# executor's pre-trade guard and the signal ingest, which re-read the table every tick / run).
+def _dex_out(r: dict) -> S.TrustedDexOut:
+    return S.TrustedDexOut(dex=r["dex"], active=r["removed_at"] is None, added_by=r["added_by"], reason=r["reason"],
+                           created_at=r["created_at"], removed_at=r.get("removed_at"), removed_by=r.get("removed_by"),
+                           removal_reason=r.get("removal_reason"))
+
+
+@router.get("/dexes", response_model=list[S.TrustedDexOut])
+def list_dexes(ctx: AuthCtx = Depends(admin_user), svc: Services = Depends(get_services)) -> list[S.TrustedDexOut]:
+    with svc.db.begin() as conn:
+        return [_dex_out(r) for r in svc.store.list_trusted_dexes(conn)]
+
+
+@router.post("/dexes", response_model=S.TrustedDexOut, status_code=201,
+             dependencies=[user_limit("admin_dexes", 20, 3600)])
+def add_dex(body: S.TrustedDexIn, ctx: AuthCtx = Depends(admin_step_up),
+            svc: Services = Depends(get_services)) -> S.TrustedDexOut:
+    """ONE admin approves a builder dex (owner decision): strategies may then list and trade its markets."""
+    from app.strategies.dexes import normalize_dex
+    dex = normalize_dex(body.dex)
+    with svc.db.begin() as conn:
+        row = svc.store.add_trusted_dex(conn, dex, by=ctx.actor, reason=body.reason)
+        if row is None:
+            raise Conflict("this dex is already trusted", dex=dex)
+        svc.notifier.notify(conn, user_id=None, severity="warn", kind="trusted_dex_added",
+                            payload={"dex": dex, "by": ctx.user_id, "reason": body.reason})
+        svc.audit.write(conn, actor=ctx.actor, action="dex.trust.add", target=f"dex:{dex}",
+                        payload={"reason": body.reason}, ip_hash=ctx.ip_hash)
+    return _dex_out(row)
+
+
+@router.post("/dexes/{dex}/remove", response_model=S.TrustedDexRemoveOut,
+             dependencies=[user_limit("admin_dexes", 20, 3600)])
+def remove_dex(body: S.DecisionIn, dex: str = Path(..., max_length=20), ctx: AuthCtx = Depends(admin_step_up),
+               svc: Services = Depends(get_services)) -> S.TrustedDexRemoveOut:
+    """Protective, immediate, one admin: new entries on this dex's markets stop from the next executor tick (exits
+    continue); creators can no longer create, upload, or list strategies on it."""
+    from app.strategies.dexes import normalize_dex
+    if dex == "" or dex.strip() == "":
+        raise ValidationFailed("the validator dex cannot be removed")
+    d = normalize_dex(dex)
+    with svc.db.begin() as conn:
+        row = svc.store.remove_trusted_dex(conn, d, by=ctx.actor, reason=body.reason)
+        if row is None:
+            raise NotFound("no active trusted dex with this name", dex=d)
+        affected = svc.store.strategies_on_dex(conn, d)
+        markets = sorted({m for st in affected for m in (st.get("markets") or []) if m.split(":", 1)[0] == d})
+        svc.notifier.notify(conn, user_id=None, severity="critical", kind="trusted_dex_removed",
+                            payload={"dex": d, "by": ctx.user_id, "reason": body.reason,
+                                     "strategies": [st["slug"] for st in affected][:50], "markets": markets[:50]})
+        svc.audit.write(conn, actor=ctx.actor, action="dex.trust.remove", target=f"dex:{d}",
+                        payload={"reason": body.reason, "strategies": [str(st["id"]) for st in affected][:100],
+                                 "markets_entries_paused": markets[:100]}, ip_hash=ctx.ip_hash)
+    return S.TrustedDexRemoveOut(dex=_dex_out(row), affected_strategies=[st["slug"] for st in affected],
+                                 markets_entries_paused=markets)

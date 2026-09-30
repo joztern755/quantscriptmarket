@@ -253,6 +253,7 @@ class HlInfoPort(Protocol):
     def master_of(self, address: str) -> Optional[str]: ...        # master of a sub-account, else None
     def find_usd_send(self, *, sender: str, destination: str, amount_micro: int, tx_hash: str) -> bool: ...
     def unknown_coins(self, coins: list[str]) -> list[str]: ...
+    def relay_exchange(self, body: dict[str, Any]) -> tuple[int, Any]: ...   # validated user-signed action only
 
 
 class StripePort(Protocol):

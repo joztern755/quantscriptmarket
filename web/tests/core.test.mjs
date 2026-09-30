@@ -153,5 +153,62 @@ eq("validate usdSend ok", hl.validateServerTypedData("usdSend", u.typedData, exp
 throws("validate usdSend amount", () => hl.validateServerTypedData("usdSend", u.typedData, { ...expU, amountMicro: 25_000_000 }));
 throws("validate usdSend dest", () => hl.validateServerTypedData("usdSend", u.typedData, { ...expU, destination: "0x4444444444444444444444444444444444444444" }));
 
+// ---- /exchange: direct POST first, relay fallback on network/CORS failure (user-signed actions only)
+{
+  const apiMod = await imp("api.js");
+  apiMod.setApiHooks({ getIdToken: async () => "test-token" });
+  const realFetch = globalThis.fetch;
+  const calls = [];
+  const jsonRes = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  let mode = "direct-ok";
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    if (String(url).endsWith("/exchange")) {
+      if (mode === "direct-ok") return jsonRes(200, { status: "ok", response: { type: "default" } });
+      if (mode === "direct-422") return new Response("Failed to deserialize the JSON body", { status: 422 });
+      throw new TypeError("Failed to fetch");               // CORS / network: no response at all
+    }
+    if (String(url).endsWith("/v1/hl/exchange-relay")) {
+      if (mode === "relay-down") throw new TypeError("Failed to fetch");
+      if (mode === "relay-nonce") return jsonRes(200, { upstream_status: 200, response: { status: "err", response: "Invalid nonce: duplicate nonce" } });
+      return jsonRes(200, { upstream_status: 200, response: { status: "ok", response: { type: "default" } } });
+    }
+    throw new Error("unexpected fetch " + url);
+  };
+  const body = { action: u.action, nonce: u.nonce, signature: { r: "0x" + "11".repeat(32), s: "0x" + "22".repeat(32), v: 27 } };
+  try {
+    let r = await hl.postExchange(body);
+    eq("direct ok", [r.ok, calls.length, calls[0].url], [true, 1, "https://api.hyperliquid.xyz/exchange"]);
+    eq("direct omits credentials", calls[0].init.credentials, "omit");
+
+    calls.length = 0; mode = "direct-422";
+    r = await hl.postExchange(body);
+    eq("HTTP error is an answer: no relay", [r.ok, calls.length], [false, 1]);
+
+    calls.length = 0; mode = "cors";
+    r = await hl.postExchange(body);
+    eq("network failure → relay ok", [r.ok, calls.length, calls[1].url], [true, 2, "https://api.aijalon.trade/v1/hl/exchange-relay"]);
+    eq("relay gets the SAME body", JSON.parse(calls[1].init.body), JSON.parse(calls[0].init.body));
+    eq("relay is authenticated", calls[1].init.headers.Authorization, "Bearer test-token");
+
+    calls.length = 0; mode = "relay-nonce";
+    r = await hl.postExchange(body);
+    eq("relayed duplicate nonce explained", [r.ok, /may already have gone through/.test(r.error)], [false, true]);
+
+    calls.length = 0; mode = "relay-down";
+    let code = null;
+    try { await hl.postExchange(body); } catch (e) { code = e.code; }
+    eq("relay down → network_error", code, "network_error");
+
+    calls.length = 0; mode = "cors";
+    code = null;
+    try { await hl.postExchange({ ...body, action: { type: "order", orders: [] } }); } catch (e) { code = e.code; }
+    eq("orders are never relayed", [code, calls.length], ["network_error", 1]);
+    eq("relayable list", hl.RELAYABLE_ACTIONS, ["approveAgent", "approveBuilderFee", "usdSend"]);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 console.log(`\n${pass}/${pass + fail} core checks passed`);
 process.exit(fail ? 1 : 0);

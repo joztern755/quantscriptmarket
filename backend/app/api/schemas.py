@@ -935,3 +935,104 @@ class JobOut(Out):
     job: str
     ok: bool
     result: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------------------------------- admin: held USDC
+Evidence = Annotated[str, StringConstraints(min_length=5, max_length=1000), AfterValidator(_clean_text)]
+
+
+class HeldDepositOut(Out):
+    tx_hash: str
+    held_tx_id: UUID
+    amount_micro: int
+    sender_address: Optional[str] = None            # None: held before 0009 — the maker supplies it (verified on-chain)
+    reason: Optional[str] = None
+    memo: Optional[str] = None
+    transfer_time: Optional[datetime] = None
+    created_at: datetime
+    release_id: Optional[UUID] = None
+    release_status: Optional[str] = None
+    release_action: Optional[str] = None
+
+
+class HeldDepositsOut(Out):
+    items: list[HeldDepositOut]
+    next_cursor: Optional[str] = None
+    suspense_balance_micro: int
+
+
+class SuspenseReleaseIn(In):
+    action: Literal["attribute", "refund"]
+    user_id: Optional[UUID] = None                  # attribute only
+    sender_address: Optional[Address] = None        # only when the deposit has no recorded sender
+    evidence: Evidence                              # what proves the owner (ops log reference, signed message, …)
+
+
+class SuspenseReleaseOut(Out):
+    id: UUID
+    created_at: datetime
+    tx_hash: str
+    amount_micro: int
+    action: str
+    user_id: Optional[UUID] = None
+    sender_address: str
+    sender_source: str
+    evidence: str
+    status: str
+    maker_admin: UUID
+    checker_admin: Optional[UUID] = None
+    decided_at: Optional[datetime] = None
+    decision_reason: Optional[str] = None
+    release_tx_id: Optional[UUID] = None
+    refund_tx_hash: Optional[str] = None
+    refund_ledger_tx_id: Optional[UUID] = None
+    sent_at: Optional[datetime] = None
+
+
+class SuspenseRefundTypedDataOut(Out):
+    release: SuspenseReleaseOut
+    payload: dict[str, Any]
+    exchange_url: str
+
+
+# ---------------------------------------------------------------------------------------------------- HL exchange relay
+class HlSignatureIn(In):
+    r: Annotated[str, StringConstraints(pattern=r"^0x[0-9a-fA-F]{1,64}$")]
+    s: Annotated[str, StringConstraints(pattern=r"^0x[0-9a-fA-F]{1,64}$")]
+    v: Annotated[StrictInt, Field(ge=0, le=28)]
+
+
+class HlRelayIn(In):
+    """Exactly the body the browser would POST to Hyperliquid /exchange (no vaultAddress / expiresAfter)."""
+    action: dict[str, Any]
+    nonce: Annotated[StrictInt, Field(ge=1_500_000_000_000, le=9_999_999_999_999)]
+    signature: HlSignatureIn
+
+
+class HlRelayOut(Out):
+    upstream_status: int
+    response: Any = None
+
+
+# ---------------------------------------------------------------------------------------------------- trusted dexes
+# SPEC §12 "Trusted builder dexes" (admin console; app/strategies/dexes.py). The validator dex "" is implicit.
+class TrustedDexIn(In):
+    dex: Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9]{0,15}$")]
+    reason: Reason
+
+
+class TrustedDexOut(Out):
+    dex: str
+    active: bool
+    added_by: str
+    reason: str
+    created_at: datetime
+    removed_at: Optional[datetime] = None
+    removed_by: Optional[str] = None
+    removal_reason: Optional[str] = None
+
+
+class TrustedDexRemoveOut(Out):
+    dex: TrustedDexOut
+    affected_strategies: list[str] = []
+    markets_entries_paused: list[str] = []

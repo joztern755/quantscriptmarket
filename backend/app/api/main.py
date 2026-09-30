@@ -161,6 +161,7 @@ def _build(services: Optional[Services], role: str) -> FastAPI:
                   alerts, reviews, posts, referrals, creator, admin, webhooks):
             app.include_router(r.router, prefix="/v1")
         from app.api.routers import kyc_webhook; app.include_router(kyc_webhook.router, prefix="/v1")
+        from app.api.routers import hl_relay; app.include_router(hl_relay.router, prefix="/v1")  # /exchange fallback
         from app.api.routers import alerts_settings, telegram  # SPEC §12 user alerts (contacts, prefs, bot webhook)
         app.include_router(alerts_settings.router, prefix="/v1")
         app.include_router(telegram.router, prefix="/v1")

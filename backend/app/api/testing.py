@@ -33,6 +33,13 @@ def _id() -> str:
     return str(uuid.uuid4())
 
 
+def _seed_trusted_dexes() -> dict[str, dict]:
+    from app.strategies.dexes import LAUNCH_TRUSTED_DEXES
+    return {d: {"dex": d, "created_at": T0, "updated_at": T0, "added_by": "system:migration_0012", "reason": "seed",
+                "removed_at": None, "removed_by": None, "removal_reason": None, "active": True}
+            for d in ("",) + LAUNCH_TRUSTED_DEXES}
+
+
 @dataclass
 class FakeWorld:
     now: datetime = T0
@@ -60,6 +67,8 @@ class FakeWorld:
     kyc: dict[str, dict] = field(default_factory=dict)
     jobs_run: list[tuple[str, dict]] = field(default_factory=list)
     alert_contacts_missing: set[str] = field(default_factory=set)   # user ids WITHOUT Telegram+email (0007)
+    trusted_dexes: dict[str, dict] = field(default_factory=lambda: _seed_trusted_dexes())   # 0012 allowlist
+    deposit_scan_requests: dict[str, dict] = field(default_factory=dict)                     # 0012 user_id -> row
 
     # ------------------------------------------------------------------ seeding helpers
     def add_user(self, uid: str = "fb-user", *, role: str = "user", plan: str = "free", email: str = "u@example.com",
@@ -516,6 +525,50 @@ class FakeStore:
         f.update(pending_value=None, pending_by=None, pending_at=None)
         return 1
 
+    # trusted dexes (0012; SPEC §12)
+    def trusted_dexes(self, conn):
+        return frozenset(d for d, r in self.w.trusted_dexes.items() if r["removed_at"] is None) | {""}
+
+    def list_trusted_dexes(self, conn):
+        return sorted((dict(r, active=r["removed_at"] is None) for r in self.w.trusted_dexes.values()),
+                      key=lambda r: (not r["active"], r["dex"]))
+
+    def add_trusted_dex(self, conn, dex, *, by, reason):
+        r = self.w.trusted_dexes.get(dex)
+        if r is not None and r["removed_at"] is None:
+            return None
+        row = {"dex": dex, "created_at": self.w.now, "updated_at": self.w.now, "added_by": by, "reason": reason,
+               "removed_at": None, "removed_by": None, "removal_reason": None, "active": True}
+        self.w.trusted_dexes[dex] = row
+        return dict(row)
+
+    def remove_trusted_dex(self, conn, dex, *, by, reason):
+        if dex == "":
+            raise ValidationFailed("the validator dex cannot be removed")
+        r = self.w.trusted_dexes.get(dex)
+        if r is None or r["removed_at"] is not None:
+            return None
+        r.update(removed_at=self.w.now, removed_by=by, removal_reason=reason, active=False, updated_at=self.w.now)
+        return dict(r)
+
+    def strategies_on_dex(self, conn, dex):
+        return [{"id": st["id"], "slug": st["slug"], "status": st["status"], "markets": list(st["markets"] or [])}
+                for st in sorted(self.w.strategies.values(), key=lambda x: x["slug"])
+                if st["status"] != "delisted" and any(":" in m and m.split(":", 1)[0] == dex for m in st["markets"] or [])]
+
+    def list_deposits(self, conn, user_id, limit, cursor):
+        rows = sorted((dict(d) for d in self.w.deposits.values() if d["user_id"] == user_id),
+                      key=lambda d: (d["created_at"], d["id"]), reverse=True)
+        return rows[:limit + 1]
+
+    # deposit scan requests (0012; AUTH F1)
+    def request_deposit_scan(self, conn, user_id, *, since, now):
+        prev = self.w.deposit_scan_requests.get(user_id)
+        if prev is not None and prev.get("served_at") is None:
+            since = min(since, prev["since"])
+        self.w.deposit_scan_requests[user_id] = {"user_id": user_id, "requested_at": now, "since": since,
+                                                 "served_at": None}
+
 
 # ============================================================================================ other ports
 class FakeAuth:
@@ -641,6 +694,12 @@ class FakeHl:
 
     def find_usd_send(self, *, sender, destination, amount_micro, tx_hash):
         return self.sent_ok
+
+    relayed: list = []
+
+    def relay_exchange(self, body):
+        self.relayed = [*self.relayed, body]
+        return 200, {"status": "ok", "response": {"type": "default"}}
 
     def unknown_coins(self, coins):
         return []
