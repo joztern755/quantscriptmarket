@@ -13,8 +13,14 @@ import { subscribeGate, feeSummary } from "../core/gate.js";
 import { connectWallet, getConnectedWallet, proveOwnership, type Wallet } from "../core/wallet.js";
 import { approveAgent, approveBuilderFee, hlInfo } from "../core/hl.js";
 import { fmtUsd, fmtBps, fmtTenthsBp, shortAddr, microToDecimal } from "../core/format.js";
-import type { StrategyDetail, Subscription, Balance } from "./_shared/types.js";
+import type { StrategyDetail, Subscription, Balance, AgentOut, AgentCreateOut } from "./_shared/types.js";
+import { ApiError } from "../core/api.js";
 import { ensurePageCss, isAbortError, errCode, errMessage, listOf, isAddress, hlNum, usdInput, LOSS_WARNING, isRec, feesList } from "./_shared/util.js";
+
+/** `details.reason` of an API error (backend Conflict/Forbidden reasons, docs/API_CONTRACT.md). */
+function errReason(err: unknown): string {
+  return err instanceof ApiError && typeof err.details.reason === "string" ? err.details.reason : "";
+}
 
 export const title = "Subscribe";
 
@@ -65,7 +71,7 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
     [s, cfg, existing] = await Promise.all([
       api.get<StrategyDetail>(`/public/strategies/${encodeURIComponent(slug)}`, { signal: ctx.signal }),
       publicConfig(),
-      api.get<unknown>("/subscriptions", { signal: ctx.signal }).then((r) => listOf<Subscription>(r, "subscriptions")),
+      api.get<unknown>("/subscriptions?limit=100", { signal: ctx.signal }).then((r) => listOf<Subscription>(r)),
     ]);
   } catch (err) {
     if (isAbortError(err) || !ctx.isCurrent()) return;
@@ -124,7 +130,8 @@ class Wizard {
               "info",
             )
           : null,
-        s.status && s.status !== "listed" ? note("This strategy is not accepting new subscribers right now.", "bad") : null,
+        s.status !== "listed" ? note("This strategy is not accepting new subscribers right now.", "bad") : null,
+        s.showcase_text ? note(s.showcase_text, "info") : null,
         this.box,
         this.status,
         h("div", { class: "row small" }, button("Start over", { kind: "ghost", onClick: () => this.reset() })),
@@ -209,7 +216,7 @@ class Wizard {
         return m !== null && st.leverage ? `${fmtUsd(m)} · max ${st.leverage}×` : "";
       }
       case 7:
-        return this.balance ? `Balance ${fmtUsd(this.balance.balance_micro)}` : "";
+        return this.balance ? `Balance ${fmtUsd(this.balance.fee_balance_micro)}` : "";
       default:
         return "";
     }
@@ -223,9 +230,22 @@ class Wizard {
     return m > 0 && Number.isSafeInteger(m) ? m : null;
   }
 
+  /** min(strategy MAX_LEVERAGE, platform cap, launch-phase cap) — the backend enforces the same (422 max_x100). */
   private maxLeverage(): number {
-    const m = typeof this.s.max_leverage === "number" && this.s.max_leverage >= 1 ? Math.floor(this.s.max_leverage) : 1;
-    return Math.min(m, 5);
+    let m = typeof this.s.max_leverage === "number" && this.s.max_leverage >= 1 ? Math.floor(this.s.max_leverage) : this.cfg.platform_max_leverage;
+    m = Math.min(m, this.cfg.platform_max_leverage);
+    if (this.cfg.max_user_leverage_x100) m = Math.min(m, Math.floor(this.cfg.max_user_leverage_x100 / 100));
+    return Math.max(1, m);
+  }
+
+  private price(): number {
+    return this.s.price_monthly_micro ?? 0;
+  }
+
+  /** Backend reserve at subscribe: min top-up whenever profit share can accrue (creator % or platform 1.5% > 0). */
+  private reserve(): number {
+    const e = this.cfg.economics;
+    return this.s.profit_share_bps > 0 || e.platform_profit_share_bps > 0 ? e.min_topup_micro : 0;
   }
 
   // ------------------------------------------------------------------ rendering
@@ -307,14 +327,14 @@ class Wizard {
 
   private stepGate(): Child {
     const e = this.cfg.economics;
-    const rows = feeSummary(this.cfg, { price_monthly_micro: this.s.price_monthly_micro, profit_share_bps: this.s.profit_share_bps });
+    const rows = feeSummary(this.cfg, { price_monthly_micro: this.price(), profit_share_bps: this.s.profit_share_bps });
     return [
       h("p", null, "Before connecting anything, review the strategy's specific risks and every fee you'll pay. You'll accept the Terms and Risk Disclosure again for this subscription."),
       feesList(rows),
       h(
         "p",
         { class: "small muted" },
-        `Builder fee ${fmtTenthsBp(e.builder_fee_tenths_bp)} of each order's notional (collected by Hyperliquid) · subscription ${this.s.price_monthly_micro > 0 ? fmtUsd(this.s.price_monthly_micro) + "/month" : "free"} · profit share ${fmtBps(this.s.profit_share_bps)} creator` +
+        `Builder fee ${fmtTenthsBp(e.builder_fee_tenths_bp)} of each order's notional (collected by Hyperliquid) · subscription ${this.price() > 0 ? fmtUsd(this.price()) + "/month" : "free"} · profit share ${fmtBps(this.s.profit_share_bps)} creator` +
           (e.platform_profit_share_mode === "on_top" ? ` + ${fmtBps(e.platform_profit_share_bps)} platform = ${fmtBps(this.s.profit_share_bps + e.platform_profit_share_bps)} of new profit above your high-water mark.` : ` (platform's ${fmtBps(e.platform_profit_share_bps)} is included).`),
       ),
       h(
@@ -328,10 +348,10 @@ class Wizard {
                 id: this.s.id,
                 slug: this.s.slug,
                 name: this.s.name,
-                price_monthly_micro: this.s.price_monthly_micro,
+                price_monthly_micro: this.price(),
                 profit_share_bps: this.s.profit_share_bps,
                 markets: this.s.markets,
-                risk_ack_text: this.s.risk_ack_text ?? null,
+                risk_ack_text: this.s.risk_ack_text,
               },
               allocationMicro: this.allocationMicro() ?? undefined,
             });
@@ -496,11 +516,11 @@ class Wizard {
       if (!st.agentId) return;
       this.say("Checking Hyperliquid for your approval…");
       try {
-        await api.post(`/agents/${encodeURIComponent(st.agentId)}/confirm`, {}, { signal: this.ctx.signal });
+        await api.post<AgentOut>(`/agents/${encodeURIComponent(st.agentId)}/confirm`, {}, { signal: this.ctx.signal });
       } catch (err) {
         const c = errCode(err);
-        if (c === "not_found") {
-          // server discarded the pending agent (expired) — start again
+        if (c === "not_found" || c === "conflict") {
+          // server discarded / replaced the pending agent — start again
           st.agentId = undefined;
           st.agentAddress = undefined;
           st.agentTypedData = undefined;
@@ -514,17 +534,36 @@ class Wizard {
       this.say("Agent approved.", "ok");
       this.next();
     };
+    /** One live agent per master wallet: reuse an ACTIVE one (e.g. a second strategy on a sub-account). */
+    const useActive = async (): Promise<boolean> => {
+      const agents = listOf<AgentOut>(await api.get<unknown>("/agents", { signal: this.ctx.signal }));
+      const active = agents.find((a) => a.status === "active" && a.master_address.toLowerCase() === st.master);
+      if (!active) return false;
+      st.agentId = active.id;
+      st.agentAddress = active.agent_address.toLowerCase();
+      st.agentDone = true;
+      this.say("Your agent for this wallet is already approved.", "ok");
+      this.next();
+      return true;
+    };
     const sign = async (): Promise<void> => {
       const w = await this.requireWallet();
       if (!w) return;
       if (!st.agentId || !st.agentAddress) {
-        const res = await api.post<Record<string, unknown>>("/agents", { master_address: st.master, trading_address: st.trading }, { signal: this.ctx.signal });
-        const id = String(res.id ?? res.agent_id ?? "");
-        const addr = String(res.agent_address ?? "").toLowerCase();
+        if (await useActive()) return;
+        let res: AgentCreateOut;
+        try {
+          res = await api.post<AgentCreateOut>("/agents", { master_address: st.master, signature_chain_id: await w.chainIdHex() }, { signal: this.ctx.signal });
+        } catch (err) {
+          if (errCode(err) === "conflict" && (await useActive())) return;
+          throw err;
+        }
+        const id = res.agent?.id ?? "";
+        const addr = String(res.agent?.agent_address ?? "").toLowerCase();
         if (!id || !isAddress(addr)) throw new Error("The server returned an invalid agent. Please try again.");
         st.agentId = id;
         st.agentAddress = addr;
-        st.agentTypedData = res.typed_data ?? res.typedData ?? undefined;
+        st.agentTypedData = res.approve_agent?.typed_data;
         this.save();
         this.draw();
       }
@@ -573,7 +612,11 @@ class Wizard {
     const confirm = async (): Promise<void> => {
       this.say("Checking Hyperliquid for your builder-fee approval…");
       try {
-        await api.post("/builder-approval/confirm", { master_address: st.master }, { signal: this.ctx.signal });
+        const r = await api.post<{ sufficient: boolean; max_fee_rate_tenths_bp: number; required_tenths_bp: number }>("/builder-approval/confirm", { master_address: st.master }, { signal: this.ctx.signal });
+        if (!r.sufficient) {
+          this.say(`Hyperliquid shows a builder-fee approval of ${fmtTenthsBp(r.max_fee_rate_tenths_bp)}; ${fmtTenthsBp(r.required_tenths_bp)} is required. Approve in your wallet, then confirm again.`, "err");
+          return;
+        }
       } catch (err) {
         this.say(`Not confirmed yet: ${errMessage(err)}`, "err");
         return;
@@ -664,8 +707,8 @@ class Wizard {
               toast("Enter a valid USD amount (up to 6 decimals).", "warn");
               return;
             }
-            if (m < 10_000_000) {
-              toast("Minimum allocation is $10.", "warn");
+            if (m < this.cfg.min_allocation_micro) {
+              toast(`Minimum allocation is ${fmtUsd(this.cfg.min_allocation_micro)}.`, "warn");
               return;
             }
             if (!ack.input.checked) {
@@ -683,7 +726,8 @@ class Wizard {
   }
 
   private stepBalance(): Child {
-    const price = this.s.price_monthly_micro;
+    const price = this.price();
+    const reserve = this.reserve();
     const box = h("div", { class: "stack tight" });
     const drawBal = (): void => {
       if (this.balanceErr) {
@@ -694,18 +738,20 @@ class Wizard {
         mount(box, skeleton(3));
         return;
       }
-      const bal = this.balance.balance_micro;
-      const enough = bal >= price;
+      const bal = this.balance.fee_balance_micro;
+      const need = price + reserve;
+      const enough = bal >= need;
       mount(
         box,
         kv([
           ["Fee balance", fmtUsd(bal)],
           ["Due now (first month)", price > 0 ? fmtUsd(price) : "Free"],
-          ["Estimated monthly need", typeof this.balance.estimated_monthly_need_micro === "number" ? fmtUsd(this.balance.estimated_monthly_need_micro) : "—"],
+          ["Reserve for profit share", reserve > 0 ? fmtUsd(reserve) : "—"],
+          ["Estimated monthly need", fmtUsd(this.balance.estimated_monthly_need_micro)],
         ]),
         enough
-          ? note("Your fee balance covers the first month. Keep a buffer for daily profit share — if the balance runs out, the subscription stops opening new positions.", "info")
-          : note(`Top up at least ${fmtUsd(price - bal)} to continue. Your progress here is saved.`, "warn"),
+          ? note("Your fee balance covers the first month and the profit-share reserve. If the balance runs out, the subscription stops opening new positions.", "info")
+          : note(`Top up at least ${fmtUsd(need - bal)} to continue (first month ${fmtUsd(price)} + reserve ${fmtUsd(reserve)} kept for daily profit share). Your progress here is saved.`, "warn"),
         h(
           "div",
           { class: "btns" },
@@ -740,6 +786,7 @@ class Wizard {
     const m = this.allocationMicro();
     const e = this.cfg.economics;
     const psTotal = e.platform_profit_share_mode === "on_top" ? this.s.profit_share_bps + e.platform_profit_share_bps : this.s.profit_share_bps;
+    const price = this.price();
     const missing = [0, 1, 2, 3, 4, 5, 6, 7].filter((i) => !this.done(i));
     return [
       kv([
@@ -747,7 +794,7 @@ class Wizard {
         ["Trading account", h("span", { class: "mono break" }, `${st.tradingLabel ?? ""} ${st.trading ?? ""}`)],
         ["Allocation", m !== null ? fmtUsd(m) : "—"],
         ["Max leverage", st.leverage ? `${st.leverage}×` : "—"],
-        ["Subscription", this.s.price_monthly_micro > 0 ? `${fmtUsd(this.s.price_monthly_micro)} / month, charged now` : "Free"],
+        ["Subscription", price > 0 ? `${fmtUsd(price)} / month, charged now` : "Free"],
         ["Profit share", `${fmtBps(psTotal)} of new profit above high-water mark`],
         ["Builder fee", `${fmtTenthsBp(e.builder_fee_tenths_bp)} of each order's notional`],
       ]),
@@ -773,29 +820,33 @@ class Wizard {
                   trading_address: st.trading,
                   allocation_micro: m,
                   max_leverage_x100: (st.leverage ?? 1) * 100,
-                  agent_id: st.agentId,
+                  // terms the user reviewed; the server refuses with 409 reason "terms_changed" if they moved
+                  expected_price_monthly_micro: price,
+                  expected_profit_share_bps: this.s.profit_share_bps,
                 },
                 { signal: this.ctx.signal, idempotencyKey: st.subKey },
               );
             } catch (err) {
               const c = errCode(err);
+              const reason = errReason(err);
+              const restart = (patch: Partial<WizState>, msg: string): void => {
+                Object.assign(this.st, patch, { subKey: undefined }); // payload will change → new Idempotency-Key
+                this.save();
+                this.say(msg, "err");
+                this.draw();
+              };
               if (c === "insufficient_balance") {
                 this.balanceOk = false;
                 this.balance = null;
-                this.say("Your fee balance is too low. Top up and try again.", "err");
-                this.draw();
-                return;
+                return restart({}, "Your fee balance is too low. Top up and try again.");
               }
-              if (c === "conflict") {
-                this.st.trading = undefined;
+              if (reason === "trading_address_in_use") return restart({ trading: undefined }, "That trading account already runs a strategy. Choose another account.");
+              if (reason === "subscription_ack_required") return restart({ gateAccepted: false }, "Please review and accept the strategy's risks and fees again (valid for 30 minutes).");
+              if (reason === "terms_changed") return restart({ gateAccepted: false }, "The strategy's price or profit share changed. Please review the new terms.");
+              if (reason === "agent_not_active") return restart({ agentDone: false, agentId: undefined, agentAddress: undefined }, "Approve the trading agent in your wallet first.");
+              if (reason === "builder_fee_not_approved") return restart({ builderDone: false }, "Approve the builder fee in your wallet first.");
+              if (c === "validation_failed" || c === "guard_rejected" || c === "conflict" || c === "forbidden") {
                 this.st.subKey = undefined;
-                this.save();
-                this.say("That trading account already runs a strategy. Choose another account.", "err");
-                this.draw();
-                return;
-              }
-              if (c === "validation_failed" || c === "guard_rejected") {
-                this.st.subKey = undefined; // payload will change
                 this.save();
               }
               throw err;

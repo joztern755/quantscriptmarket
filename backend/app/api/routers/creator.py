@@ -224,5 +224,5 @@ def kyc_session(ctx: AuthCtx = Depends(creator_user), svc: Services = Depends(ge
                                      provider_ref=str(session["provider_ref"]))
         svc.audit.write(conn, actor=ctx.actor, action="creator.kyc.session", target=f"user:{ctx.user_id}",
                         payload={"provider": str(session["provider"])}, ip_hash=ctx.ip_hash)
-    return S.KycSessionOut(url=str(session["url"]), provider=str(session["provider"]),
-                           status=str(session.get("status") or "pending"))
+    return S.KycSessionOut(url=str(session.get("url") or ""), provider=str(session["provider"]),
+                           status=str(session.get("status") or "pending"), manual=bool(session.get("manual")))

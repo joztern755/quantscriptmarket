@@ -762,9 +762,10 @@ class EarningsOut(Out):
 
 
 class KycSessionOut(Out):
-    url: str
+    url: str                                    # "" when manual
     provider: str
     status: str
+    manual: bool = False                        # manual review by our team: no redirect (web shows a notice)
 
 
 # ---------------------------------------------------------------------------------------------------- admin
