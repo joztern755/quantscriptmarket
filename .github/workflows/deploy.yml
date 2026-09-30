@@ -105,7 +105,7 @@ jobs:
         run: python3 infra/csp_sync.py check --require-dist
       - name: Header rules (firebase.json emulation, SECURITY M1)
         run: node web/tests/headers.test.mjs
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: web-dist
           path: web/dist
@@ -159,7 +159,7 @@ jobs:
           docker run --rm --entrypoint python "$img" -c 'import importlib.metadata as m, json; print(json.dumps(sorted(d.name + "==" + d.version for d in m.distributions()), indent=1))' \
             > "${RUNNER_TEMP}/backend-image-packages.json"
           wc -l "${RUNNER_TEMP}/backend-image-packages.json"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: deploy-state
           path: |
