@@ -60,6 +60,7 @@ from typing import Any, Callable, Mapping
 
 from app.config import Economics, get_settings
 from app.errors import ExternalServiceError, ValidationFailed
+from app.https_only import https_open
 from app.logging import get_logger
 from app.money import BPS, parse_decimal, to_micro
 
@@ -200,7 +201,7 @@ class SandboxClient:
 
     def __init__(self, url: str, secret: str, *, require_id_token: bool, timeout: float = 60.0,
                  token_provider: Callable[[str], str | None] | None = None,
-                 opener: Callable[..., Any] = urllib.request.urlopen, max_response_bytes: int = 1 << 20) -> None:
+                 opener: Callable[..., Any] = https_open, max_response_bytes: int = 1 << 20) -> None:
         self.url = (url or "").rstrip("/")
         self.secret = secret or ""
         self.require_id_token = require_id_token
@@ -241,7 +242,7 @@ class SandboxClient:
         body = json.dumps({"source": source, "bars": bars, "now_ms": int(now_ms)}, separators=(",", ":")).encode()
         req = urllib.request.Request(self.url + "/run", data=body, method="POST", headers=headers)
         try:
-            with self._open(req, timeout=self.timeout) as r:  # noqa: S310 - URL from config
+            with self._open(req, timeout=self.timeout) as r:  # default opener: https only
                 raw = r.read(self._max + 1)
         except urllib.error.HTTPError as e:
             detail: dict[str, Any] = {}
@@ -251,8 +252,8 @@ class SandboxClient:
                 pass
             raise ExternalServiceError("sandbox run failed", status=e.code,
                                        sandbox_error=str(detail.get("error") or "")[:64],
-                                       message=str(detail.get("message") or "")[:200]) from None
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+                                       sandbox_message=str(detail.get("message") or "")[:200]) from None
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:  # ValueError: non-https URL
             raise ExternalServiceError("sandbox unavailable", error=type(e).__name__) from None
         if len(raw) > self._max:
             raise ExternalServiceError("sandbox response too large")

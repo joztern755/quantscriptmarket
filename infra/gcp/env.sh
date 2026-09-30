@@ -14,7 +14,7 @@
 : "${GITHUB_REPO:=joztern755/quantscriptmarket}" # only this repo (branch main, env production) may deploy
 : "${GITHUB_REPO_ID:=}"                          # numeric id (gh api repos/$GITHUB_REPO --jq .id); pins WIF to
                                                  # the repo *instance* so a deleted+recreated repo cannot deploy
-: "${BUDGET_USD:=400}"                           # monthly budget alert (50/90/100% actual, 120% forecast)
+: "${BUDGET_USD:=150}"                           # internal phase (owner 30 Sep 2026); monthly budget alert (50/90/100% actual, 120% forecast)
 
 # ---- domains ---------------------------------------------------------------------------------------------
 : "${WEB_DOMAIN:=aijalon.trade}"
@@ -29,7 +29,7 @@ BACKEND_IMAGE_REPO="${AR_HOST}/${PROJECT_ID}/${AR_REPO}/backend"
 SANDBOX_IMAGE_REPO="${AR_HOST}/${PROJECT_ID}/${AR_REPO}/sandbox"
 # Cloud SQL Auth Proxy sidecar (api + executor). `make pin` replaces the digest; deploy refuses PIN_ME.
 # pin-image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.26.0
-: "${CLOUDSQL_PROXY_IMAGE:=gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.26.0@sha256:PIN_ME}"
+: "${CLOUDSQL_PROXY_IMAGE:=gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.26.0@sha256:86e4f3cc266020e7ee07740df78d7511e2c340c274b56f84d80b7251913af9ad}"
 
 # ---- network ---------------------------------------------------------------------------------------------
 : "${VPC:=aijalon-vpc}"
@@ -58,8 +58,9 @@ SANDBOX_IMAGE_REPO="${AR_HOST}/${PROJECT_ID}/${AR_REPO}/sandbox"
 # ---- Cloud SQL -------------------------------------------------------------------------------------------
 : "${SQL_INSTANCE:=aijalon-pg}"
 : "${SQL_EDITION:=enterprise}"                   # explicit: PG16 otherwise defaults to enterprise-plus
-: "${SQL_TIER:=db-custom-2-8192}"                # 2 vCPU / 8 GB; resize later without data loss
-: "${SQL_STORAGE_GB:=50}"
+: "${SQL_TIER:=db-custom-1-3840}"                # internal phase: 1 vCPU / 3.75 GB (owner 30 Sep 2026); public: db-custom-2-8192
+: "${SQL_AVAILABILITY:=ZONAL}"                   # internal phase: ZONAL (owner, cost); REGIONAL (HA) before Gate C public
+: "${SQL_STORAGE_GB:=20}"
 : "${SQL_MAX_CONNECTIONS:=200}"                  # api 20 inst x 5 + executor 3 x 5 + migrate + headroom
 : "${SQL_ENABLE_CMEK:=1}"                        # SPEC §2 "CMEK": disk encrypted with our HSM key (create-time only)
 : "${DB_NAME:=aijalon}"

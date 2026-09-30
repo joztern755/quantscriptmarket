@@ -1,0 +1,9 @@
+# Allow-list for sandbox/Dockerfile (BuildKit reads <Dockerfile>.dockerignore). The build context is the repo root,
+# so without this every local file (backend/.venv, web/, .env files, keys) would be offered to the build.
+# Keep in sync with the COPY lines in sandbox/Dockerfile; a missing entry fails the build loudly.
+*
+!backend/app/__init__.py
+!backend/app/errors.py
+!backend/app/logging.py
+!backend/app/https_only.py
+!backend/app/sandbox/*.py

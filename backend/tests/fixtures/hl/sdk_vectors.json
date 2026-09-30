@@ -1,0 +1,79 @@
+{
+ "generated_by": "hyperliquid-python-sdk 0.24.0 + eth-account 0.13.7 (SDK user_signed_payload; not our code)",
+ "cases": [
+  {
+   "name": "agent_arbitrum_mainnet",
+   "kind": "approveAgent",
+   "input": {
+    "agentAddress": "0x4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a",
+    "agentName": "aijalon",
+    "nonce": 1790000000123,
+    "signatureChainId": "0xa4b1",
+    "hyperliquidChain": "Mainnet"
+   },
+   "digest": "bd0a3ced55be1660fcd71bfe63cf17e1ba84b50c950150437d245d968684e068"
+  },
+  {
+   "name": "agent_sdk_chain_mainnet",
+   "kind": "approveAgent",
+   "input": {
+    "agentAddress": "0x4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a",
+    "agentName": "aijalon",
+    "nonce": 1790000000124,
+    "signatureChainId": "0x66eee",
+    "hyperliquidChain": "Mainnet"
+   },
+   "digest": "9a8c064764555e0ef1bf894ece2e4ce4642e1ef205163e57b2821c1810eb28c7"
+  },
+  {
+   "name": "builder_fee_arbitrum_0_1pct",
+   "kind": "approveBuilderFee",
+   "input": {
+    "builder": "0xb1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+    "maxFeeRate": "0.1%",
+    "maxFeeTenthsBp": 100,
+    "nonce": 1790000000125,
+    "signatureChainId": "0xa4b1",
+    "hyperliquidChain": "Mainnet"
+   },
+   "digest": "1f0583088070aebfe875cf91eb9d43a3756fff17a008df76af7d7d35bc30ea99"
+  },
+  {
+   "name": "builder_fee_sdk_chain_0_1pct",
+   "kind": "approveBuilderFee",
+   "input": {
+    "builder": "0xb1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+    "maxFeeRate": "0.1%",
+    "maxFeeTenthsBp": 100,
+    "nonce": 1790000000126,
+    "signatureChainId": "0x66eee",
+    "hyperliquidChain": "Mainnet"
+   },
+   "digest": "0d1fd5e9d43b209f2e3ecce09f735daffda24deca71139456de7a4815438641f"
+  },
+  {
+   "name": "usd_send_arbitrum",
+   "kind": "usdSend",
+   "input": {
+    "destination": "0x7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e",
+    "amount": "10.5",
+    "time": 1790000000127,
+    "signatureChainId": "0xa4b1",
+    "hyperliquidChain": "Mainnet"
+   },
+   "digest": "cc5fbee6e4b8e45219b6d54c3f52e13734f4ffe7ec879e541a063c88224a4f47"
+  },
+  {
+   "name": "usd_send_sdk_chain_testnet",
+   "kind": "usdSend",
+   "input": {
+    "destination": "0x7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e",
+    "amount": "25",
+    "time": 1790000000128,
+    "signatureChainId": "0x66eee",
+    "hyperliquidChain": "Testnet"
+   },
+   "digest": "a7be2703065fabb5eb15ba3b02a5415b2e4c9cce431801e8c601439c6e2ac60f"
+  }
+ ]
+}

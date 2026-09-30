@@ -14,7 +14,7 @@
 #   * no compilers / build tools in the final stage; non-root uid 10001; read-only code owned by root.
 
 # pin-image: python:3.12-slim
-ARG PYTHON_IMAGE=python:3.12-slim@sha256:PIN_ME
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
 
 # ---------------------------------------------------------------------------------------------- build
 FROM ${PYTHON_IMAGE} AS build
@@ -61,8 +61,10 @@ COPY --chown=root:root . /srv
 # The API hashes these exact bytes to verify what users consented to (must equal what the web serves).
 COPY --from=legal --chown=root:root . /srv/legal
 ENV LEGAL_DIR=/srv/legal
+# COPY keeps the builder's file modes: normalise to world-readable (dirs traversable) and nobody-writable, so a
+# 0600 file in a local checkout cannot make the image unstartable for uid 10001. /srv holds code + legal text only.
 RUN python -m compileall -q /srv/app /srv/scripts \
- && chmod -R a-w /srv
+ && chmod -R a+rX,a-w /srv
 USER 10001:10001
 EXPOSE 8080
 # `--proxy-headers`: Cloud Run's front end is the only peer. Client IP for rate limits / audit comes from

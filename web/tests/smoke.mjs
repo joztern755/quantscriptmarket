@@ -182,6 +182,43 @@ function check(name, cond, detail = "") {
   if (!cond) failures++;
 }
 
+// ---- Firebase SRI (web/sri.json → import map with `integrity` + its sha256 in the CSP meta, see build.mjs).
+// The production import map pins the REAL gstatic hashes, so the stubbed Firebase modules below cannot load under
+// it (checked explicitly further down: a tampered module must be refused). For the stubbed UI flows the harness
+// serves index.html with the SAME import map keyed to the stub bytes, and the CSP meta hash recomputed for that
+// map — SRI and CSP stay enforced, only against the test fixtures instead of the real SDK.
+const INDEX_HTML = readFileSync(join(DIST, "index.html"), "utf8");
+const IMPORT_MAP_RE = /<script type="importmap">([^<]*)<\/script>/;
+const PROD_IMPORT_MAP = IMPORT_MAP_RE.exec(INDEX_HTML)?.[1] ?? null;
+const SRI_JSON = join(DIST, "..", "sri.json");
+const sha256b64 = (s) => createHash("sha256").update(s).digest("base64");
+const sri384 = (s) => `sha384-${createHash("sha384").update(s).digest("base64")}`;
+if (existsSync(SRI_JSON)) {
+  const sri = JSON.parse(readFileSync(SRI_JSON, "utf8"));
+  const v = JSON.parse(readFileSync(join(DIST, "app-config.json"), "utf8")).firebaseSdkVersion;
+  const map = PROD_IMPORT_MAP ? JSON.parse(PROD_IMPORT_MAP) : null;
+  const base = `https://www.gstatic.com/firebasejs/${v}/`;
+  check("sri: index.html has the Firebase import map", !!map);
+  check("sri: import map pins web/sri.json hashes for the configured Firebase version",
+    !!map && ["firebase-app.js", "firebase-auth.js"].every((f) => map.integrity?.[base + f] === sri[f]) && Object.keys(map.integrity).length === 2,
+    JSON.stringify(map?.integrity));
+  const metaCsp = /<meta http-equiv="Content-Security-Policy" content="([^"]*)"/.exec(INDEX_HTML)?.[1] ?? "";
+  const mapHash = PROD_IMPORT_MAP ? `'sha256-${sha256b64(PROD_IMPORT_MAP)}'` : "(none)";
+  check("sri: CSP (meta + dist/csp.txt) allows exactly this import map", metaCsp.includes(mapHash) && readFileSync(join(DIST, "csp.txt"), "utf8").includes(mapHash), mapHash);
+}
+/** index.html whose import map pins the given stub modules (CSP hash recomputed); the production page otherwise. */
+function fixtureIndexHtml(appConfig, fbAuthBody) {
+  if (!PROD_IMPORT_MAP) return INDEX_HTML;
+  const base = `https://www.gstatic.com/firebasejs/${appConfig.firebaseSdkVersion}/`;
+  const map = JSON.parse(PROD_IMPORT_MAP);
+  map.integrity = { [base + "firebase-app.js"]: sri384(FB_APP_STUB), [base + "firebase-auth.js"]: sri384(fbAuthBody) };
+  const fixtureMap = JSON.stringify(map);
+  const html = INDEX_HTML.replace(IMPORT_MAP_RE, () => `<script type="importmap">${fixtureMap}</script>`)
+    .replace(`'sha256-${sha256b64(PROD_IMPORT_MAP)}'`, () => `'sha256-${sha256b64(fixtureMap)}'`);
+  if (html === INDEX_HTML || !html.includes(`'sha256-${sha256b64(fixtureMap)}'`)) throw new Error("fixture import map rewrite failed");
+  return html;
+}
+
 const browser = await chromium.launch();
 
 async function newPage(viewport, colorScheme, opts = {}) {
@@ -230,6 +267,12 @@ async function newPage(viewport, colorScheme, opts = {}) {
   }
   if (opts.appConfig) {
     await context.route(`${BASE}app-config.json`, (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(opts.appConfig) }));
+  }
+  if (PROD_IMPORT_MAP && !opts.productionImportMap) {
+    const cfg = opts.appConfig ?? JSON.parse(readFileSync(join(DIST, "app-config.json"), "utf8"));
+    const html = fixtureIndexHtml(cfg, opts.fbAuth ?? FB_AUTH_STUB);
+    await context.route((u) => u.origin === new URL(BASE).origin && (u.pathname === "/" || u.pathname === "/index.html"),
+      (r) => r.fulfill({ status: 200, contentType: "text/html; charset=utf-8", headers: { "cache-control": "no-store" }, body: html }));
   }
   return { context, page, errors, setConfig: (c) => (cfgState = c) };
 }
@@ -408,6 +451,28 @@ for (const vp of VIEWPORTS) {
   check("firebase: closed popup handled quietly", await page.isVisible(".signin"));
   if (SHOTS) await page.screenshot({ path: join(SHOTS, "firebase-signin.png") });
   check("firebase: no console errors", errors.length === 0, errors.slice(0, 5).join(" | "));
+  await context.close();
+}
+
+// SRI enforced: under the PRODUCTION import map (real gstatic hashes) a module whose bytes differ — here the stub —
+// is refused by the browser; sign-in shows the load-failure note and never renders provider buttons.
+if (PROD_IMPORT_MAP) {
+  const appConfig = JSON.parse(readFileSync(join(DIST, "app-config.json"), "utf8"));
+  appConfig.firebase = { apiKey: "test-key", authDomain: "aijalon.trade", projectId: "aijalon-test", appId: "1:1:web:1" };
+  const { context, page, errors } = await newPage({ width: 390, height: 844 }, "light", { appConfig, productionImportMap: true });
+  await page.goto(BASE, { waitUntil: "networkidle" });
+  await page.evaluate(() => {
+    localStorage.setItem("aij.consents.v1", JSON.stringify({ site: Object.fromEntries(["jurisdiction", "terms", "risk", "privacy", "waiver"].map((d) => [d, { version: "2026-09-30", accepted_at: new Date().toISOString() }])), synced: {} }));
+  });
+  await page.goto(BASE + "#/signin", { waitUntil: "networkidle" });
+  await page.reload({ waitUntil: "networkidle" });
+  await page.waitForTimeout(500);
+  const text = await page.locator(".signin").innerText();
+  check("sri: tampered Firebase module refused (load-failure note, no sign-in buttons)",
+    /couldn't load/.test(text) && (await page.locator(".signin .btn").count()) === 0, text.slice(0, 160));
+  check("sri: browser reported the integrity mismatch", errors.some((e) => /integrity/i.test(e)), errors.slice(0, 3).join(" | "));
+  const other = errors.filter((e) => !/integrity/i.test(e));
+  check("sri: no other console errors", other.length === 0, other.slice(0, 5).join(" | "));
   await context.close();
 }
 

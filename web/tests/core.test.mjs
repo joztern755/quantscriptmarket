@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Unit tests for pure core modules (no browser): format, keccak/EIP-55, QR encoder, Hyperliquid builders.
 //   node web/build.mjs && node web/tests/core.test.mjs
-import { cpSync, mkdtempSync, writeFileSync, existsSync } from "node:fs";
+import { cpSync, mkdtempSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -69,9 +69,14 @@ for (const a of ["0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "0xfB6916095ca1df
 
 // ---- QR vs an independent reference encoder (npm's bundled qrcode-terminal vendor QRCode)
 const require = createRequire(import.meta.url);
-const REF = "/opt/node22/lib/node_modules/npm/node_modules/qrcode-terminal/vendor/QRCode";
+// npm ships next to the running node binary (<prefix>/bin/node → <prefix>/lib/node_modules/npm), e.g. setup-node's
+// toolcache or Homebrew; /opt/node22 is the authoring environment.
+const REF = [
+  join(dirname(process.execPath), "..", "lib", "node_modules", "npm", "node_modules", "qrcode-terminal", "vendor", "QRCode"),
+  "/opt/node22/lib/node_modules/npm/node_modules/qrcode-terminal/vendor/QRCode",
+].find((p) => existsSync(join(p, "index.js"))) ?? "";
 const q = await imp("qr.js");
-if (existsSync(REF)) {
+if (REF) {
   const QRCode = require(`${REF}/index.js`);
   const L = require(`${REF}/QRErrorCorrectLevel.js`);
   const texts = ["otpauth://totp/aijalon.trade:user%40example.com?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=aijalon.trade&algorithm=SHA1&digits=6&period=30"];
@@ -208,6 +213,40 @@ throws("validate usdSend dest", () => hl.validateServerTypedData("usdSend", u.ty
   } finally {
     globalThis.fetch = realFetch;
   }
+}
+
+// ---- SDK parity: hl.ts typed data hashes to the digests hyperliquid-python-sdk produced
+// (backend/tests/fixtures/hl/sdk_vectors.json, generated from the SDK only; backend/tests/test_hl_sdk_parity.py
+// checks the Python side against the same file). Minimal EIP-712 encoder for the field types these actions use.
+{
+  const vec = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "backend", "tests", "fixtures", "hl", "sdk_vectors.json"), "utf8"));
+  const cat = (...xs) => { const o = new Uint8Array(xs.reduce((n, x) => n + x.length, 0)); let i = 0; for (const x of xs) { o.set(x, i); i += x.length; } return o; };
+  const hexBytes = (h) => Uint8Array.from(h.replace(/^0x/, "").padStart(64, "0").match(/../g).map((b) => parseInt(b, 16)));
+  const utf8 = (s) => new TextEncoder().encode(s);
+  const enc = (type, v) => {
+    if (type === "string") return k.keccak256(utf8(v));
+    if (type === "address") return hexBytes(v.toLowerCase());
+    if (/^uint\d+$/.test(type)) return hexBytes(BigInt(v).toString(16));
+    throw new Error(`unsupported EIP-712 type ${type}`);
+  };
+  const hashStruct = (name, fields, data) => k.keccak256(cat(
+    k.keccak256(utf8(`${name}(${fields.map((f) => `${f.type} ${f.name}`).join(",")})`)),
+    ...fields.map((f) => enc(f.type, data[f.name]))));
+  const digest = (td) => k.toHex(k.keccak256(cat(Uint8Array.of(0x19, 0x01),
+    hashStruct("EIP712Domain", td.types.EIP712Domain, td.domain),
+    hashStruct(td.primaryType, td.types[td.primaryType], td.message)))).replace(/^0x/, "");
+  const kinds = new Set();
+  for (const c of vec.cases) {
+    const i = c.input;
+    const built = c.kind === "approveAgent" ? hl.buildApproveAgent({ agentAddress: i.agentAddress, agentName: i.agentName, nonce: i.nonce, signatureChainId: i.signatureChainId, hyperliquidChain: i.hyperliquidChain })
+      : c.kind === "approveBuilderFee" ? hl.buildApproveBuilderFee({ builder: i.builder, maxFeeRate: hl.maxFeeRateFromTenthsBp(i.maxFeeTenthsBp), nonce: i.nonce, signatureChainId: i.signatureChainId, hyperliquidChain: i.hyperliquidChain })
+      : hl.buildUsdSend({ destination: i.destination, amount: i.amount, time: i.time, signatureChainId: i.signatureChainId, hyperliquidChain: i.hyperliquidChain });
+    kinds.add(c.kind);
+    eq(`sdk parity ${c.name} digest`, digest(built.typedData), c.digest);
+    if (c.kind === "approveBuilderFee") eq(`sdk parity ${c.name} maxFeeRate`, built.action.maxFeeRate, i.maxFeeRate);
+    for (const [f, v] of Object.entries(built.typedData.message)) eq(`sdk parity ${c.name} action.${f} == signed`, built.action[f], v);
+  }
+  eq("sdk parity covers every kind", [...kinds].sort(), ["approveAgent", "approveBuilderFee", "usdSend"]);
 }
 
 console.log(`\n${pass}/${pass + fail} core checks passed`);

@@ -58,7 +58,7 @@ IN_HOUSE: tuple[InHouseStrategy, ...] = (
     InHouseStrategy("sol", "crest-sol", "CREST Solana", ("SOL",)),
     InHouseStrategy("hype", "crest-hype", "CREST HYPE", ("HYPE",)),
     InHouseStrategy("gold", "crest-gold", "CREST Gold", ("xyz:GOLD",)),
-    # [CONFIRM] WTI (xyz:CL) vs Brent (xyz:BRENTOIL) — SPEC §7.
+    # Owner 30 Sep 2026: both WTI (xyz:CL) and Brent (xyz:BRENTOIL); weight split still [CONFIRM] — SPEC §7. Unlisted.
     InHouseStrategy("oil", "crest-oil", "CREST Oil", ("xyz:CL",), notes="[CONFIRM] WTI vs Brent."),
     # Multi-market; per-coin members are not defined yet → cannot be mapped until they are (stays draft).
     InHouseStrategy("runners", "crest-runners", "CREST Runners", (), notes="Members TBD; multi-market."),
