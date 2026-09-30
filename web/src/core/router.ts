@@ -7,7 +7,7 @@ import { renderSiteGate, siteGateAccepted } from "./gate.js";
 import { getMe, peekMe, type Me } from "./state.js";
 import { clear, emptyState, errorState, h, note } from "./ui.js";
 
-export type PageName = "home" | "market" | "strategy" | "subscribe" | "dashboard" | "leaderboard" | "posts" | "referrals" | "creator" | "admin" | "legal" | "signin";
+export type PageName = "home" | "market" | "strategy" | "subscribe" | "dashboard" | "leaderboard" | "posts" | "referrals" | "alerts" | "creator" | "admin" | "legal" | "signin";
 export type Access = "public" | "user" | "admin";
 
 export interface PageContext {
@@ -48,6 +48,7 @@ export const ROUTES: RouteDef[] = [
   { pattern: "/posts", name: "posts", access: "public", gate: true, title: "Posts" },
   { pattern: "/posts/:id", name: "posts", access: "public", gate: true, title: "Post" },
   { pattern: "/referrals", name: "referrals", access: "user", gate: true, title: "Referrals" },
+  { pattern: "/alerts", name: "alerts", access: "user", gate: true, title: "Alerts" },
   { pattern: "/creator", name: "creator", access: "user", gate: true, title: "Creator Studio" },
   { pattern: "/creator/:tab", name: "creator", access: "user", gate: true, title: "Creator Studio" },
   { pattern: "/admin", name: "admin", access: "admin", gate: true, title: "Admin" },

@@ -100,6 +100,27 @@ export interface StrategyDetail extends StrategySummary {
   rating_count: number;
 }
 
+/** GET /v1/public/strategies/{slug}/equity — live record of the CURRENT version (t = ms epoch). When the record
+ *  is hidden (k-anonymity / not live yet) `points` is empty and `hidden_reason` says why. */
+export interface EquityPoint {
+  t: number;
+  pnl_micro: Micro | null;
+  roi_bps: number | null;
+}
+export interface EquityOut {
+  points: EquityPoint[];
+  hidden_reason: "not_live" | "too_few_subscribers" | string | null;
+}
+
+/** POST /v1/me/plan {plan} → PlanChangeOut (step-up; 402 insufficient_balance; 409 already on plan / too many strategies). */
+export type PlanKey = "free" | "pro" | "max";
+export interface PlanChangeOut {
+  plan: PlanKey | string;
+  charged_micro: Micro;
+  period_end: string | null;
+  fee_balance_micro: Micro;
+}
+
 /** GET /v1/public/showcase/{slug} → ShowcaseWallet[] (plain list). */
 export interface ShowcaseWallet {
   address: string;
@@ -341,8 +362,33 @@ export interface Earnings {
   payable_micro: Micro;
   payouts_pending_micro: Micro;
   total_earned_micro: Micro;
-  by_strategy: { strategy_id: string; slug: string; active_subscribers: number; earned_micro: Micro | null }[];
+  by_strategy: StrategyEarnings[];
   recent: LedgerRow[];
+}
+
+/** EarningsOut.by_strategy row: per-strategy breakdown by source (all micro-USD, creator's share). Older backends
+ *  sent only {strategy_id, slug, active_subscribers, earned_micro}, so everything but strategy_id is optional. */
+export interface StrategyEarnings {
+  strategy_id: string | null;
+  name?: string | null;
+  slug?: string | null;
+  active_subscribers?: number | null;
+  builder_micro?: Micro | null;
+  subscription_micro?: Micro | null;
+  profit_share_micro?: Micro | null;
+  posts_micro?: Micro | null;
+  total_micro?: Micro | null;
+  earned_micro?: Micro | null;
+}
+
+/** GET /v1/creator/posts → Page<CreatorPost> (the creator's own posts). */
+export interface CreatorPost {
+  id: string;
+  title: string;
+  price_micro: Micro;
+  published_at: string | null;
+  strategy_id: string | null;
+  sales_count?: number | null;
 }
 
 /** No-code builder JSON spec — EXACTLY what backend/app/sandbox/nocode.py validate_spec/compile_spec accept (SPEC §10). */
