@@ -442,7 +442,7 @@ class SqlStore:
                 VALUES (CAST(:u AS uuid), CAST(:sid AS uuid), CAST(:vid AS uuid), :a, :m, :alloc, :lev,
                         CAST(:st AS subscription_status), :pe)
                 RETURNING *)
-            SELECT {_SUB_COLS}, st.slug AS strategy_slug, st.name AS strategy_name
+            SELECT {_SUB_COLS}, st.slug AS strategy_slug, st.name AS strategy_name, st.markets AS strategy_markets
               FROM s JOIN strategies st ON st.id = s.strategy_id""",
                         u=user_id, sid=strategy_id, vid=version_id, a=trading_address, m=master_address,
                         alloc=allocation_micro,
@@ -451,7 +451,7 @@ class SqlStore:
         return row
 
     def get_subscription(self, conn: Any, sub_id: str, user_id: str, *, for_update: bool = False) -> Optional[dict]:
-        sql = f"""SELECT {_SUB_COLS}, st.slug AS strategy_slug, st.name AS strategy_name
+        sql = f"""SELECT {_SUB_COLS}, st.slug AS strategy_slug, st.name AS strategy_name, st.markets AS strategy_markets
                   FROM subscriptions s JOIN strategies st ON st.id = s.strategy_id
                   WHERE s.id = CAST(:id AS uuid) AND s.user_id = CAST(:u AS uuid)"""
         if for_update:
@@ -485,7 +485,7 @@ class SqlStore:
 
     def list_subscriptions(self, conn: Any, user_id: str, limit: int, cursor: Cursor) -> list[dict]:
         return self._all(conn, f"""
-            SELECT {_SUB_COLS}, st.slug AS strategy_slug, st.name AS strategy_name
+            SELECT {_SUB_COLS}, st.slug AS strategy_slug, st.name AS strategy_name, st.markets AS strategy_markets
               FROM subscriptions s JOIN strategies st ON st.id = s.strategy_id
              WHERE s.user_id = CAST(:u AS uuid)
                AND (CAST(:cts AS timestamptz) IS NULL OR (s.created_at, s.id) < (CAST(:cts AS timestamptz), CAST(:cid AS uuid)))
