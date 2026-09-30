@@ -865,6 +865,52 @@ class SqlStore:
               FROM strategies st LEFT JOIN subscriptions s ON s.strategy_id = st.id
              WHERE st.owner_user_id = CAST(:o AS uuid) GROUP BY st.id, st.slug ORDER BY st.slug""", o=owner_id)
 
+    def list_creator_posts(self, conn: Any, creator_id: str, limit: int, cursor: Cursor) -> list[dict]:
+        """The creator's own posts (any strategy or none), newest first, with sales count and gross sales."""
+        return self._all(conn, """
+            SELECT p.id, p.created_at, p.title, p.price_micro, p.published_at, p.body, st.slug AS strategy_slug,
+                   (SELECT count(*) FROM post_purchases pp WHERE pp.post_id = p.id) AS sales,
+                   (SELECT coalesce(sum(pp.price_micro), 0)::bigint FROM post_purchases pp
+                     WHERE pp.post_id = p.id) AS gross_sales_micro
+              FROM posts p LEFT JOIN strategies st ON st.id = p.strategy_id
+             WHERE p.creator_id = CAST(:c AS uuid)
+               AND (CAST(:cts AS timestamptz) IS NULL OR (p.created_at, p.id) < (CAST(:cts AS timestamptz), CAST(:cid AS uuid)))
+             ORDER BY p.created_at DESC, p.id DESC LIMIT :lim""", c=creator_id, lim=limit + 1, **_c(cursor))
+
+    def creator_earnings_by_strategy(self, conn: Any, creator_id: str) -> list[dict]:
+        """Credits to ``creator:{id}:payable`` grouped by (strategy_id, category). Categories: builder (builder-fee
+        share, via fills.builder_fee_ledger_tx_id), subscription (start + renewals: key sub:{subscription}:…),
+        profit_share (ps:{subscription}:{date}), posts (post:{post}:{buyer}; strategy NULL for general posts),
+        other. strategy_id NULL = not attributable to one of the creator's strategies."""
+        return self._all(conn, """
+            WITH cr AS (
+                SELECT t.id AS tx_id, t.kind, t.idempotency_key AS k, -e.amount_micro AS amt
+                  FROM ledger_entries e
+                  JOIN ledger_accounts a ON a.id = e.account_id
+                  JOIN ledger_transactions t ON t.id = e.tx_id
+                 WHERE a.code = :code AND e.amount_micro < 0
+            ), src AS (
+                SELECT cr.amt,
+                       CASE WHEN cr.kind = 'builder_fee' THEN 'builder'
+                            WHEN cr.kind IN ('subscription_start', 'subscription_renewal') THEN 'subscription'
+                            WHEN cr.kind = 'profit_share' THEN 'profit_share'
+                            WHEN cr.kind = 'post_purchase' THEN 'posts'
+                            ELSE 'other' END AS cat,
+                       CASE WHEN cr.kind = 'builder_fee' THEN
+                                 (SELECT s.strategy_id FROM fills f JOIN subscriptions s ON s.id = f.subscription_id
+                                   WHERE f.builder_fee_ledger_tx_id = cr.tx_id LIMIT 1)
+                            WHEN cr.kind IN ('subscription_start', 'subscription_renewal', 'profit_share')
+                                 AND split_part(cr.k, ':', 2) ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+                                 (SELECT s.strategy_id FROM subscriptions s
+                                   WHERE s.id = CAST(split_part(cr.k, ':', 2) AS uuid))
+                            WHEN cr.kind = 'post_purchase'
+                                 AND split_part(cr.k, ':', 2) ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+                                 (SELECT p.strategy_id FROM posts p WHERE p.id = CAST(split_part(cr.k, ':', 2) AS uuid))
+                       END AS strategy_id
+                  FROM cr)
+            SELECT strategy_id, cat, sum(amt)::bigint AS micro FROM src GROUP BY strategy_id, cat
+             ORDER BY strategy_id NULLS LAST, cat""", code=f"creator:{creator_id}:payable")
+
     def get_kyc(self, conn: Any, user_id: str) -> Optional[dict]:
         return self._one(conn, """SELECT provider, provider_ref, status::text AS status FROM kyc_creators
                                   WHERE user_id = CAST(:u AS uuid)""", u=user_id)

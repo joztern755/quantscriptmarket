@@ -438,6 +438,104 @@ class ApiStoreDbTest(unittest.TestCase):
                                    actor="user:c")
         s.mark_deposit_reversed(db, ref)
 
+    # ------------------------------------------------------------------------------------------------ 0008 + creator
+    def test_devices_mfa_alert_dedup_and_kyc_states(self) -> None:
+        """user_devices / users.mfa_factor_hash (0008), alert dedup keys, KYC provider_approved (single admin)."""
+        s, db = self.store, self.db
+        uid = str(self.c["id"])
+        h1, h2 = "a" * 64, "b" * 64
+        self.assertFalse(s.record_device(db, uid, h1, "Chrome on macOS"))     # first device: silent
+        self.assertFalse(s.record_device(db, uid, h1, "Chrome on macOS"))
+        self.assertTrue(s.record_device(db, uid, h2, "Safari on iOS"))        # new device → alert
+        self.assertFalse(s.record_device(db, uid, h2, None))
+        self.assertIsNone(s.get_user(db, uid)["mfa_factor_hash"])
+        s.set_mfa_factor_hash(db, uid, "c" * 64)
+        self.assertEqual(s.get_user_by_firebase_uid(db, self.c["firebase_uid"])["mfa_factor_hash"], "c" * 64)
+        with self.assertRaises(DbError):
+            s.set_mfa_factor_hash(db, uid, "not-a-hash")                      # CHECK: hashes only
+        key = f"builder_approval_missing:{uid}:{self.tag}"
+        for _ in range(2):
+            s.insert_alert(db, user_id=uid, severity="critical", kind="builder_approval_missing",
+                           payload={"where": "subscribe"}, dedup_key=key)
+        self.assertEqual(len(db.fetchall("SELECT id FROM alerts WHERE dedup_key = :k", {"k": key})), 1)
+        # KYC: a provider GREEN is stored as provider_approved; a new session never replaces that applicant
+        s.upsert_kyc_pending(db, user_id=uid, provider="sumsub", provider_ref="app-" + self.tag)
+        self.assertEqual(s.set_kyc_status(db, uid, "provider_approved"), 1)
+        s.upsert_kyc_pending(db, user_id=uid, provider="sumsub", provider_ref="other-" + self.tag)
+        self.assertEqual(s.get_kyc(db, uid), {"provider": "sumsub", "provider_ref": "app-" + self.tag,
+                                              "status": "provider_approved"})
+        self.assertEqual(s.set_kyc_status(db, uid, "approved"), 1)
+
+    def test_creator_posts_and_earnings_by_strategy(self) -> None:
+        from app.api import ledger_ops
+        from app.api.creator_earnings import earnings_breakdown
+        from app.ledger import service
+
+        s, db, svc = self.store, self.db, self.svc
+        su = ApiRoleRunner(DB_URL, "postgres")
+        t = uuid.uuid4().hex[:8]
+        creator = str(s.create_user(db, firebase_uid=f"fbK{t}", email=f"k{t}@x.io", display_name="K",
+                                    referral_code=f"K{t}", referred_by=None, mfa_enrolled=True)["id"])
+        buyer = str(s.create_user(db, firebase_uid=f"fbQ{t}", email=f"q{t}@x.io", display_name="Q",
+                                  referral_code=f"Q{t}", referred_by=None, mfa_enrolled=True)["id"])
+        st = s.insert_strategy(db, owner_user_id=creator, slug=f"k-{t}", name="K strat", description=None,
+                               markets=["BTC"], timeframe="1d", price_monthly_micro=20_000_000, profit_share_bps=1000)
+        st2 = s.insert_strategy(db, owner_user_id=creator, slug=f"k2-{t}", name="K idle", description=None,
+                                markets=["BTC"], timeframe="1d", price_monthly_micro=0, profit_share_bps=0)
+        sid = str(st["id"])
+        ver = s.insert_version(db, strategy_id=sid, version=1, code_hash="d" * 64, code_ciphertext=b"\x00c",
+                               params={}, markets=["BTC"], timeframe="1d", lookback=300, max_leverage=2, backtest={})
+        addr = _addr(self.seed * 10 + 77)
+        sub = str(s.insert_subscription(db, user_id=buyer, strategy_id=sid, version_id=str(ver["id"]),
+                                        trading_address=addr, master_address=addr, allocation_micro=500_000_000,
+                                        max_leverage_x100=100, status="active",
+                                        current_period_end=self.now + timedelta(days=30))["id"])
+        service.post_transaction(su, f"test-topup:{t}", "deposit", "t",
+                                 [("treasury:hl_usdc", 100_000_000), (ledger_ops.fee_balance(buyer), -100_000_000)], "t")
+        stg = {"slug": st["slug"], "price_monthly_micro": 20_000_000, "in_house": False, "owner_user_id": creator}
+        ledger_ops.charge_subscription_start(db, svc, user_id=buyer, subscription_id=sub, strategy=stg, actor="t")
+        service.post_transaction(su, f"ps:{sub}:2026-10-01", "profit_share", "t",
+                                 [(ledger_ops.fee_balance(buyer), 1_150_000), (ledger_ops.creator_payable(creator), -1_000_000),
+                                  ("platform:revenue:profit_share", -150_000)], "system:settlement")
+        bf = service.post_transaction(su, f"bf:{addr}:{self.seed}", "builder_fee", "t",
+                                      [("builder:hl_receivable", 1000), (ledger_ops.creator_payable(creator), -500),
+                                       ("platform:revenue:builder", -500)], "system:settlement")
+        su.fetchall("""INSERT INTO fills (subscription_id, trading_address, coin, tid, px, sz, side, closed_pnl_micro,
+                                          fee_micro, builder_fee_micro, cloid, time, builder_fee_recognised_at,
+                                          builder_fee_ledger_tx_id)
+                       VALUES (CAST(:s AS uuid), :a, 'BTC', :tid, 100, 1, 'buy', 0, 1000, 1000, NULL, now(), now(),
+                               CAST(:tx AS uuid))""", {"s": sub, "a": addr, "tid": self.seed % 10**9, "tx": str(bf.id)})
+        p1 = s.insert_post(db, creator_id=creator, strategy_id=sid, title="Strategy notes", body="body one",
+                           price_micro=5_000_000, now=self.now)
+        p2 = s.insert_post(db, creator_id=creator, strategy_id=None, title="General notes", body="body two",
+                           price_micro=3_000_000, now=self.now)
+        for p in (p1, p2):
+            prow = {**s.get_post(db, str(p["id"])), "strategy_in_house": None}
+            price, ptx = ledger_ops.charge_post(db, svc, user_id=buyer, post_row=prow, actor="t")
+            s.insert_purchase(db, post_id=str(p["id"]), user_id=buyer, price_micro=price, tx_id=ptx)
+
+        posts = s.list_creator_posts(db, creator, 1, None)
+        self.assertEqual(len(posts), 2)                                   # limit + 1 (next page exists)
+        allp = {r["title"]: r for r in s.list_creator_posts(db, creator, 10, None)}
+        self.assertEqual((allp["Strategy notes"]["strategy_slug"], allp["Strategy notes"]["body"],
+                          allp["Strategy notes"]["sales"], allp["Strategy notes"]["gross_sales_micro"]),
+                         (st["slug"], "body one", 1, 5_000_000))
+        self.assertIsNone(allp["General notes"]["strategy_slug"])
+        self.assertEqual(s.list_creator_posts(db, buyer, 10, None), [])
+
+        credits = s.creator_earnings_by_strategy(db, creator)
+        rows, general, other = earnings_breakdown(s.active_subscribers_by_strategy(db, creator), credits)
+        by = {str(r["strategy_id"]): r for r in rows}
+        r = by[sid]
+        self.assertEqual((r["subscription_share_micro"], r["profit_share_micro"], r["builder_share_micro"],
+                          r["posts_micro"]), (19_400_000, 1_000_000, 500, 4_000_000))
+        self.assertEqual(r["earned_micro"], 19_400_000 + 1_000_000 + 500 + 4_000_000)
+        self.assertEqual(r["active_subscribers"], 1)
+        self.assertEqual(by[str(st2["id"])]["earned_micro"], 0)
+        self.assertEqual((general, other), (2_000_000, 0))
+        self.assertEqual(sum(x["earned_micro"] for x in rows) + general + other,
+                         s.total_credited(db, ledger_ops.creator_payable(creator)))
+
     # ------------------------------------------------------------------------------------------------ ops / admin
     def test_alerts_flags_changes_audit_idempotency(self) -> None:
         s, db = self.store, self.db

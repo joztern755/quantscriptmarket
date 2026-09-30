@@ -109,7 +109,7 @@ def all_cursors(conn: Any, job: str) -> dict[str, tuple[Optional[int], dict[str,
 def set_cursor(conn: Any, job: str, key: str, cursor_ms: Optional[int], state: Mapping[str, Any] | None = None,
                *, monotonic: bool = True) -> None:
     """Upsert a cursor. ``monotonic``: never move an existing cursor backwards (concurrent runs are harmless)."""
-    rows(conn, f"""
+    rows(conn, """
         INSERT INTO job_cursors (job, key, cursor_ms, state) VALUES (:j, :k, :c, CAST(:s AS jsonb))
         ON CONFLICT (job, key) DO UPDATE
            SET cursor_ms = CASE WHEN :mono AND job_cursors.cursor_ms IS NOT NULL

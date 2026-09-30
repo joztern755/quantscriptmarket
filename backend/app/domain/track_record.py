@@ -12,11 +12,17 @@ Definitions:
 - subscriber counts are DISTINCT USERS (a user with two subscriptions counts once) — this is what the
   k-anonymity threshold (default 5) is applied to.
 - `not_live_proven` while the version has < 90 live days (or has never gone live).
+
+Daily public series (`daily_series`, GET /v1/public/strategies/{slug}/equity): for each UTC day d since live_since,
+the aggregate cumulative PnL through the end of d (today: through `now`) and the ROI over [live_since, end of d]
+with exactly the definitions above (so the last point equals `compute_track_record(..., now)`). k-anonymity: the
+whole series is hidden when the window has fewer than `min_subscribers` distinct users, and a day is emitted only
+once at least `min_subscribers` distinct users had capital deployed up to it.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from collections.abc import Iterable
 
 from app.money import BPS
@@ -31,6 +37,8 @@ __all__ = [
     "PublicStats",
     "compute_track_record",
     "public_stats",
+    "SeriesPoint",
+    "daily_series",
 ]
 
 LIVE_PROVEN_DAYS = 90
@@ -166,3 +174,71 @@ def public_stats(record: TrackRecord, min_subscribers: int = 5) -> PublicStats |
         active_subscribers=record.active_subscribers,
         profitable_subscriptions=record.profitable_subscriptions,
     )
+
+
+@dataclass(frozen=True)
+class SeriesPoint:
+    day: date                 # UTC day
+    pnl_micro: int            # cumulative aggregate PnL since live_since through the end of `day` (today: `now`)
+    roi_bps: int | None       # ROI over [live_since, end of `day`] (time-weighted capital), None without capital
+    subscribers: int          # distinct users with capital deployed up to the end of `day`
+
+
+def daily_series(
+    live_since: datetime | None,
+    events: Iterable[PnlEvent],
+    spans: Iterable[AllocationSpan],
+    now: datetime,
+    *,
+    min_subscribers: int = 5,
+    max_days: int = 1000,
+) -> tuple[list[SeriesPoint], str | None]:
+    """(points, hidden_reason) — see module docstring. hidden_reason: "not_live" | "too_few_subscribers" | None.
+    At most the last `max_days` days are returned (cumulative values still start at live_since)."""
+    now = require_aware("now", now)
+    k = max(1, require_non_negative("min_subscribers", min_subscribers))
+    if live_since is None:
+        return [], "not_live"
+    ls = require_aware("live_since", live_since)
+    if ls > now:
+        return [], "not_live"
+    evs = list(events)
+    sps = list(spans)
+    whole = compute_track_record(ls, evs, sps, now)
+    if public_stats(whole, k) is None:
+        return [], "too_few_subscribers"
+
+    counted = sorted((require_aware("event.time", e.time), require_int("pnl_micro", e.pnl_micro))
+                     for e in evs if ls <= require_aware("event.time", e.time) <= now)
+    norm = []
+    for sp in sps:
+        alloc = require_non_negative("allocation_micro", sp.allocation_micro)
+        start = require_aware("span.start", sp.start)
+        end = require_aware("span.end", sp.end) if sp.end is not None else now
+        if alloc > 0:
+            norm.append((alloc, start, min(end, now), sp.user_id))
+
+    first_day, last_day = ls.astimezone(timezone.utc).date(), now.astimezone(timezone.utc).date()
+    n_days = (last_day - first_day).days + 1
+    points: list[SeriesPoint] = []
+    cum, i = 0, 0
+    for n in range(n_days):
+        d = first_day + timedelta(days=n)
+        end_d = min(datetime.combine(d + timedelta(days=1), time(0), tzinfo=timezone.utc), now)
+        is_last = n == n_days - 1
+        while i < len(counted) and (counted[i][0] <= end_d if is_last else counted[i][0] < end_d):
+            cum += counted[i][1]
+            i += 1
+        window_us = max(0, (end_d - ls) // _US)
+        cap_acc, users = 0, set()
+        for alloc, start, end, uid in norm:
+            ov = _overlap_us(start, end, ls, end_d)
+            if ov > 0:
+                cap_acc += alloc * ov
+                users.add(uid)
+        if len(users) < k:
+            continue
+        twc = cap_acc // window_us if window_us > 0 else 0
+        roi = None if twc <= 0 else (1 if cum >= 0 else -1) * ((abs(cum) * BPS) // twc)
+        points.append(SeriesPoint(day=d, pnl_micro=cum, roi_bps=roi, subscribers=len(users)))
+    return points[-max(1, int(max_days)):], None

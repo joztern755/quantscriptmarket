@@ -314,6 +314,13 @@ class FakeStore:
         k = self.w.kyc.get(str(user_id))
         return dict(k) if k else None
 
+    def set_kyc_status(self, conn, user_id, status):
+        k = self.w.kyc.get(str(user_id))
+        if k is None:
+            return 0
+        k["status"] = status
+        return 1
+
     # strategies
     def get_strategy(self, conn, strategy_id, *, for_update=False):
         st = self.w.strategies.get(str(strategy_id))
@@ -518,11 +525,14 @@ class FakeAuth:
         self.tokens: dict[str, dict] = {}
 
     def add(self, token: str, uid: str, *, email: str = "u@example.com", mfa: bool = True,
-            auth_time: Optional[datetime] = None, provider: str = "google.com", **extra: Any) -> str:
+            auth_time: Optional[datetime] = None, provider: str = "google.com",
+            second_factor_identifier: Optional[str] = None, **extra: Any) -> str:
         at = int((auth_time or T0).timestamp())
         fb = {"sign_in_provider": provider}
         if mfa:
             fb["sign_in_second_factor"] = "totp"
+        if second_factor_identifier:
+            fb["second_factor_identifier"] = second_factor_identifier
         self.tokens[token] = {"sub": uid, "uid": uid, "email": email, "email_verified": True, "auth_time": at,
                               "firebase": fb, **extra}
         return token

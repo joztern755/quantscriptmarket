@@ -715,6 +715,19 @@ class DomainAdapter:
                                                     "pnl_micro": pub.total_pnl_micro}}
 
 
+    def equity_series(self, *, live_since: Optional[datetime], events: list[dict], spans: list[dict], now: datetime,
+                      min_subscribers: int) -> tuple[list[dict[str, Any]], Optional[str]]:
+        """Daily public live series (app.domain.track_record.daily_series) → ([{t, pnl_micro, roi_bps}], hidden)."""
+        tr = _require("app.domain.track_record")
+        pts, hidden = tr.daily_series(
+            live_since,
+            [tr.PnlEvent(str(e["subscription_id"]), e["time"], int(e["pnl_micro"])) for e in events],
+            [tr.AllocationSpan(str(s["subscription_id"]), str(s["user_id"]), int(s["allocation_micro"]), s["start"],
+                               s.get("end")) for s in spans],
+            now, min_subscribers=min_subscribers)
+        return [{"t": p.day, "pnl_micro": p.pnl_micro, "roi_bps": p.roi_bps} for p in pts], hidden
+
+
 # =============================================================================================================
 # Factory
 # =============================================================================================================

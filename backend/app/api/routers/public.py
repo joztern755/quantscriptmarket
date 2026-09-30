@@ -158,6 +158,28 @@ def strategy_detail(slug: str = Path(..., pattern=SLUG_PATTERN, max_length=64), 
     )
 
 
+@router.get("/strategies/{slug}/equity", response_model=S.EquitySeriesOut)
+def strategy_equity(slug: str = Path(..., pattern=SLUG_PATTERN, max_length=64),
+                    svc: Services = Depends(get_services)) -> S.EquitySeriesOut:
+    """Daily aggregate LIVE record of the current version (fills closedPnl − fee + funding of all subscribers, the
+    same inputs as `stats`): cumulative $ and ROI per UTC day since live_since. k-anonymity (SPEC §5.8): hidden with
+    fewer than min_subscribers distinct users; days before k users had capital deployed are omitted."""
+    with svc.db.begin() as conn:
+        st = svc.store.get_public_strategy(conn, slug)
+        if st is None:
+            raise NotFound("strategy not found")
+        sid = str(st["id"])
+        ver = svc.store.current_versions(conn, [sid]).get(sid)
+        live_since = ver.get("live_since") if ver else None
+        if live_since is None:
+            return S.EquitySeriesOut(slug=slug, version=ver["version"] if ver else None, hidden_reason="not_live")
+        events, spans = svc.store.track_record_inputs(conn, sid, live_since)
+    points, hidden = svc.domain.equity_series(live_since=live_since, events=events, spans=spans, now=svc.now(),
+                                              min_subscribers=svc.settings.risk.min_subscribers_for_public_stats)
+    return S.EquitySeriesOut(slug=slug, version=ver["version"], since=live_since,
+                             points=[S.EquityPointOut(**p) for p in points], hidden_reason=hidden)
+
+
 @router.get("/strategies/{slug}/reviews", response_model=S.Page[S.ReviewOut])
 def strategy_reviews(slug: str = Path(..., pattern=SLUG_PATTERN, max_length=64), limit: int = Query(20, ge=1, le=50),
                      cursor: Optional[str] = Query(None, max_length=200),

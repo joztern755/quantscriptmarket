@@ -8,7 +8,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.domain.track_record import AllocationSpan, PnlEvent, compute_track_record, public_stats  # noqa: E402
+from app.domain.track_record import (  # noqa: E402
+    AllocationSpan,
+    PnlEvent,
+    compute_track_record,
+    daily_series,
+    public_stats,
+)
 from app.money import usd  # noqa: E402
 
 UTC = timezone.utc
@@ -113,6 +119,46 @@ class TrackRecordTest(unittest.TestCase):
     def test_naive_rejected(self):
         with self.assertRaises(ValueError):
             compute_track_record(LIVE, [PnlEvent("s0", datetime(2026, 2, 1), 1)], [], NOW)
+
+
+
+class DailySeriesTest(unittest.TestCase):
+    def test_cumulative_daily_points_last_equals_track_record(self):
+        now = LIVE + timedelta(days=3, hours=6)
+        ev = [PnlEvent(f"s{i}", LIVE + timedelta(days=1, hours=2), usd(100)) for i in range(5)]
+        ev += [PnlEvent("s0", LIVE + timedelta(days=3, hours=5), -usd(50)),
+               PnlEvent("s1", LIVE + timedelta(days=3, hours=7), usd(999)),      # after now: ignored
+               PnlEvent("s2", LIVE - timedelta(hours=1), usd(999))]              # before live_since: ignored
+        pts, hidden = daily_series(LIVE, ev, spans(5), now, min_subscribers=5)
+        self.assertIsNone(hidden)
+        self.assertEqual([p.day.isoformat() for p in pts], ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"])
+        self.assertEqual([p.pnl_micro for p in pts], [0, usd(500), usd(500), usd(450)])
+        self.assertEqual(pts[0].roi_bps, 0)
+        self.assertEqual(pts[1].roi_bps, usd(500) * 10_000 // usd(50_000))         # full capital all along
+        tr = compute_track_record(LIVE, ev, spans(5), now)
+        self.assertEqual((pts[-1].pnl_micro, pts[-1].roi_bps, pts[-1].subscribers),
+                         (tr.total_pnl_micro, tr.roi_bps, tr.subscriber_count))
+
+    def test_k_anonymity(self):
+        now = LIVE + timedelta(days=5)
+        pts, hidden = daily_series(LIVE, [], spans(4), now, min_subscribers=5)
+        self.assertEqual((pts, hidden), ([], "too_few_subscribers"))
+        self.assertEqual(daily_series(None, [], spans(5), now), ([], "not_live"))
+        self.assertEqual(daily_series(now + timedelta(days=1), [], spans(5), now), ([], "not_live"))
+        # 4 users from day 0, the 5th joins on day 3 → no point before k users had capital
+        sp = spans(4) + [AllocationSpan("s9", "u9", usd(10_000), LIVE + timedelta(days=3, hours=1), None)]
+        pts, hidden = daily_series(LIVE, [PnlEvent("s0", LIVE + timedelta(hours=5), usd(10))], sp, now)
+        self.assertIsNone(hidden)
+        self.assertEqual(pts[0].day.isoformat(), "2026-01-04")
+        self.assertTrue(all(p.subscribers >= 5 for p in pts))
+        self.assertEqual(pts[0].pnl_micro, usd(10))
+
+    def test_max_days_keeps_latest(self):
+        now = LIVE + timedelta(days=30)
+        pts, _ = daily_series(LIVE, [PnlEvent("s0", LIVE + timedelta(days=1), usd(7))], spans(5), now, max_days=7)
+        self.assertEqual(len(pts), 7)
+        self.assertEqual(pts[-1].day, now.date())
+        self.assertEqual(pts[0].pnl_micro, usd(7))                                  # cumulative from live_since
 
 
 if __name__ == "__main__":

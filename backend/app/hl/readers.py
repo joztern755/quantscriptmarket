@@ -69,15 +69,16 @@ class HlMarketData:
                                        {d: v[2] for d, v in used.items()}, oldest)
 
     def snapshot(self, coin: str) -> PortSnapshot | None:
+        """Executor port snapshot. The domain → port mapping has ONE home: ``app.execution.wiring.from_risk_snapshot``
+        (this is the same path as ``wiring.CatalogMarketData(self).snapshot``)."""
+        from app.execution.wiring import from_risk_snapshot
+
         try:
             snap = self.catalog([coin]).to_snapshot(coin)
         except (NotFound, GuardRejected) as e:
             log.info("hl_snapshot_unavailable", extra={"fields": {"coin": coin, "reason": e.message}})
             return None
-        return PortSnapshot(coin=snap.coin, mid_px=snap.mid_px, mark_px=snap.mark_px, oracle_px=snap.oracle_px,
-                            day_notional_volume_micro=snap.day_ntl_vlm_micro,
-                            open_interest_notional_micro=snap.open_interest_micro, max_leverage=snap.max_leverage,
-                            sz_decimals=snap.sz_decimals, as_of=snap.data_time, is_delisted=snap.is_delisted)
+        return from_risk_snapshot(snap)
 
 
 class HlPositionReader:

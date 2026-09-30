@@ -15,16 +15,19 @@ import math
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
 from app.api import ledger_ops
 from app.api import schemas as S
+from app.api.creator_earnings import earnings_breakdown
 from app.api.deps import (
     AuthCtx,
     Services,
     creator_step_up,
     creator_user,
+    decode_cursor_or_422,
     get_services,
+    next_cursor,
     user_limit,
 )
 from app.errors import Conflict, Forbidden, NotFound, ValidationFailed
@@ -218,6 +221,20 @@ def create_post(body: S.CreatorPostIn, ctx: AuthCtx = Depends(creator_step_up),
                      published_at=row["published_at"], body=row["body"], purchased=False)
 
 
+@router.get("/posts", response_model=S.Page[S.CreatorPostOut])
+def my_posts(limit: int = Query(20, ge=1, le=100), cursor: Optional[str] = Query(None, max_length=200),
+             ctx: AuthCtx = Depends(creator_user), svc: Services = Depends(get_services)) -> S.Page[S.CreatorPostOut]:
+    """The creator's own posts (full bodies), newest first, with sales counts."""
+    cur = decode_cursor_or_422(cursor)
+    with svc.db.begin() as conn:
+        rows, nxt = next_cursor(svc.store.list_creator_posts(conn, ctx.user_id, limit, cur), limit)
+    return S.Page[S.CreatorPostOut](items=[S.CreatorPostOut(
+        id=r["id"], title=r["title"], price_micro=int(r["price_micro"]), strategy_slug=r.get("strategy_slug"),
+        published_at=r.get("published_at"), created_at=r["created_at"], body=r.get("body"),
+        sales=int(r.get("sales") or 0), gross_sales_micro=int(r.get("gross_sales_micro") or 0)) for r in rows],
+        next_cursor=nxt)
+
+
 @router.get("/earnings", response_model=S.EarningsOut)
 def earnings(ctx: AuthCtx = Depends(creator_user), svc: Services = Depends(get_services)) -> S.EarningsOut:
     account = ledger_ops.creator_payable(ctx.user_id)
@@ -225,13 +242,13 @@ def earnings(ctx: AuthCtx = Depends(creator_user), svc: Services = Depends(get_s
         payable = -svc.ledger.balance(conn, account)
         total = svc.store.total_credited(conn, account)
         pending = svc.store.pending_payouts_total(conn, ctx.user_id)
-        by_strategy = svc.store.active_subscribers_by_strategy(conn, ctx.user_id)
+        strategies = svc.store.active_subscribers_by_strategy(conn, ctx.user_id)
+        credits = svc.store.creator_earnings_by_strategy(conn, ctx.user_id)
         recent = svc.store.ledger_history(conn, account, 20, None)[:20]
+    rows, general_posts, other = earnings_breakdown(strategies, credits)
     return S.EarningsOut(
         payable_micro=payable, payouts_pending_micro=pending, total_earned_micro=total,
-        by_strategy=[S.StrategyEarningsOut(strategy_id=r["strategy_id"], slug=r["slug"],
-                                           active_subscribers=int(r["active_subscribers"] or 0),
-                                           earned_micro=r.get("earned_micro")) for r in by_strategy],
+        by_strategy=[S.StrategyEarningsOut(**r) for r in rows], general_posts_micro=general_posts, other_micro=other,
         recent=[S.LedgerEntryOut(tx_id=r["tx_id"], kind=r["kind"], memo=r.get("memo"),
                                  amount_micro=-int(r["raw_amount_micro"]), created_at=r["created_at"]) for r in recent])
 

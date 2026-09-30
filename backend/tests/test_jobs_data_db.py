@@ -180,6 +180,12 @@ class FakeInfo:
         self.calls.append(("agents", user))
         return list(self.agents.get(user, []))
 
+    builder_fees: dict[str, int] = {}
+
+    def max_builder_fee(self, user: str, builder: str) -> int:
+        self.calls.append(("max_builder_fee", user, builder))
+        return int(self.builder_fees.get(user, 0))
+
     def perp_dexs(self) -> list:
         return [None, {"name": "zz" + self.tag}]
 
@@ -489,7 +495,7 @@ class JobsDataDbTest(unittest.TestCase):
         rep = funding_scan(self.db, T0, info=info, weight_per_minute=100_000)
         self.assertEqual(rep["errors"], [])
         self.assertEqual(rep["inserted"], 5)
-        rows = {(r["coin"], r["t"]): r for r in self.admin.fetchall(f"""
+        rows = {(r["coin"], r["t"]): r for r in self.admin.fetchall("""
             SELECT coin, (floor(extract(epoch FROM time) * 1000))::bigint AS t, usdc_micro, attributed_micro,
                    subscription_id::text AS sub, n_samples, estimated
               FROM funding_events WHERE trading_address = :a""", {"a": addr})}
@@ -643,6 +649,53 @@ class JobsDataDbTest(unittest.TestCase):
         self.assertEqual((kinds.count("agent_revoked"), kinds.count("agent_expired")), (1, 2))
         self.assertEqual(ev[-2]["payload"].get("threshold_days") if ev[-2]["kind"] == "agent_expiring"
                          else ev[-1]["payload"].get("threshold_days"), 1)
+
+    def test_agent_scan_builder_approval_missing_daily(self) -> None:
+        """SPEC §12 mandatory builder_approval_missing: masters with an active agent AND a live subscription are
+        re-checked (maxBuilderFee) once per scan; below the required fee → one critical event per (user, master, day);
+        no live subscription / no builder configured → no check."""
+        from app.jobs_data.agents import agent_expiry_scan
+
+        info = FakeInfo()
+        info.builder_fees = {}
+        builder = "0x" + "b" * 40
+        settings = SimpleNamespace(builder_address=builder, hl_api_url="http://unused",
+                                   economics=SimpleNamespace(builder_fee_tenths_bp=100))
+        uid, idle = self.user(60), self.user(61)
+        sid, vid = self.strategy(["BTC"])
+        masters = {}
+        for n, (u, live, fee) in enumerate([(uid, True, 50), (uid, True, 100), (idle, False, 0)]):
+            master, agent = _addr(self.seed + 70 + n), _addr(self.seed + 80 + n)
+            masters[n] = master
+            self.admin.fetchall("""
+                INSERT INTO agent_keys (user_id, master_address, agent_address, key_ciphertext, kms_key_version, status)
+                VALUES (CAST(:u AS uuid), :m, :a, '\\x01'::bytea, 'v1', 'active')""", {"u": u, "m": master, "a": agent})
+            info.agents[master] = [{"name": "aijalon", "address": agent, "validUntil": T0_MS + 100 * DAY}]
+            info.builder_fees[master] = fee
+            if live:
+                self.subscription(u, sid, vid, master, T0 - timedelta(days=1))
+        rep = agent_expiry_scan(self.db, T0, info=info, settings=settings)
+        self.assertEqual(rep["errors"], [])
+        checked = {c[1] for c in info.calls if c[0] == "max_builder_fee"}
+        self.assertEqual(checked, {masters[0], masters[1]})                    # idle master (no live sub) skipped
+        ev = self.admin.fetchall("""SELECT user_id::text AS u, severity::text AS s, payload FROM events_outbox
+                                     WHERE kind = 'builder_approval_missing' AND user_id IN (CAST(:a AS uuid), CAST(:b AS uuid))""",
+                                 {"a": uid, "b": idle})
+        self.assertEqual(len(ev), 1)
+        self.assertEqual((ev[0]["u"], ev[0]["s"], ev[0]["payload"]["approved_tenths_bp"],
+                          ev[0]["payload"]["required_tenths_bp"], ev[0]["payload"]["where"]),
+                         (uid, "critical", 50, 100, "daily_scan"))
+        self.assertNotIn(masters[0], json.dumps(ev[0]["payload"]))              # short address only
+        agent_expiry_scan(self.db, T0 + timedelta(hours=3), info=info, settings=settings)   # same day: no repeat
+        agent_expiry_scan(self.db, T0 + timedelta(days=1), info=info, settings=settings)    # next day: again
+        n = self.admin.fetchall("""SELECT count(*) AS n FROM events_outbox WHERE kind = 'builder_approval_missing'
+                                    AND user_id = CAST(:u AS uuid)""", {"u": uid})[0]["n"]
+        self.assertEqual(n, 2)
+        # no builder configured → no check at all
+        calls = len(info.calls)
+        agent_expiry_scan(self.db, T0 + timedelta(days=2), info=info,
+                          settings=SimpleNamespace(builder_address="", hl_api_url="x", economics=settings.economics))
+        self.assertFalse([c for c in info.calls[calls:] if c[0] == "max_builder_fee"])
 
     # ------------------------------------------------------------------------------------------ signals
     def test_signals_ingest_store_duplicate_and_reject(self) -> None:

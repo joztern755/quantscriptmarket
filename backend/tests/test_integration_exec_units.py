@@ -151,9 +151,19 @@ class SnapshotMappingTest(unittest.TestCase):
         risk = src.catalog([SILVER]).to_snapshot(SILVER)
         self.assertEqual(to_risk_snapshot(snap), risk)
         self.assertEqual(from_risk_snapshot(risk), snap)
-        legacy = HlMarketData(FakeInfo()).snapshot(SILVER)   # the readers' own mapping agrees (except fetch time)
+        legacy = HlMarketData(FakeInfo()).snapshot(SILVER)   # the readers' snapshot agrees (except fetch time)
         self.assertEqual(replace(legacy, as_of=snap.as_of), snap)
         self.assertIsNone(md.snapshot("xyz:NOPE"))
+        self.assertIsNone(src.snapshot("xyz:NOPE"))
+        # single mapping: HlMarketData.snapshot delegates to wiring.from_risk_snapshot (no second copy)
+        import inspect
+        from unittest import mock
+
+        from app.execution import wiring
+        self.assertNotIn("day_notional_volume_micro", inspect.getsource(HlMarketData.snapshot))
+        with mock.patch.object(wiring, "from_risk_snapshot", wraps=wiring.from_risk_snapshot) as spy:
+            self.assertEqual(replace(src.snapshot(SILVER), as_of=snap.as_of), snap)
+        self.assertEqual(spy.call_count, 1)
 
     def test_planner_treats_closing_as_reduce_only(self):
         from app.execution.ports import PlanInput, Position

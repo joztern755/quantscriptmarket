@@ -100,8 +100,9 @@ export interface StrategyDetail extends StrategySummary {
   rating_count: number;
 }
 
-/** GET /v1/public/strategies/{slug}/equity — live record of the CURRENT version (t = ms epoch). When the record
- *  is hidden (k-anonymity / not live yet) `points` is empty and `hidden_reason` says why. */
+/** GET /v1/public/strategies/{slug}/equity (EquitySeriesOut) — daily cumulative live record of the CURRENT version.
+ *  Wire `t` is a UTC day ("2026-09-20") or ms epoch; parsed to ms. When hidden (k-anonymity / not live yet) `points`
+ *  is empty and `hidden_reason` says why. */
 export interface EquityPoint {
   t: number;
   pnl_micro: Micro | null;
@@ -110,6 +111,8 @@ export interface EquityPoint {
 export interface EquityOut {
   points: EquityPoint[];
   hidden_reason: "not_live" | "too_few_subscribers" | string | null;
+  version?: number | null;
+  since?: string | null;
 }
 
 /** POST /v1/me/plan {plan} → PlanChangeOut (step-up; 402 insufficient_balance; 409 already on plan / too many strategies). */
@@ -363,32 +366,43 @@ export interface Earnings {
   payouts_pending_micro: Micro;
   total_earned_micro: Micro;
   by_strategy: StrategyEarnings[];
+  /** Paid posts not linked to a strategy, and any other credit; Σ by_strategy + these = total_earned_micro. */
+  general_posts_micro?: Micro;
+  other_micro?: Micro;
   recent: LedgerRow[];
 }
 
-/** EarningsOut.by_strategy row: per-strategy breakdown by source (all micro-USD, creator's share). Older backends
- *  sent only {strategy_id, slug, active_subscribers, earned_micro}, so everything but strategy_id is optional. */
+/** EarningsOut.by_strategy row: per-strategy breakdown by source (creator's share, micro-USD, all time).
+ *  Backend field names: builder_share_micro / subscription_share_micro / profit_share_micro / posts_micro, total =
+ *  earned_micro. The shorter builder_micro / subscription_micro / total_micro / name are accepted too. */
 export interface StrategyEarnings {
   strategy_id: string | null;
-  name?: string | null;
   slug?: string | null;
+  name?: string | null;
   active_subscribers?: number | null;
-  builder_micro?: Micro | null;
-  subscription_micro?: Micro | null;
+  earned_micro?: Micro | null;
+  builder_share_micro?: Micro | null;
+  subscription_share_micro?: Micro | null;
   profit_share_micro?: Micro | null;
   posts_micro?: Micro | null;
+  builder_micro?: Micro | null;
+  subscription_micro?: Micro | null;
   total_micro?: Micro | null;
-  earned_micro?: Micro | null;
 }
 
-/** GET /v1/creator/posts → Page<CreatorPost> (the creator's own posts). */
+/** GET /v1/creator/posts → Page<CreatorPostOut> (the creator's own posts, newest first). */
 export interface CreatorPost {
   id: string;
   title: string;
   price_micro: Micro;
+  strategy_slug?: string | null;
+  strategy_id?: string | null;
   published_at: string | null;
-  strategy_id: string | null;
+  created_at?: string;
+  body?: string | null;
+  sales?: number | null;
   sales_count?: number | null;
+  gross_sales_micro?: Micro | null;
 }
 
 /** No-code builder JSON spec — EXACTLY what backend/app/sandbox/nocode.py validate_spec/compile_spec accept (SPEC §10). */

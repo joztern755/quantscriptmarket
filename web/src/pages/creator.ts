@@ -6,7 +6,7 @@ import { h, mount, skeleton, errorState, emptyState, note, stat, kv, table, tabs
 import { api, publicConfig, newIdempotencyKey, type PublicConfig } from "../core/api.js";
 import { LEGAL_SLUGS, legalDocHash } from "../core/gate.js";
 import { fmtUsd, fmtBps, fmtDate, fmtDateTime, fmtTenthsBp } from "../core/format.js";
-import type { CreatorStrategy, CreatorVersion, CreatorPost, Earnings, NoCodeSpec, StrategyEarnings } from "./_shared/types.js";
+import type { CreatorStrategy, CreatorVersion, CreatorPost, Earnings, NoCodeSpec } from "./_shared/types.js";
 import { payoutForm } from "./_shared/payout.js";
 import { profitShare, subscriptionSplit, builderSplit, postSplit } from "./_shared/fees.js";
 import { backtestPanel } from "./_shared/backtest.js";
@@ -560,26 +560,40 @@ async function postsTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfig):
   );
 
   // GET /v1/creator/posts → Page<CreatorPost> (own posts, newest first)
-  const names = new Map(strategies.map((s) => [s.id, s]));
+  const byId = new Map(strategies.map((s) => [s.id, s]));
+  const bySlug = new Map(strategies.map((s) => [s.slug, s]));
   const loadPosts = async (): Promise<void> => {
     try {
       const res = await api.get<unknown>("/creator/posts?limit=100", { signal: ctx.signal });
       if (!ctx.isCurrent()) return;
-      const posts = listOf<CreatorPost>(res).sort((a, b) => (Date.parse(b.published_at ?? "") || 0) - (Date.parse(a.published_at ?? "") || 0));
+      const ts = (p: CreatorPost): number => Date.parse(p.published_at ?? p.created_at ?? "") || 0;
+      const posts = listOf<CreatorPost>(res).sort((a, b) => ts(b) - ts(a));
       const cols: Column<CreatorPost>[] = [
         { key: "t", label: "Title", value: (p) => h("a", { href: `#/posts/${encodeURIComponent(p.id)}`, class: "break" }, p.title), primary: true },
         {
           key: "s",
           label: "Strategy",
           value: (p) => {
-            const st = p.strategy_id ? names.get(p.strategy_id) : undefined;
-            return st ? (st.status === "listed" ? h("a", { href: `#/s/${encodeURIComponent(st.slug)}` }, st.name) : st.name) : h("span", { class: "muted" }, "—");
+            const st = (p.strategy_id ? byId.get(p.strategy_id) : undefined) ?? (p.strategy_slug ? bySlug.get(p.strategy_slug) : undefined);
+            if (st) return st.status === "listed" ? h("a", { href: `#/s/${encodeURIComponent(st.slug)}` }, st.name) : st.name;
+            return p.strategy_slug ? h("span", { class: "mono" }, p.strategy_slug) : h("span", { class: "muted" }, "—");
           },
           hideOnMobile: true,
         },
         { key: "p", label: "Price", value: (p) => (p.price_micro > 0 ? fmtUsd(p.price_micro) : badge("Free", "info")), align: "right", mono: true },
-        { key: "n", label: "Sales", value: (p) => (p.price_micro > 0 ? (typeof p.sales_count === "number" ? String(p.sales_count) : "—") : "n/a"), align: "right", mono: true },
-        { key: "d", label: "Published", value: (p) => (p.published_at ? fmtDate(p.published_at) : "Draft") },
+        {
+          key: "n",
+          label: "Sales",
+          value: (p) => {
+            if (!(p.price_micro > 0)) return h("span", { class: "muted" }, "n/a");
+            const n = typeof p.sales === "number" ? p.sales : typeof p.sales_count === "number" ? p.sales_count : null;
+            if (n === null) return "—";
+            return typeof p.gross_sales_micro === "number" && p.gross_sales_micro > 0 ? `${n} · ${fmtUsd(p.gross_sales_micro)}` : String(n);
+          },
+          align: "right",
+          mono: true,
+        },
+        { key: "d", label: "Published", value: (p) => (p.published_at ? fmtDate(p.published_at) : "Not published") },
       ];
       mount(listBox, posts.length ? table({ columns: cols, rows: posts, rowKey: (p) => p.id }) : emptyState("No posts yet", "Your published posts will be listed here."));
     } catch (err) {
@@ -594,7 +608,10 @@ async function postsTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfig):
 async function earningsTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfig): Promise<void> {
   mount(body, skeleton(8));
   try {
-    const e = await api.get<Earnings>("/creator/earnings", { signal: ctx.signal });
+    const [e, strategies] = await Promise.all([
+      api.get<Earnings>("/creator/earnings", { signal: ctx.signal }),
+      loadMyStrategies(ctx).catch(() => [] as CreatorStrategy[]),
+    ]);
     if (!ctx.isCurrent()) return;
     mount(
       body,
@@ -605,7 +622,7 @@ async function earningsTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfi
         stat("Payable", fmtUsd(e.payable_micro)),
         stat("Payouts pending", fmtUsd(e.payouts_pending_micro)),
       ),
-      panel("By strategy", earningsByStrategy(e.by_strategy)),
+      panel("By strategy", earningsByStrategy(e, strategies)),
       panel("Request a payout", note("Payouts require verified identity (KYC) and are approved by two administrators, then sent as USDC on Hyperliquid.", "info"), payoutForm(ctx, cfg, "creator", e.payable_micro, () => void earningsTab(body, ctx, cfg))),
       panel(
         "Recent earnings",
@@ -628,37 +645,62 @@ async function earningsTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfi
   }
 }
 
-/** Per-strategy earnings by source (EarningsOut.by_strategy). Core `table` turns rows into cards below 640px. */
-function earningsByStrategy(rows: StrategyEarnings[]): HTMLElement {
-  const money = (v: number | null | undefined): Child => (typeof v === "number" ? fmtUsd(v) : "—");
-  const hasBreakdown = rows.some((r) => typeof r.total_micro === "number");
-  const total = (r: StrategyEarnings): number | null =>
-    typeof r.total_micro === "number" ? r.total_micro : typeof r.earned_micro === "number" ? r.earned_micro : null;
-  const cols: Column<StrategyEarnings>[] = [
-    {
-      key: "s",
-      label: "Strategy",
-      value: (r) => (r.name || r.slug ? h("span", { class: "break" }, r.name || r.slug || "") : h("span", { class: "muted" }, r.strategy_id ? "Strategy" : "Posts without a strategy")),
-      primary: true,
-    },
-  ];
-  if (rows.some((r) => typeof r.active_subscribers === "number")) {
-    cols.push({ key: "a", label: "Subscribers", value: (r) => (typeof r.active_subscribers === "number" ? String(r.active_subscribers) : "—"), align: "right", mono: true });
-  }
+/** Per-strategy earnings by source (EarningsOut.by_strategy + general_posts_micro / other_micro). Core `table`
+ *  turns rows into cards below 640px. */
+interface EarnRow {
+  key: string;
+  name: Child;
+  subscribers: number | null;
+  subscription: number | null;
+  profitShare: number | null;
+  builder: number | null;
+  posts: number | null;
+  total: number | null;
+}
+
+function earningsByStrategy(e: Earnings, strategies: CreatorStrategy[]): HTMLElement {
+  const num = (...xs: unknown[]): number | null => {
+    for (const x of xs) if (typeof x === "number" && Number.isFinite(x)) return x;
+    return null;
+  };
+  const byId = new Map(strategies.map((s) => [s.id, s]));
+  const rows: EarnRow[] = e.by_strategy.map((r) => {
+    const st = r.strategy_id ? byId.get(r.strategy_id) : undefined;
+    const parts = [num(r.subscription_share_micro, r.subscription_micro), num(r.profit_share_micro), num(r.builder_share_micro, r.builder_micro), num(r.posts_micro)];
+    const sum = parts.every((x) => x === null) ? null : parts.reduce<number>((a, x) => a + (x ?? 0), 0);
+    return {
+      key: r.strategy_id ?? r.slug ?? "strategy",
+      name: h("span", { class: "break" }, r.name || st?.name || r.slug || "Strategy"),
+      subscribers: num(r.active_subscribers),
+      subscription: parts[0]!,
+      profitShare: parts[1]!,
+      builder: parts[2]!,
+      posts: parts[3]!,
+      total: num(r.total_micro, r.earned_micro) ?? sum,
+    };
+  });
+  const general = num(e.general_posts_micro);
+  if (general) rows.push({ key: "general-posts", name: h("span", { class: "muted" }, "Posts without a strategy"), subscribers: null, subscription: null, profitShare: null, builder: null, posts: general, total: general });
+  const other = num(e.other_micro);
+  if (other) rows.push({ key: "other", name: h("span", { class: "muted" }, "Other (adjustments)"), subscribers: null, subscription: null, profitShare: null, builder: null, posts: null, total: other });
+  const money = (v: number | null): Child => (v === null ? "—" : fmtUsd(v));
+  const cols: Column<EarnRow>[] = [{ key: "s", label: "Strategy", value: (r) => r.name, primary: true }];
+  if (rows.some((r) => r.subscribers !== null)) cols.push({ key: "a", label: "Subscribers", value: (r) => (r.subscribers === null ? "—" : String(r.subscribers)), align: "right", mono: true });
+  const hasBreakdown = rows.some((r) => r.subscription !== null || r.profitShare !== null || r.builder !== null || r.posts !== null);
   if (hasBreakdown) {
     cols.push(
-      { key: "sub", label: "Subscriptions", value: (r) => money(r.subscription_micro), align: "right", mono: true },
-      { key: "ps", label: "Profit share", value: (r) => money(r.profit_share_micro), align: "right", mono: true },
-      { key: "b", label: "Builder fees", value: (r) => money(r.builder_micro), align: "right", mono: true },
-      { key: "p", label: "Posts", value: (r) => money(r.posts_micro), align: "right", mono: true },
+      { key: "sub", label: "Subscriptions", value: (r) => money(r.subscription), align: "right", mono: true },
+      { key: "ps", label: "Profit share", value: (r) => money(r.profitShare), align: "right", mono: true },
+      { key: "b", label: "Builder fees", value: (r) => money(r.builder), align: "right", mono: true },
+      { key: "p", label: "Posts", value: (r) => money(r.posts), align: "right", mono: true },
     );
   }
-  cols.push({ key: "t", label: "Total", value: (r) => { const t = total(r); return t === null ? "—" : h("b", null, fmtUsd(t)); }, align: "right", mono: true });
-  const sorted = [...rows].sort((a, b) => (total(b) ?? -1) - (total(a) ?? -1));
+  cols.push({ key: "t", label: "Total", value: (r) => (r.total === null ? "—" : h("b", null, fmtUsd(r.total))), align: "right", mono: true });
+  rows.sort((a, b) => (b.total ?? -1) - (a.total ?? -1));
   return h(
     "div",
     { class: "stack tight earnings-by-strategy" },
-    table({ columns: cols, rows: sorted, rowKey: (r) => r.strategy_id ?? "no-strategy", empty: "No strategies yet." }),
+    table({ columns: cols, rows, rowKey: (r) => r.key, empty: "No strategies yet." }),
     hasBreakdown ? h("p", { class: "small muted" }, "Your share after the platform's cut, all time. Builder fees are your part of the builder fee on subscribers' orders; profit share is charged only above each subscriber's high-water mark.") : null,
   );
 }

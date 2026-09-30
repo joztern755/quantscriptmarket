@@ -400,7 +400,7 @@ class UserAlertsDbTest(unittest.TestCase):
                                                             "avg_px": "31", "fees_micro": 60_000})
         a_bal = self.alert(uid, "balance_low", "warn", {"balance_micro": 4_000_000, "threshold_bps": 2000,
                                                         "need_micro": 20_000_000})
-        a_agent = self.alert(uid, "agent_expired", "critical", {"master": wallet, "secret": "a" * 64})
+        self.alert(uid, "agent_expired", "critical", {"master": wallet, "secret": "a" * 64})
         tg, mail = FakeTelegram(), FakeEmail()
         rep = self.run_worker(tg, mail)
         self.assertGreaterEqual(rep["sent_telegram"], 3)

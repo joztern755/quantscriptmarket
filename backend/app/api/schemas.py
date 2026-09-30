@@ -157,6 +157,20 @@ class StrategySummary(Out):
     stats: StrategyStats
 
 
+class EquityPointOut(Out):
+    t: date                                     # UTC day; values are cumulative through the end of that day
+    pnl_micro: int                              # aggregate $ made by subscribers since the version went live
+    roi_bps: Optional[int] = None               # ROI on time-weighted capital over [live_since, end of day]
+
+
+class EquitySeriesOut(Out):
+    slug: str
+    version: Optional[int] = None               # current (published) version the series belongs to
+    since: Optional[datetime] = None            # its live_since (a new version resets the series)
+    points: list[EquityPointOut] = Field(default_factory=list)
+    hidden_reason: Optional[str] = None         # not_live | too_few_subscribers (k-anonymity) → points = []
+
+
 class StrategyVersionPublic(Out):
     version: int
     published_at: Optional[datetime]
@@ -751,7 +765,11 @@ class StrategyEarningsOut(Out):
     strategy_id: UUID
     slug: str
     active_subscribers: int
-    earned_micro: Optional[int] = None          # not broken down per strategy yet (see total_earned_micro)
+    earned_micro: Optional[int] = None          # lifetime credits attributed to this strategy (Σ of the four below)
+    builder_share_micro: int = 0                # creator share of the builder fee on subscribers' fills
+    subscription_share_micro: int = 0           # 97 % of subscription prices (first period + renewals)
+    profit_share_micro: int = 0                 # creator's profit share (the platform's 1.5 % is on top, not here)
+    posts_micro: int = 0                        # paid posts linked to this strategy (price − $1 platform fee)
 
 
 class EarningsOut(Out):
@@ -759,7 +777,21 @@ class EarningsOut(Out):
     payouts_pending_micro: int
     total_earned_micro: int
     by_strategy: list[StrategyEarningsOut]
+    general_posts_micro: int = 0                # paid posts not linked to a strategy
+    other_micro: int = 0                        # any other credit (adjustments); Σ by_strategy + these = total
     recent: list[LedgerEntryOut]
+
+
+class CreatorPostOut(Out):
+    id: UUID
+    title: str
+    price_micro: int
+    strategy_slug: Optional[str] = None
+    published_at: Optional[datetime] = None
+    created_at: datetime
+    body: Optional[str] = None                  # own posts: always the full body
+    sales: int = 0
+    gross_sales_micro: int = 0                  # Σ prices paid by buyers (before the $1 platform fee per sale)
 
 
 class KycSessionOut(Out):

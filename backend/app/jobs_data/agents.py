@@ -12,6 +12,11 @@ Events (``events_outbox``, user-facing, mandatory kinds of app/alerts/prefs.py):
     consecutive scans (and its known validUntil has not simply passed) → ``status = 'revoked'``, ``revoked_at``.
     A single miss only raises an ops event (a transient empty answer must not revoke anything).
 
+Builder-fee approval (SPEC §12 mandatory alert "builder approval missing"): for every master that has an active
+agent AND a live subscription, ``maxBuilderFee(master, builder)`` is re-read once per scan; below the fee our
+orders carry (``economics.builder_fee_tenths_bp``) → ``builder_approval_missing`` (critical), at most once per
+(user, master, UTC day). Skipped when no builder address is configured.
+
 EXECUTION CONTRACT (the executor/settlement code must honour it; this job never touches subscriptions):
   an expired or revoked agent cannot place ANY order on Hyperliquid (not even reduce-only exits). The executor must
   only trade subscriptions whose user has an ``agent_keys`` row with ``status = 'active'`` AND
@@ -55,6 +60,8 @@ class AgentReport:
     expired: int = 0
     missing: int = 0
     revoked: int = 0
+    builder_checked: int = 0
+    builder_missing: int = 0
     errors: list[str] = field(default_factory=list)
     remaining: int = 0
 
@@ -68,16 +75,26 @@ def agent_expiry_scan(db: Any, now: datetime, *, info: Any = None, settings: Any
                       max_seconds: float = 240.0, weight_per_minute: int = 600, missing_scans_to_revoke: int = 2,
                       pacer: Optional[WeightPacer] = None) -> dict[str, Any]:
     now_ms = _db.now_ms(now)
+    if settings is None:
+        from app.config import get_settings
+
+        settings = get_settings()
     info = make_info_client(settings, info=info)
     pacer = pacer or WeightPacer(weight_per_minute, max_seconds=max_seconds)
     report = AgentReport()
+    builder = str(getattr(settings, "builder_address", "") or "").lower()
+    econ = getattr(settings, "economics", None)
+    required = int(getattr(econ, "builder_fee_tenths_bp", 0) or 0)
     with _db.transaction(db) as conn:
         agents = _db.rows(conn, f"""
-            SELECT id::text AS id, user_id::text AS user_id, master_address, agent_address, agent_name,
-                   {_db.ts_to_ms('valid_until')} AS valid_until_ms,
-                   {_db.ts_to_ms('valid_until_checked_at')} AS checked_ms
-              FROM agent_keys WHERE status = 'active'
-             ORDER BY valid_until_checked_at NULLS FIRST, id""")
+            SELECT k.id::text AS id, k.user_id::text AS user_id, k.master_address, k.agent_address, k.agent_name,
+                   {_db.ts_to_ms('k.valid_until')} AS valid_until_ms,
+                   {_db.ts_to_ms('k.valid_until_checked_at')} AS checked_ms,
+                   EXISTS (SELECT 1 FROM subscriptions s
+                            WHERE s.user_id = k.user_id AND s.master_address = k.master_address
+                              AND s.status IN ('pending', 'active', 'past_due', 'reduce_only', 'closing')) AS live
+              FROM agent_keys k WHERE k.status = 'active'
+             ORDER BY k.valid_until_checked_at NULLS FIRST, k.id""")
     report.agents = len(agents)
     by_master: dict[str, list[dict[str, Any]]] = {}
     for a in agents:
@@ -103,8 +120,34 @@ def agent_expiry_scan(db: Any, now: datetime, *, info: Any = None, settings: Any
             except Exception as e:  # noqa: BLE001 - one agent must not block the others
                 report.errors.append(f"{a['id'][:8]}:{type(e).__name__}")
                 _db.log.error("agent_scan_failed", exc_info=True, extra={"fields": {"agent_id": a["id"]}})
+        live_users = sorted({str(a["user_id"]) for a in rows if a.get("live")})
+        if builder and required > 0 and live_users and pacer.can_start(20):
+            _check_builder(db, info, pacer, master, live_users, builder, required, now_ms, report)
     _db.log.info("agent_expiry_scan_done", extra={"fields": report.as_dict()})
     return report.as_dict()
+
+
+def _check_builder(db: Any, info: Any, pacer: WeightPacer, master: str, user_ids: list[str], builder: str,
+                   required: int, now_ms: int, report: AgentReport) -> None:
+    """Daily builder-fee approval check for a master with live subscriptions (see module doc)."""
+    pacer.spend(20)
+    try:
+        approved = int(info.max_builder_fee(master, builder))
+    except (AppError, TypeError, ValueError) as e:
+        report.errors.append(f"builder:{_db.short_addr(master)}:{type(e).__name__}")
+        return
+    report.builder_checked += 1
+    if approved >= required:
+        return
+    day = now_ms // DAY_MS
+    with _db.transaction(db) as conn:
+        for uid in user_ids:
+            if _db.emit_event(conn, kind="builder_approval_missing", user_id=uid, severity="critical",
+                              payload={"master": _db.short_addr(master), "approved_tenths_bp": approved,
+                                       "required_tenths_bp": required, "where": "daily_scan",
+                                       "reapprove_path": "#/agents"},
+                              dedup_key=f"builder_approval_missing:{uid}:{master}:{day}"):
+                report.builder_missing += 1
 
 
 def _payload(a: dict[str, Any], valid_until_ms: Optional[int], now_ms: int, **extra: Any) -> dict[str, Any]:

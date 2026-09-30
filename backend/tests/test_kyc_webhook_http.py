@@ -67,15 +67,18 @@ class KycWebhookHttpTests(unittest.TestCase):
         svc = make_services(world, store=Store(world), kyc=SimpleNamespace(parse_webhook=prov.parse_webhook))
         return world, u, TestClient(create_app(svc), raise_server_exceptions=False)
 
-    def test_green_approves_and_audits(self):
+    def test_green_is_provider_approved_awaiting_one_admin(self):
+        """Owner: a provider GREEN is never an approval by itself — stored as provider_approved, ops asked for ONE
+        admin's confirmation (POST /v1/admin/users/{id}/kyc)."""
         world, u, c = self.build()
         raw, h = signed(u["id"])
         for _ in range(2):                                   # redelivery: second is "unchanged"
             r = c.post("/v1/webhooks/kyc", content=raw, headers=h)
             self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(world.kyc[u["id"]]["status"], "approved")
+        self.assertEqual(world.kyc[u["id"]]["status"], "provider_approved")
         results = [a["payload"]["result"] for a in world.audit if a["action"] == "kyc.webhook"]
         self.assertEqual(results, ["updated", "unchanged"])
+        self.assertEqual([a["kind"] for a in world.alerts if a["user_id"] is None], ["kyc_awaiting_admin"])
 
     def test_api_red_final_rejects_even_if_payload_green(self):
         world, u, c = self.build(answer="RED", reject_type="FINAL")

@@ -24,6 +24,7 @@ one of them in the same commit. Reconciled 30 Sep 2026 (the two sides had been b
 | GET `/public/config` | — | `PublicConfigOut` (below) | — | core `publicConfig()` |
 | GET `/public/strategies` | `?market=&limit≤50&cursor=` | `Page<StrategySummary>` | 422 bad cursor | market, home |
 | GET `/public/strategies/{slug}` | — | `StrategyDetail` | 404 | strategy, subscribe |
+| GET `/public/strategies/{slug}/equity` **(new)** | — | `EquitySeriesOut {slug, version|null, since|null, points[{t, pnl_micro, roi_bps|null}], hidden_reason|null}` | 404 · `hidden_reason` `not_live` / `too_few_subscribers` (then `points = []`) | strategy (live chart) |
 | GET `/public/strategies/{slug}/reviews` | `?limit&cursor` | `Page<ReviewOut>` | 404 | strategy |
 | GET `/public/leaderboard` | `?by=roi\|pnl\|subscribers&period=30d\|90d\|all` | `LeaderboardOut {by, period, entries:[{rank, slug, name, roi_bps, pnl_micro, subscribers}]}` | hidden/not-live strategies never ranked | leaderboard |
 | GET `/public/posts` | `?strategy=<slug>&limit&cursor` | `Page<PostSummary {id, title, price_micro, strategy_slug, creator_display_name, published_at, preview}>` | preview = first 280 chars of FREE posts | posts, strategy |
@@ -46,17 +47,40 @@ Summary: `id, slug, name, description` **(moved up from detail)**, `in_house, ma
 `current_version|null (int), live_since|null, stats{subscribers, roi_bps, pnl_micro, since, hidden_reason}` (k-anonymity: nulls + `hidden_reason` `not_live`/`too_few_subscribers`).
 Detail adds: `versions[{version, published_at, live_since, is_current}]`, `backtest` (sandbox report minus `trades`, `latest_signal`, `data_notes`: `period{sim_days,…}, history_days, equity_curve[[t_ms, equity]], metrics{in_sample, out_of_sample, full, split_t}` with fractional returns, `trade_count, warnings[]`), `backtest_warning|null`, **`risk_ack_text` (new, shown by the subscribe gate)**, `rating_avg_x100|null, rating_count`.
 SILVER (SPEC §12): `free_showcase=true`, `showcase_text` = "Free showcase of the engine: $0/month and 0% profit share … CASH since 1980-01-15 … no trades for a long time." — card and page render it verbatim.
-Not provided (web guessed, dropped): live `equity` series, `creator_name`, `featured`, per-strategy `showcase` embed.
+Not provided (web guessed, dropped): `creator_name`, `featured`, per-strategy `showcase` embed.
+
+### `EquitySeriesOut` (GET `/public/strategies/{slug}/equity`)
+Daily aggregate LIVE record of the **current version** (a new version resets it), from the same inputs as `stats`
+(subscribers' fills `closedPnl − fee` + funding, `app.domain.track_record.daily_series`): one point per UTC day since
+`since` (= the version's `live_since`), at most the latest 1000 days. `t` = the UTC day (`"YYYY-MM-DD"`); `pnl_micro` =
+cumulative $ made by all subscribers since `since` through the end of that day (today: now); `roi_bps` = that PnL over
+the time-weighted capital of [since, end of day] (null without capital) — the last point equals `stats` of the
+`all` period. k-anonymity (SPEC §5.8): the whole series is hidden (`points: []`, `hidden_reason: "too_few_subscribers"`)
+below `min_subscribers` (5) distinct users, and days before 5 users had capital deployed are omitted; a version that
+never went live → `hidden_reason: "not_live"`. Cacheable 60 s like every `/public` route.
 
 ## Account (Bearer + MFA)
 
 | Method & path | Gate | Request | Response | Errors / reasons | Web caller |
 |---|---|---|---|---|---|
-| GET `/me` | MFA | — | `MeOut {id, email, display_name, role, plan, status, referral_code, country_attested, mfa_enrolled, created_at, consents_complete, wallets[{address, verified_at}], kyc_status|null}` (**kyc_status new**) | 403 suspended/not allow-listed | core state |
+| GET `/me` | MFA | — | `MeOut {id, email, display_name, role, plan, status, referral_code, country_attested, mfa_enrolled, created_at, consents_complete, wallets[{address, verified_at}], kyc_status|null}` (**kyc_status new**: `pending` \| `provider_approved` (provider passed, awaiting our admin) \| `approved` \| `rejected`) | 403 suspended/not allow-listed | core state |
 | PATCH `/me` | MFA | `{display_name?, referral_code_used?}` | `MeOut` | 409 already bound, 403 self-referral/window, 404 code | main.ts (first-touch ref) |
-| POST `/me/plan` 🔑 | consent | `{plan}` | `PlanChangeOut` | 402, 409 | — (not in UI yet) |
+| POST `/me/plan` 🔑 | consent | `{plan: "free"\|"pro"\|"max"}` | `PlanChangeOut {plan, charged_micro, period_end|null, fee_balance_micro}` | 402 `insufficient_balance` (details `balance_micro`, `required_micro`) · 409 already on this plan · 409 too many active strategies for the plan (details `active`) | plan picker (see below) |
 | GET `/consents/status` | MFA | — | `{required, accepted, missing[], complete}` | — | — |
 | POST `/consents` | MFA | `{consents:[{doc, doc_version, context, strategy_id?, accepted_at?, doc_text_sha256, country?}]}` (1–10) | `ConsentStatusOut` | 409 version changed (details.current_version) · **409 reason `legal_text_mismatch`** · 422 missing hash · 451 restricted country · 503 prod without canonical hashes | gate.ts (site + subscribe), creator (creator_agreement) |
+
+`POST /me/plan` (exists, `routers/me.py`): switches the platform plan NOW. A paid plan (Pro $20, Max $50 —
+`public/config.plans`) charges the first month immediately from the fee balance (`charged_micro`; no proration, no
+refund when switching) and sets `period_end` = now + 1 month; the daily settlement renews it from the fee balance at
+`period_end` (unpaid → `plan_past_due` alert, downgraded to free after the 72 h grace → `plan_downgraded` alert).
+`free` → `charged_micro: 0`, `period_end: null`. Downgrading is refused (409) while the user has more live
+subscriptions than the target plan allows (`max_active_strategies`). Send a fresh `Idempotency-Key` per click.
+
+Sign-in security alerts (server-side, no web call): the API raises the mandatory `new_device_login` alert on a sign-in
+from a new country or a new device and `mfa_changed` when the Firebase second factor differs from the last one seen.
+The web SHOULD send **`X-Device-Id`** on every API call: a random 16–128 char `[A-Za-z0-9_-]` id created once and kept
+in `localStorage` (never derived from hardware; CORS allows the header). Without it the device is approximated from
+the User-Agent without version numbers.
 
 **Consent doc keys** (DB enum `consent_doc`, SPEC §4) and the file whose bytes are hashed:
 
@@ -131,6 +155,14 @@ Stripe fee (SPEC §1, owner): passed to the user. UI estimate = `ceil(amount × 
 | POST `/posts/{id}/purchase` 🔑 | consent | — | 201 `{post_id, charged_micro, fee_balance_micro}` (402; 403 needs Pro/Max; 409 free/own) | posts |
 | GET `/referrals` | consent | — | `{code, link, tier, share_of_pool_bps, active_referred_users_30d, referred_notional_30d_micro, referred_users_total, earnings_payable_micro, earnings_total_micro, next_tier|null}` | referrals |
 
+User alert kinds in `GET /alerts` (catalog `app/alerts/prefs.py`, payloads `app/alerts/user_templates.py`; Telegram +
+email delivery by the worker per the email policy) now produced by the backend: `withdrawal_requested` (POST
+/withdrawals), `withdrawal_sent` / `withdrawal_rejected` (admin), `new_device_login` {country?, device?, reason}
+and `mfa_changed` (sign-in), `builder_approval_missing` {master, approved_tenths_bp, required_tenths_bp, where}
+(subscribe refusal, builder confirm, agent confirm, daily scan), `profit_share_charged` {amount_micro, profit_micro,
+rate_bps, strategy, period_start, period_end}, `subscription_renewed`, `balance_low` / `balance_empty` (every
+fee-balance posting incl. settlement and USDC scans), `kyc_status` {status}.
+
 ## Creator Studio (feature flag + creator agreement consent → role creator)
 
 | Method & path | Gate | Request | Response | Errors | Web caller |
@@ -141,8 +173,16 @@ Stripe fee (SPEC §1, owner): passed to the user. UI estimate = `ceil(amount × 
 | GET `/creator/strategies/{id}/versions` | creator | — | **array** `CreatorVersionOut {id, version, code_hash, published_at, live_since, params{source,…}, backtest, created_at, warning}` | — | creator (reset warning) |
 | POST `/creator/strategies/{id}/versions` | creator step-up | `{source: "python", code}` or `{source: "nocode", spec}` | 201 `CreatorVersionOut` (validation + backtest run synchronously; `backtest.history_days` stamped from the candle store / backtest span) | 422 `details.errors` (validator strings or no-code `{path, message}`) | creator — uploading moves draft → review; there is **no** `/submit` or `GET …/versions/{vid}` endpoint (web polling removed) |
 | POST `/creator/posts` | creator step-up | `{title, body, strategy_id?, price_micro}` (no `excerpt`) | 201 `PostOut` | 403 `kyc_required` for paid | creator |
-| GET `/creator/earnings` | creator | — | `{payable_micro, payouts_pending_micro, total_earned_micro, by_strategy[{strategy_id, slug, active_subscribers, earned_micro|null}], recent: LedgerEntryOut[]}` | — | creator |
-| POST `/creator/kyc/session` | creator | — | `{url ("" when manual), provider, status, manual}` | 409 approved | creator (manual → "reviewed by our team" notice) |
+| GET `/creator/posts` **(new)** | creator | `?limit≤100&cursor` | `Page<CreatorPostOut {id, title, price_micro, strategy_slug|null, published_at, created_at, body, sales, gross_sales_micro}>` (own posts, newest first, full bodies) | — | creator (my posts) |
+| GET `/creator/earnings` | creator | — | `{payable_micro, payouts_pending_micro, total_earned_micro, by_strategy[{strategy_id, slug, active_subscribers, earned_micro, builder_share_micro, subscription_share_micro, profit_share_micro, posts_micro}], general_posts_micro, other_micro, recent: LedgerEntryOut[]}` (**per-strategy breakdown new**) | — | creator |
+| POST `/creator/kyc/session` | creator | — | `{url ("" when manual), provider, status, manual}` | 409 approved · 409 reason `awaiting_admin` (provider passed, our admin confirms) | creator (manual → "reviewed by our team" notice) |
+
+Earnings per strategy = lifetime credits to the creator's payable, attributed through the ledger: builder-fee share
+(creator 50 % of the builder fee on subscribers' fills), subscription share (97 % of first periods + renewals), the
+creator's profit share (the platform's 1.5 % is charged on top and is not the creator's), paid posts linked to the
+strategy (price − $1). `earned_micro` = Σ of the four. Posts without a strategy → `general_posts_micro`; anything else
+(manual adjustments) → `other_micro`. Σ `by_strategy[].earned_micro` + `general_posts_micro` + `other_micro` =
+`total_earned_micro`. Every owned strategy is listed (zeros included).
 
 No-code spec = exactly `backend/app/sandbox/nocode.py` (SPEC §10): `{version: 1, markets[], timeframe, lookback, max_leverage, indicators: {id: {type, source?, period, shift?}}, rules: [{when: {all|any: [{left, op, right} | nested]}, weight}], default_weight}`; operands = indicator id, price field (`close|open|high|low|volume`) or number; ops `> < >= <= crosses_above crosses_below`; weights apply to **each** market. The web's former per-coin rule format was replaced. `web/tests/nocode_contract.mjs` validates/compiles/runs web-generated specs with the Python module.
 
@@ -154,7 +194,7 @@ No-code spec = exactly `backend/app/sandbox/nocode.py` (SPEC §10): `{version: 1
 | POST `/admin/flags` | `{key, value: bool, reason (5–500)}` | `{status: "applied"\|"pending", change?}` | engage = now; lift = pending |
 | POST `/admin/flags/{key}/approve` \| `/reject` | `{reason}` | `AdminActionOut` | different admin |
 | GET `/admin/changes` | `?status=pending\|approved\|rejected` | `Page<ChangeOut {id, kind, target, payload, reason, status, maker_admin, checker_admin, created_at, decided_at}>` | Approvals tab (**new UI**) |
-| POST `/admin/changes/{id}/approve` \| `/reject` | `{reason}` | `AdminActionOut` | strategy_list / strategy_price / user_unsuspend / kyc_approve |
+| POST `/admin/changes/{id}/approve` \| `/reject` | `{reason}` | `AdminActionOut` | strategy_list / strategy_price / user_unsuspend (KYC no longer uses the queue; a legacy `kyc_approve` entry can only be rejected) |
 | GET `/admin/payouts` | `?kind=withdrawal\|payout&status=` | `Page<AdminPayoutOut {id, kind, beneficiary, amount_micro, to_address, status, maker_admin, checker_admin, tx_hash, created_at}>` | web loads both kinds |
 | POST `/admin/payouts/{kind}/{id}/approve` | — | `AdminPayoutOut` | 1st then 2nd (different) admin |
 | POST `/admin/payouts/{kind}/{id}/reject` | `{reason}` | `AdminPayoutOut` | releases hold |
@@ -166,7 +206,7 @@ No-code spec = exactly `backend/app/sandbox/nocode.py` (SPEC §10): `{version: 1
 | POST `/admin/strategies/{id}/price` | `{price_monthly_micro, reason}` | pending (in-house only) | web's PATCH /admin/strategies/{id} did not exist |
 | GET `/admin/users` | `?q (≥3)` | `Page<AdminUserOut>` | |
 | POST `/admin/users/{id}/suspend` \| `/unsuspend` | `{reason}` | applied / pending | |
-| POST `/admin/users/{id}/kyc` | `{decision: approved\|rejected, reason}` | pending / applied | |
+| POST `/admin/users/{id}/kyc` | `{decision: approved\|rejected, reason}` | `AdminActionOut {status: "applied"}` | **ONE admin** (owner 30 Sep 2026), step-up + audit. Manual provider: pending/rejected → approved. Sumsub: only `provider_approved` (provider GREEN; never auto-approved) → approved, else 409 reason `provider_not_approved`. 403 own KYC. 409 already approved/rejected. Rejection immediate. Listing and payouts keep two admins. |
 | GET `/admin/alerts` | `?severity=&unacked=&ops_only=` | `Page<AlertOut>` | |
 | POST `/admin/alerts/{id}/ack` | — | `{ok}` | |
 | GET `/admin/reconciliation` | — | `{report: ReconcileReport.as_dict()|null, generated_at}` | report = `{positions_checked, drifts[], builder_db_micro, builder_chain_micro, builder_mismatch, treasury_ledger_micro, treasury_chain_micro, treasury_mismatch, errors[]}` |
@@ -179,7 +219,7 @@ Webhooks (`/webhooks/stripe`, `/webhooks/telegram`, `/webhooks/kyc`) and `/inter
 |---|---|---|
 | Lists | `{strategies:[…]}`, `{rows}`, `{posts}` … | `Page.items` everywhere (plain arrays where noted) |
 | Strategy stats | `roi_pct, pnl_micro, subscribers` top-level | `stats{roi_bps, pnl_micro, subscribers, hidden_reason}` |
-| Strategy extras | `signal_state, live_days, max_leverage, risk_ack_text, current_version{…}, equity` | backend adds signal_state, live_days, not_live_proven, max_leverage, history/short_history_days, free_showcase/showcase_text, risk_ack_text; current_version is an int; no live equity series |
+| Strategy extras | `signal_state, live_days, max_leverage, risk_ack_text, current_version{…}, equity` | backend adds signal_state, live_days, not_live_proven, max_leverage, history/short_history_days, free_showcase/showcase_text, risk_ack_text; current_version is an int; live equity series at GET `/public/strategies/{slug}/equity` (k-anonymous) |
 | Consents | no hash; docs posted without evidence | `doc_text_sha256` required and verified; file-stem ↔ doc-key mapping fixed on the server |
 | Agent create | `{master_address, trading_address}` → `{id, agent_address, typed_data}` | `{master_address, signature_chain_id}` → `{agent{…}, approve_agent{typed_data}}` |
 | Subscribe | extra `agent_id` (422); min $10; balance ≥ price | no agent_id; expected terms sent; min $100; balance ≥ price + reserve; reasons handled |
@@ -190,7 +230,7 @@ Webhooks (`/webhooks/stripe`, `/webhooks/telegram`, `/webhooks/kyc`) and `/inter
 | Positions | `szi` | `size`; `unavailable[]` shown |
 | Posts | `/public/posts/{id}` (missing), `excerpt`, `creator_name` | new public route; `preview`, `creator_display_name`; `/posts/{id}` when signed in; no `excerpt` on create |
 | Referrals | `active_users_30d, payable_micro, tiers, history` | ReferralsOut names; tiers from public config; payout request added |
-| Creator | no slug (422); `/versions/{vid}`, `/submit`, `/creator/posts` GET (missing) | slug added; upload result used directly; list of own posts replaced by a link |
+| Creator | no slug (422); `/versions/{vid}`, `/submit`, `/creator/posts` GET (missing) | slug added; upload result used directly; GET `/creator/posts` (own posts) and per-strategy earnings added |
 | Admin | `/flags/pending/{id}`, `/payouts/{id}`, `/strategies/{id}/review`, PATCH strategy, `?in_house=` | real routes incl. Approvals queue, kinds, reasons, KYC decisions |
 | No-code | per-coin indicators/rules, `c/h/l/v` sources | nocode.py format (cross-tested) |
 | Earnings | `earned_micro` required but never filled (500) | optional (null) |

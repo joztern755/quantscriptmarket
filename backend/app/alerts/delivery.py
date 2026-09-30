@@ -22,11 +22,12 @@ deliver_outbox(db, now) — one pass, idempotent, safe to run concurrently:
      queued (email only) and the executor pauses new entries after 24 h (alert_contacts_entries_allowed).
 
 Low-balance hook: :func:`on_balance_changed` — call it whenever a user's fee balance changes, in the SAME
-transaction, with the balance before and after (user-facing, i.e. −ledger balance):
-  * API: wired in app/api/ledger_ops.post (every fee-balance posting made by the API).
-  * Settlement / renewals / deposit scans that post outside ledger_ops MUST call
-    ``on_balance_changed(conn, user_id, prev_micro, new_micro)`` after each posting that touches
-    ``user:{id}:fee_balance`` (profit share, subscription renewal, plan renewal, deposits credited by jobs).
+transaction, with the balance before and after (user-facing, i.e. −ledger balance). Wired everywhere a posting
+touches ``user:{id}:fee_balance``:
+  * API: app/api/ledger_ops.post (every API posting, incl. the Stripe webhook's credits / refunds / disputes);
+  * settlement (profit share, subscription renewals, plan renewals): app.execution.settlement via
+    app.execution.pg.PgUserEvents.fee_balance_changed (SAVEPOINT inside the settlement transaction);
+  * USDC deposits credited by the treasury scan: app/jobs_data/deposits._balance_changed.
 It emits balance_low (50 %, 20 %) / balance_empty (0 %) alerts when a threshold of the estimated monthly need
 (Σ live subscription prices + plan price) is crossed downwards (app.domain.billing.crossed_low_balance_thresholds).
 

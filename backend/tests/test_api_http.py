@@ -317,6 +317,9 @@ def test_withdrawal_idempotency_replay_mismatch_and_rollback():
     world.credit(u["id"], 100 * USD)
     assert c.post("/v1/withdrawals", headers={**h, "Idempotency-Key": k2}, json=big).status_code == 201
     assert any(a["kind"] == "withdrawal_requested" for a in world.alerts)
+    # SPEC §12 mandatory user alert (the worker sends it by Telegram + email), besides the ops row
+    mine = [a for a in world.alerts if a["kind"] == "withdrawal_requested" and a["user_id"] == u["id"]]
+    assert len(mine) == 2 and mine[0]["payload"]["amount_micro"] == 40 * USD and mine[0]["payload"]["request_id"]
     assert any(a["action"] == "withdrawal.request" for a in world.audit)
 
 
@@ -398,6 +401,11 @@ def test_subscribe_checks_agent_builder_leverage_terms():
     svc.hl.builder_fee = 50
     r = c.post("/v1/subscriptions", headers={**h, "Idempotency-Key": key()}, json=base)
     assert r.status_code == 409                                              # builder approval too low
+    r = c.post("/v1/subscriptions", headers={**h, "Idempotency-Key": key()}, json=base)
+    assert r.status_code == 409
+    missing = [a for a in world.alerts if a["kind"] == "builder_approval_missing"]
+    assert len(missing) == 1 and missing[0]["user_id"] == u["id"]             # survives the 409; once per day
+    assert missing[0]["payload"]["approved_tenths_bp"] == 50 and missing[0]["payload"]["where"] == "subscribe"
     svc.hl.builder_fee = 100
     for a in world.agents.values():
         a["status"] = "revoked"
@@ -504,6 +512,61 @@ def test_payout_two_admins_required():
     assert r.status_code == 200 and r.json()["payload"]["action"]["destination"] == W1
     stale = login(svc, world, "fb-admin2", stale=True)
     assert c.post(f"/v1/admin/payouts/withdrawal/{wid}/approve", headers=stale).status_code == 401
+
+
+def test_kyc_single_admin_decision():
+    """Owner 30 Sep 2026: ONE admin approves creator KYC (no change queue). Manual: pending → approved. Sumsub:
+    only provider_approved (GREEN) can be confirmed. Rejection immediate. No self-approval."""
+    world, svc, c = build()
+    a1, _ = _admins(world)
+    h1 = login(svc, world, "fb-admin1")
+    manual = world.add_user("fb-manual", role="creator")
+    sums = world.add_user("fb-sumsub", role="creator", email="s@example.com")
+    world.kyc[manual["id"]] = {"provider": "manual", "provider_ref": "m-1", "status": "pending"}
+    world.kyc[sums["id"]] = {"provider": "sumsub", "provider_ref": "app-1", "status": "pending"}
+    body = {"decision": "approved", "reason": "documents verified"}
+    r = c.post(f"/v1/admin/users/{manual['id']}/kyc", headers=h1, json=body)
+    assert r.status_code == 200 and r.json()["status"] == "applied", r.text
+    assert world.kyc[manual["id"]]["status"] == "approved" and not world.changes
+    assert any(x["action"] == "kyc.approve" for x in world.audit)
+    assert c.post(f"/v1/admin/users/{manual['id']}/kyc", headers=h1, json=body).status_code == 409
+    r = c.post(f"/v1/admin/users/{sums['id']}/kyc", headers=h1, json=body)
+    assert r.status_code == 409 and r.json()["error"]["details"]["reason"] == "provider_not_approved"
+    world.kyc[sums["id"]]["status"] = "provider_approved"
+    assert c.post(f"/v1/admin/users/{sums['id']}/kyc", headers=h1, json=body).status_code == 200
+    assert world.kyc[sums["id"]]["status"] == "approved"
+    r = c.post(f"/v1/admin/users/{sums['id']}/kyc", headers=h1, json={"decision": "rejected", "reason": "sanctions hit"})
+    assert r.status_code == 200 and world.kyc[sums["id"]]["status"] == "rejected"
+    world.kyc[a1["id"]] = {"provider": "manual", "provider_ref": "m-2", "status": "pending"}
+    assert c.post(f"/v1/admin/users/{a1['id']}/kyc", headers=h1, json=body).status_code == 403
+    stale = login(svc, world, "fb-admin1", stale=True)
+    assert c.post(f"/v1/admin/users/{manual['id']}/kyc", headers=stale, json=body).status_code == 401
+
+
+def test_new_device_and_mfa_change_alerts():
+    world, svc, c = build()
+    u = world.add_user("fb-dev")
+    ua1 = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/129.0 Safari/537.36"
+    ua2 = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 Version/17.6 Safari/604.1"
+
+    def me(ua, factor=None):
+        h = {**login(svc, world, "fb-dev", second_factor_identifier=factor), "User-Agent": ua}
+        assert c.get("/v1/me", headers=h).status_code == 200
+
+    def kinds():
+        return [a["kind"] for a in world.alerts if a["user_id"] == u["id"]]
+
+    me(ua1, "factor-1")
+    me(ua1.replace("129.0", "130.0"), "factor-1")          # browser update: same device, same factor
+    assert kinds() == []
+    me(ua2, "factor-1")
+    assert kinds() == ["new_device_login"]
+    assert world.alerts[-1]["payload"]["device"] == "Safari on iOS"
+    me(ua2, "factor-2")                                     # second factor replaced
+    assert kinds() == ["new_device_login", "mfa_changed"]
+    me(ua2, "factor-2")
+    assert kinds() == ["new_device_login", "mfa_changed"]
+    assert "factor-2" not in json.dumps(world.users[u["id"]], default=str)
 
 
 def test_kill_switch_engage_now_lift_needs_second_admin():

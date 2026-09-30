@@ -855,7 +855,7 @@ class PgCreatorSignalRepo:
     def creator_versions(self) -> list[dict[str, Any]]:
         """Published creator versions to run: strategy listed/paused and either the latest published version or
         one that live subscriptions still trade. Includes the sealed code (app_executor may read it)."""
-        rows = self.db.all(f"""
+        rows = self.db.all("""
             SELECT v.id::text AS version_id, v.strategy_id::text AS strategy_id, v.version, v.code_hash,
                    v.code_ciphertext, coalesce(v.markets, st.markets) AS markets,
                    coalesce(v.timeframe, st.timeframe) AS timeframe, coalesce(v.lookback, 300) AS lookback,

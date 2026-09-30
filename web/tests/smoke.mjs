@@ -86,8 +86,9 @@ function publicConfig(overrides = {}) {
       { name: "elite", min_active_users: 100, min_notional_30d_micro: 25000000000000, share_of_pool_bps: 10000 },
     ],
     features: { creator_uploads: true, payouts: false },
-    platform_max_leverage: 5,
-    max_user_leverage_x100: 200,
+    // owner decision (30 Sep 2026): no platform / launch leverage cap — the UI bound is min(strategy, HL market)
+    platform_max_leverage: 50,
+    max_user_leverage_x100: null,
     min_allocation_micro: 100000000,
     min_listing_history_days: 180,
     short_history_warning_days: 365,
@@ -107,7 +108,7 @@ const SILVER = {
 };
 const MOMO = {
   ...SILVER, id: "5c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f", slug: "btc-momo", name: "BTC Momentum 4h", in_house: false,
-  description: "Creator strategy.", markets: ["BTC"], timeframe: "4h", price_monthly_micro: 29000000, profit_share_bps: 1000,
+  description: "Creator strategy.", markets: ["BTC"], timeframe: "4h", price_monthly_micro: 29000000, profit_share_bps: 1000, max_leverage: 20,
   holds: false, signal_state: "trades", history_days: 208, short_history_days: 208, free_showcase: false, showcase_text: null,
 };
 const SILVER_DETAIL = {
@@ -136,13 +137,14 @@ const MOMO_DETAIL = {
   rating_count: 0,
 };
 const page = (items) => ({ items, next_cursor: null });
-// GET /v1/public/strategies/{slug}/equity → {points:[{t (ms), pnl_micro, roi_bps}], hidden_reason}
+// GET /v1/public/strategies/{slug}/equity → EquitySeriesOut {slug, version, since, points:[{t (UTC day), pnl_micro, roi_bps}], hidden_reason}
 const MOMO_V2_LIVE = Date.parse("2026-09-20T00:00:00Z");
 const MOMO_EQUITY = {
-  points: Array.from({ length: 11 }, (_, i) => ({ t: MOMO_V2_LIVE + i * DAY, pnl_micro: Math.round((i * 37 - (i % 3) * 20) * 1e6), roi_bps: i * 31 - (i % 3) * 17 })),
+  slug: "btc-momo", version: 2, since: "2026-09-20T00:00:00Z",
+  points: Array.from({ length: 11 }, (_, i) => ({ t: new Date(MOMO_V2_LIVE + i * DAY).toISOString().slice(0, 10), pnl_micro: Math.round((i * 37 - (i % 3) * 20) * 1e6), roi_bps: i * 31 - (i % 3) * 17 })),
   hidden_reason: null,
 };
-const SILVER_EQUITY = { points: [], hidden_reason: "too_few_subscribers" };
+const SILVER_EQUITY = { slug: "silver", version: 1, since: "2026-09-30T00:00:00Z", points: [], hidden_reason: "too_few_subscribers" };
 function publicRoute(pathname) {
   if (pathname === "/v1/public/strategies/silver/equity") return SILVER_EQUITY;
   if (pathname === "/v1/public/strategies/btc-momo/equity") return MOMO_EQUITY;
@@ -217,6 +219,15 @@ async function newPage(viewport, colorScheme, opts = {}) {
     }
     return r.fulfill({ status: 401, contentType: "application/json", headers: cors, body: JSON.stringify({ error: { code: "unauthorized", message: "sign in" } }) });
   });
+  if (opts.hl) {
+    // Hyperliquid info API (read-only): opts.hl(body) → JSON
+    await context.route("https://api.hyperliquid.xyz/**", (r) => {
+      const cors = { "access-control-allow-origin": "*", "access-control-allow-headers": "content-type" };
+      if (r.request().method() === "OPTIONS") return r.fulfill({ status: 204, headers: cors });
+      const out = opts.hl(JSON.parse(r.request().postData() || "{}"));
+      return r.fulfill({ status: out ? 200 : 422, contentType: "application/json", headers: cors, body: JSON.stringify(out ?? "unknown") });
+    });
+  }
   if (opts.appConfig) {
     await context.route(`${BASE}app-config.json`, (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(opts.appConfig) }));
   }
@@ -520,6 +531,7 @@ for (const vp of VIEWPORTS) {
     const planPosts = [];
     const unknown = [];
     const PLAN_PRICE = { free: 0, pro: 20000000, max: 50000000 };
+    const SUB2 = { ...SUB, id: "7b6a5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d", strategy_id: MOMO.id, strategy_slug: "btc-momo", strategy_name: "BTC Momentum 4h", strategy_markets: ["BTC"], trading_address: "0x4444444444444444444444444444444444444444", max_leverage_x100: 300 };
     const CREATOR_STRAT = { id: MOMO.id, slug: "btc-momo", name: "BTC Momentum 4h", status: "listed", markets: ["BTC"], timeframe: "4h", price_monthly_micro: 29000000, profit_share_bps: 1000, description: null, created_at: "2026-08-01T00:00:00Z" };
     const api = (req, u) => {
       const m = req.method();
@@ -529,7 +541,7 @@ for (const vp of VIEWPORTS) {
       if (m === "GET" && p === "/v1/alerts/contacts") return { body: contactsOut(st.linked) };
       if (m === "GET" && p === "/v1/alerts/settings") return { body: { contacts: contactsOut(st.linked), prefs: ALERT_PREFS, telegram_bot: "aijalon_bot", email_policy: "Telegram carries every alert. Email carries only mandatory alerts and security / money events." } };
       if (m === "GET" && p === "/v1/alerts") return { body: page([]) };
-      if (m === "GET" && p === "/v1/subscriptions") return { body: page([SUB]) };
+      if (m === "GET" && p === "/v1/subscriptions") return { body: page([SUB, SUB2]) };
       if (m === "GET" && p === "/v1/positions") return { body: { positions: [], unavailable: [] } };
       if (m === "GET" && p === "/v1/balance") return { body: { fee_balance_micro: st.fee, withdrawable_micro: 0, withdrawals_pending_micro: 0, estimated_monthly_need_micro: 0, reserve_required_micro: 0, min_topup_micro: 10000000 } };
       if (m === "GET" && p === "/v1/balance/ledger") return { body: page([]) };
@@ -543,18 +555,27 @@ for (const vp of VIEWPORTS) {
       }
       if (m === "GET" && p === "/v1/creator/strategies") return { body: [CREATOR_STRAT] };
       if (m === "GET" && p === "/v1/creator/posts") return { body: page([
-        { id: "p0000000-0000-4000-8000-000000000001", title: "Weekly notes: why we held cash", price_micro: 0, published_at: "2026-09-28T00:00:00Z", strategy_id: MOMO.id },
-        { id: "p0000000-0000-4000-8000-000000000002", title: "Deep dive: the 4h momentum filter, entry timing and why the stop sits where it does", price_micro: 5000000, published_at: "2026-09-29T00:00:00Z", strategy_id: MOMO.id, sales_count: 7 },
+        { id: "p0000000-0000-4000-8000-000000000001", title: "Weekly notes: why we held cash", price_micro: 0, strategy_slug: "btc-momo", published_at: "2026-09-28T00:00:00Z", created_at: "2026-09-28T00:00:00Z", body: "Free body.", sales: 0, gross_sales_micro: 0 },
+        { id: "p0000000-0000-4000-8000-000000000002", title: "Deep dive: the 4h momentum filter, entry timing and why the stop sits where it does", price_micro: 5000000, strategy_slug: "btc-momo", published_at: "2026-09-29T00:00:00Z", created_at: "2026-09-29T00:00:00Z", body: "Paid body.", sales: 7, gross_sales_micro: 35000000 },
       ]) };
       if (m === "GET" && p === "/v1/creator/earnings") return { body: {
-        payable_micro: 150000000, payouts_pending_micro: 0, total_earned_micro: 489760000,
-        by_strategy: [{ strategy_id: MOMO.id, slug: "btc-momo", name: "BTC Momentum 4h", active_subscribers: 12, builder_micro: 4200000, subscription_micro: 337560000, profit_share_micro: 120000000, posts_micro: 28000000, total_micro: 489760000 }],
+        payable_micro: 150000000, payouts_pending_micro: 0, total_earned_micro: 498760000,
+        by_strategy: [{ strategy_id: MOMO.id, slug: "btc-momo", active_subscribers: 12, earned_micro: 489760000, builder_share_micro: 4200000, subscription_share_micro: 337560000, profit_share_micro: 120000000, posts_micro: 28000000 }],
+        general_posts_micro: 9000000, other_micro: 0,
         recent: [],
       } };
       unknown.push(`${m} ${p}`);
       return { status: 404, body: { error: { code: "not_found", message: "not mocked" } } };
     };
-    const { context, page: pg, errors } = await newPage(vp.viewport, scheme, { appConfig: SIGNED_IN_APP_CONFIG, fbAuth: FB_AUTH_SIGNED_IN, api });
+    // HL meta: BTC max 12× (below the strategy's 20× → the market is the bound); builder dex xyz lists SILVER at 10×
+    const hlBodies = [];
+    const hl = (body) => {
+      hlBodies.push(body);
+      if (body.type === "meta" && !body.dex) return { universe: [{ name: "BTC", szDecimals: 5, maxLeverage: 12 }, { name: "SOL", szDecimals: 2, maxLeverage: 10 }] };
+      if (body.type === "meta" && body.dex === "xyz") return { universe: [{ name: "xyz:SILVER", szDecimals: 2, maxLeverage: 10 }] };
+      return null;
+    };
+    const { context, page: pg, errors } = await newPage(vp.viewport, scheme, { appConfig: SIGNED_IN_APP_CONFIG, fbAuth: FB_AUTH_SIGNED_IN, api, hl });
     await enterSite(pg);
     const hsOk = async (name) => {
       const r = await noHorizontalScroll(pg);
@@ -593,6 +614,38 @@ for (const vp of VIEWPORTS) {
     await pg.goto(BASE + "#/dashboard", { waitUntil: "networkidle" });
     await pg.waitForTimeout(400);
     check(`${tag}: no set-up note once linked`, !/Set up alerts/.test(await text()));
+
+    // Leverage bound = min(strategy 20×, HL market 12×) — no platform/launch cap; stronger warning above 5×
+    await pg.locator(`.rtable tr[data-key='${SUB2.id}'] button:has-text('Edit')`).click();
+    await pg.waitForSelector("dialog #e-lev", { timeout: 8000 }).catch(() => undefined);
+    let dlg = await pg.locator("dialog[open]").last().innerText().catch(() => "");
+    check(`${tag}: edit leverage bounded by HL market max (12×)`, (await pg.locator("dialog #e-lev option").count()) === 12 && /Hyperliquid market maximum 12×/.test(dlg) && /strategy maximum 20×/.test(dlg) && !/launch/i.test(dlg), dlg.slice(0, 200));
+    check(`${tag}: edit dialog keeps the lose-all warning`, /You can lose all allocated funds/i.test(dlg) && (await pg.locator("dialog .high-lev").count()) === 0);
+    await pg.selectOption("dialog #e-lev", "8");
+    check(`${tag}: edit >5× shows the high-leverage warning`, await pg.isVisible("dialog .high-lev"));
+    await pg.locator("dialog[open] .dlg-x").last().click();
+    await pg.waitForSelector("dialog", { state: "detached", timeout: 3000 }).catch(() => undefined);
+    check(`${tag}: edit dialog closes`, (await pg.locator("dialog").count()) === 0);
+    check(`${tag}: HL meta queried for BTC`, hlBodies.some((b) => b.type === "meta" && !b.dex));
+    // Subscribe wizard step 7 (allocation & leverage), resumed from saved progress
+    await pg.evaluate((st) => localStorage.setItem("aijalon.subwiz.fb-1.btc-momo", JSON.stringify({ v: 1, savedAt: Date.now(), ...st })), { gateAccepted: true, master: "0x5555555555555555555555555555555555555555", trading: "0x5555555555555555555555555555555555555555", tradingLabel: "Master account", agentDone: true, builderDone: true });
+    await pg.goto(BASE + "#/subscribe/btc-momo", { waitUntil: "networkidle" });
+    await pg.waitForSelector("#w-lev", { timeout: 8000 }).catch(() => undefined);
+    await pg.waitForFunction(() => document.querySelectorAll("#w-lev option").length === 12, null, { timeout: 5000 }).catch(() => undefined);
+    t = await text();
+    check(`${tag}: wizard leverage = min(strategy, market), no launch cap text`, (await pg.locator("#w-lev option").count()) === 12 && /Hyperliquid market maximum 12×/.test(t) && !/launch cap|launch-phase/i.test(t), t.slice(0, 120));
+    check(`${tag}: wizard keeps the lose-all warning`, /You can lose all allocated funds/i.test(t) && (await pg.locator("main .high-lev").count()) === 0);
+    await pg.selectOption("#w-lev", "10");
+    check(`${tag}: wizard >5× shows the high-leverage warning`, (await pg.isVisible("main .high-lev")) && /High leverage \(10×\)/.test(await pg.locator("main .high-lev").innerText()));
+    await pg.selectOption("#w-lev", "5");
+    check(`${tag}: wizard 5× has no high-leverage warning`, (await pg.locator("main .high-lev").count()) === 0);
+    await hsOk("subscribe leverage step");
+    if (SHOTS) await pg.screenshot({ path: join(SHOTS, `${vp.name}-${scheme}-leverage.png`), fullPage: true });
+    // xyz:SILVER (builder dex) strategy max 2× < market 10× → 2 options
+    await pg.evaluate((st) => localStorage.setItem("aijalon.subwiz.fb-1.silver", JSON.stringify({ v: 1, savedAt: Date.now(), ...st })), { gateAccepted: true, master: "0x5555555555555555555555555555555555555555", trading: "0x6666666666666666666666666666666666666666", tradingLabel: "Sub-account", agentDone: true, builderDone: true });
+    await pg.goto(BASE + "#/subscribe/silver", { waitUntil: "networkidle" });
+    await pg.waitForFunction(() => /Hyperliquid market maximum/.test(document.body.innerText), null, { timeout: 5000 }).catch(() => undefined);
+    check(`${tag}: builder-dex market read from meta {dex:"xyz"}; strategy 2× is the bound`, (await pg.locator("#w-lev option").count()) === 2 && hlBodies.some((b) => b.type === "meta" && b.dex === "xyz") && /Hyperliquid market maximum 10×/.test(await text()));
 
     // Plans
     await pg.goto(BASE + "#/dashboard?tab=plan", { waitUntil: "networkidle" });
@@ -639,12 +692,12 @@ for (const vp of VIEWPORTS) {
     await pg.goto(BASE + "#/creator/posts", { waitUntil: "networkidle" });
     await pg.waitForSelector("text=Weekly notes", { timeout: 8000 }).catch(() => undefined);
     t = await text();
-    check(`${tag}: creator lists own posts`, /Weekly notes: why we held cash/.test(t) && /Deep dive/.test(t) && (await pg.locator("main a[href='#/posts/p0000000-0000-4000-8000-000000000002']").count()) === 1);
+    check(`${tag}: creator lists own posts`, /Weekly notes: why we held cash/.test(t) && /Deep dive/.test(t) && (await pg.locator("main a[href='#/posts/p0000000-0000-4000-8000-000000000002']").count()) === 1 && /7 · \$35\.00/.test(t));
     await hsOk("creator posts");
     await pg.goto(BASE + "#/creator/earnings", { waitUntil: "networkidle" });
     await pg.waitForSelector(".earnings-by-strategy", { timeout: 8000 }).catch(() => undefined);
     t = await pg.locator(".earnings-by-strategy").innerText();
-    check(`${tag}: per-strategy earnings breakdown`, /BTC Momentum 4h/.test(t) && /\$337\.56/.test(t) && /\$120\.00/.test(t) && /\$4\.20/.test(t) && /\$28\.00/.test(t) && /\$489\.76/.test(t), t.slice(0, 200));
+    check(`${tag}: per-strategy earnings breakdown`, /BTC Momentum 4h/.test(t) && /\$337\.56/.test(t) && /\$120\.00/.test(t) && /\$4\.20/.test(t) && /\$28\.00/.test(t) && /\$489\.76/.test(t) && /Posts without a strategy[\s\S]*\$9\.00/.test(t), t.slice(0, 200));
     const rowDisplay = await pg.locator(".earnings-by-strategy .rtable tbody tr").first().evaluate((el) => getComputedStyle(el).display);
     check(`${tag}: earnings ${vp.name === "mobile" ? "cards on mobile" : "table on desktop"}`, vp.name === "mobile" ? rowDisplay === "block" : rowDisplay === "table-row", rowDisplay);
     await hsOk("creator earnings");
