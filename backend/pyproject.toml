@@ -1,0 +1,57 @@
+# aijalon.trade backend. Dependencies live in requirements.txt / requirements-dev.txt (exact pins) and the
+# hash-locked requirements.lock / requirements-dev.lock generated from them (`make lock`); this file only
+# carries project metadata and tool configuration.
+[project]
+name = "aijalon-backend"
+version = "0.1.0"
+description = "aijalon.trade — strategy marketplace on Hyperliquid (API, executor, sandbox)"
+requires-python = ">=3.12,<3.13"
+readme = "../docs/SPEC.md"
+license = { text = "Proprietary" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q -ra --strict-markers"
+markers = [
+    "db: needs a live Postgres 16 (TEST_DATABASE_URL); skipped when unset",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = ["migrations"]
+
+[tool.ruff.lint]
+# Blocking in CI. Kept to real-error classes so CI is a signal, not noise; security linting is bandit's job.
+# Tighten over time (B, UP, SIM, PL...) with `ruff check --select X --statistics` first.
+select = ["E4", "E7", "E9", "F", "B006", "B008", "B904", "S102", "S307", "S506", "S602", "S605"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "."
+packages = ["app"]
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+ignore_missing_imports = true   # hyperliquid-python-sdk, firebase_admin, google.cloud.* ship partial types
+
+[[tool.mypy.overrides]]
+# Pure money/fee/risk logic must be fully typed (SPEC §11).
+module = ["app.domain.*", "app.money", "app.security.*", "app.ledger.*"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_return_any = true
+
+[tool.bandit]
+exclude_dirs = ["tests", "migrations"]
+# B101 assert: allowed in app code only where tests import it; keep the default (flagged) for app/.
+skips = []
+
+[tool.coverage.run]
+source = ["app"]
+branch = true

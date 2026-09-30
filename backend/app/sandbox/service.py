@@ -20,7 +20,7 @@ Auth, two layers:
    the env var ``SANDBOX_SHARED_SECRET``. Defense in depth, and the only auth for local runs.
    The service refuses to start without it.
 
-Source code is never logged (creator IP): logs carry the SHA-256 ``code_hash``, timings and outcome.
+Source code is never logged (creator IP): logs carry a 16-hex prefix of the SHA-256 code hash, timings, outcome.
 Env is read only in :func:`main` (this entrypoint runs in its own container without ``app.config``).
 
 Recommended Cloud Run flags (see sandbox/Dockerfile): ``--execution-environment gen1`` (gVisor),
@@ -183,7 +183,8 @@ class SandboxHandler(BaseHTTPRequestHandler):
                 self.slots.release()
             self._send(200, out)
             log.info("sandbox request", extra={"fields": {"path": self.path, "status": 200,
-                     "code_hash": _code_hash(body.get("source")), "ms": int((time.monotonic() - t0) * 1000)}})
+                     # 16-hex prefix: the shared log redactor (rightly) masks any 64-hex string as a key
+                     "code_hash16": _code_hash(body.get("source"))[:16], "ms": int((time.monotonic() - t0) * 1000)}})
         except AppError as e:
             self._err(e)
             log.info("sandbox request", extra={"fields": {"path": self.path, "status": e.http_status, "error": e.code,

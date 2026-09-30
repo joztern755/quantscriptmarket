@@ -70,8 +70,34 @@ if (process.env.APP_CONFIG) {
   log(`app-config from ${process.env.APP_CONFIG}`);
 }
 
+// 3b. legal drafts (repo legal/*.md → dist/legal/) + fallback versions from their "Version:" lines
+const LEGAL_SRC = join(WEB, "..", "legal");
+const DOC_FILES = { terms: "terms", risk: "risk-disclosure", privacy: "privacy", waiver: "liability-waiver", jurisdiction: "jurisdiction", creator_agreement: "creator-agreement", subscription_ack: "subscription-ack" };
+const ALIASES = { "waiver.md": "liability-waiver.md", "restricted-jurisdictions.md": "jurisdiction.md" };
+const legalVersions = {};
+if (existsSync(LEGAL_SRC)) {
+  mkdirSync(join(DIST, "legal"), { recursive: true });
+  for (const f of readdirSync(LEGAL_SRC)) {
+    if (!f.endsWith(".md") || f.toLowerCase() === "readme.md") continue;
+    cpSync(join(LEGAL_SRC, f), join(DIST, "legal", f));
+  }
+  for (const [alias, src] of Object.entries(ALIASES)) if (existsSync(join(LEGAL_SRC, src))) cpSync(join(LEGAL_SRC, src), join(DIST, "legal", alias));
+  for (const [doc, file] of Object.entries(DOC_FILES)) {
+    const p = join(LEGAL_SRC, `${file}.md`);
+    if (!existsSync(p)) continue;
+    const m = /^Version:\s*(\S+)/m.exec(readFileSync(p, "utf8"));
+    if (m) legalVersions[doc] = m[1];
+  }
+  log(`legal docs copied (versions: ${JSON.stringify(legalVersions)})`);
+} else {
+  log("WARN: ../legal not found — legal pages will 404");
+}
+
 // 4. CSP
 const appCfg = JSON.parse(readFileSync(join(DIST, "app-config.json"), "utf8"));
+appCfg.fallback = appCfg.fallback || {};
+appCfg.fallback.legal_versions = { ...(appCfg.fallback.legal_versions || {}), ...legalVersions };
+writeFileSync(join(DIST, "app-config.json"), JSON.stringify(appCfg, null, 2) + "\n");
 const apiOrigin = String(appCfg.apiOrigin || "https://api.aijalon.trade").replace(/\/+$/, "");
 const hlOrigin = String(appCfg.hlApiUrl || "https://api.hyperliquid.xyz").replace(/\/+$/, "");
 const authDomain = String(appCfg.firebase?.authDomain || "");

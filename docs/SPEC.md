@@ -135,7 +135,7 @@ Core tables (all have `id uuid pk default gen_random_uuid()`, `created_at timest
 - `builder_approvals` (user_id, master_address, max_fee_rate_tenths_bp, verified_on_chain_at)
 - `strategies` (slug unique, name, owner_user_id, in_house bool, markets text[], timeframe, price_monthly_micro, profit_share_bps ≤1200, status draft|review|listed|paused|delisted, description)
 - `strategy_versions` (strategy_id, version int, code_hash, code_ciphertext (creator uploads), params jsonb, published_at, backtest jsonb, live_since) — a new version resets live track record
-- `subscriptions` (user_id, strategy_id, strategy_version_id, trading_address (master or sub-account), allocation_micro, max_leverage_x100, status pending|active|past_due|reduce_only|paused_user|cancelled, current_period_end, hwm_micro, cum_pnl_micro, created_at) — UNIQUE active per trading_address
+- `subscriptions` (user_id, strategy_id, strategy_version_id, trading_address (master or sub-account), allocation_micro, max_leverage_x100, status pending|active|past_due|reduce_only|paused_user|closing|cancelled, cancel_positions close|leave null, current_period_end, hwm_micro, cum_pnl_micro, created_at) — UNIQUE active per trading_address
 - `signals` (strategy_id, version_id, as_of_date, target_weight_x100 (0,100,200 for CREST), raw jsonb, signature, received_at) UNIQUE(strategy_id, as_of_date)
 - `orders` (subscription_id, cloid unique, coin, side, sz, limit_px, reduce_only, status, hl_response jsonb, submitted_at, jitter_seconds)
 - `fills` (subscription_id null, trading_address, coin, tid unique, px, sz, side, closed_pnl_micro, fee_micro, builder_fee_micro, cloid, time)
@@ -228,3 +228,10 @@ Walk-forward backtest on every upload (`sandbox/backtest.py`): Hyperliquid candl
 - Errors: raise typed exceptions from `app.errors`; API maps to HTTP.
 - Logging: `app.logging.get_logger`; structured JSON; secrets redacted.
 - Tests: `backend/tests/test_<module>.py`, runnable with `python -m pytest` (prod) and the domain/sandbox ones also with `python -m unittest` (no deps).
+
+## 12. Owner decisions (30 Sep 2026, latest)
+- **Cancel flow:** the user picks one of two buttons — "Close positions and cancel" or "Leave positions open and cancel" — each with a double confirmation (second dialog restates the consequence) and step-up auth. API: `DELETE /v1/subscriptions/{id}` body `{"positions": "close"|"leave"}` (required, no default).
+  - `close` → status `closing`: executor treats target weight 0 for every strategy market, reduce-only, until the on-chain position for those markets is 0 (bounded retries + alert on residual), then `cancelled`. No new entries. Profit share settles on the realized PnL of the closing fills, then stops.
+  - `leave` → status `cancelled` immediately; the executor never touches the account again for this subscription; open positions are the user's responsibility (UI says so explicitly). Profit share settles realized PnL up to cancellation only.
+  - Either way the subscription's prepaid period is not refunded (see legal/refund-policy.md) and the agent stays approved unless the user revokes it (UI offers "revoke agent" guidance).
+- **SILVER is listed FREE as a transparent showcase of the engine:** price $0, profit share 0%, builder fee still applies to any orders. Its card and page state plainly: live signal is CASH since 1980-01-15 under the current setting (M2 filter blocking entries), so subscribers may see no trades for a long time.

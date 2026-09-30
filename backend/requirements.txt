@@ -1,0 +1,28 @@
+# aijalon.trade backend — runtime dependencies (Python 3.12). Exact pins of the TOP-LEVEL packages.
+#
+# Every version below was confirmed to exist as a release tag in the project's upstream repository on
+# 2026-09-30 (git ls-remote); PyPI itself was not reachable from the authoring environment, so each line
+# is marked "# verify" until the lock step below has resolved it against PyPI.
+#
+# Supply-chain rule: production images and CI install ONLY from the hash-locked file generated from this
+# one, never from this file directly:
+#     make lock      # = pip-compile --generate-hashes --strip-extras -o requirements.lock requirements.txt
+#                    #   (runs inside python:3.12-slim so markers resolve for the runtime platform)
+# then commit requirements.lock. backend/Dockerfile refuses to build without it unless ALLOW_UNLOCKED=1
+# (CI's smoke build only). The deploy workflow refuses to run without it.
+
+fastapi==0.142.1                      # verify
+uvicorn[standard]==0.54.0             # verify
+pydantic==2.13.5                      # verify
+pydantic-settings==2.15.0             # verify
+sqlalchemy==2.0.54                    # verify  (2.0 LTS line; 2.1 exists — upgrade deliberately)
+psycopg[binary]==3.3.6                # verify
+hyperliquid-python-sdk==0.24.0        # verify  (requires eth-account >=0.10,<0.14)
+eth-account==0.13.7                   # verify  (latest 0.13.x: the SDK caps eth-account below 0.14)
+firebase-admin==7.7.0                 # verify
+google-auth==2.48.0                   # verify
+google-cloud-kms==3.17.0              # verify
+google-cloud-secret-manager==2.30.0   # verify
+stripe==15.6.1                        # verify
+requests==2.34.2                      # verify
+cryptography==50.0.1                  # verify

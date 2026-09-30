@@ -66,8 +66,12 @@ export interface PageContext {
   enforces it).
 - Every route except `legal` is behind the site-entry gate (core renders the gate instead).
 - Unknown routes and pages that fail to import get a core "not found / couldn't load" view.
-- Legal doc slugs: `terms`, `risk-disclosure`, `privacy`, `waiver`, `restricted-jurisdictions`,
-  `creator-agreement`, `acceptable-use` (`LEGAL_SLUGS` in gate.ts). The gate's links point to these.
+- Legal docs: build copies repo `legal/*.md` (except README) to `dist/legal/<file>.md`, plus aliases
+  `waiver.md` (= liability-waiver.md) and `restricted-jurisdictions.md` (= jurisdiction.md).
+  `LEGAL_SLUGS` (gate.ts) maps consent doc → slug = file name: terms→`terms`, risk→`risk-disclosure`,
+  privacy→`privacy`, waiver→`liability-waiver`, jurisdiction→`jurisdiction`,
+  creator_agreement→`creator-agreement`, subscription_ack→`subscription-ack`. Gate/footer links use these.
+  Fallback legal versions (used only if the API is down) are read by the build from each file's `Version:` line.
 - `pages/signin.ts` should be thin: `export { renderSignIn as render } from "../core/auth.js";`
   (core owns the Google/Apple buttons, MFA enrolment with QR, and the MFA code prompt).
 
@@ -179,6 +183,7 @@ interface PublicConfig {
   agent_name: string;                // "aijalon"
   hl_chain: "Mainnet" | "Testnet";
   stripe_publishable_key: string | null;
+  stripe_fee_estimate: { pct_bps: number; fixed_micro: number } | null;   // Stripe fees are PASSED TO THE USER (owner 30 Sep 2026); estimate only
   restricted_jurisdictions: string[];  // ISO alpha-2
   legal_versions: { terms: string; risk: string; privacy: string; waiver: string; jurisdiction: string; creator_agreement?: string; subscription_ack?: string };
   economics: { builder_fee_tenths_bp: number; builder_split_creator_bps: number; builder_split_platform_bps: number; builder_split_referral_pool_bps: number;
@@ -223,7 +228,9 @@ storage.get(key) / storage.set(key, value) / storage.remove(key)   // localStora
 ## 6. `core/gate.ts` — site-entry gate and subscribe gate
 
 ```ts
-LEGAL_SLUGS: Record<ConsentDoc, string>      // terms→"terms", risk→"risk-disclosure", privacy→"privacy", waiver→"waiver", jurisdiction→"restricted-jurisdictions", creator_agreement→"creator-agreement"
+LEGAL_SLUGS: Record<ConsentDoc, string>      // see §1 (slug = legal file name)
+SITE_DOCS = ["jurisdiction","terms","risk","privacy","waiver"]
+gateForm(cfg, onAccept): HTMLElement ; renderSiteGate(root, cfg, onAccept) ; showGateModal(): Promise<boolean>   // used by core
 siteGateAccepted(cfg?: PublicConfig): boolean
 syncConsents(): Promise<void>                // POSTs locally-recorded site-entry consents to /v1/consents after sign-in (core calls it)
 subscribeGate(opts: {
@@ -274,11 +281,16 @@ approveAgent(wallet, p: { agentAddress: string; serverTypedData?: unknown }): Pr
 approveBuilderFee(wallet, p?: { serverTypedData?: unknown }): Promise<HlResult>                        // builder + max rate from publicConfig()
 usdSend(wallet, p: { destination: string; amountMicro: number | bigint; serverTypedData?: unknown; expectDestination: string }): Promise<HlResult>
 hlInfo<T>(body: Record<string, unknown>): Promise<T>                        // POST https://api.hyperliquid.xyz/info (read-only)
-maxFeeRateFromTenthsBp(100) === "0.1%"
+maxFeeRateFromTenthsBp(100) === "0.1%" ; tenthsBpFromMaxFeeRate("0.1%") === 100 ; HL_TYPES ; HlValidationError
 interface HlResult { ok: boolean; status: "ok"|"err"; response: unknown; error?: string }
 ```
 Always: server typed data (if given) is validated, then the final payload is rebuilt locally with
-the wallet's **current** chain id as `signatureChainId` (hex) — never signed as received.
+the wallet's **current** chain id as `signatureChainId` (hex) and a fresh `Date.now()` nonce — never
+signed as received. Builder address / max fee / agent name / chain come from `publicConfig()`; the
+flows refuse to run on fallback config (API unreachable). `usdSend` requires `expectDestination`
+from a trusted source (config treasury, or the approved payout record).
+Economics: never hard-code fees — creator profit-share cap is `economics.profit_share_creator_cap_bps`
+(1200 = 12% at launch; platform 1.5% on top → max 13.5%).
 
 ## 9. `core/format.ts`
 
@@ -297,7 +309,10 @@ fmtDate(iso | ms): string  // "30 Sep 2026" (UTC) ; fmtDateTime(): "30 Sep 2026,
 ## 10. Other core modules
 - `core/theme.ts`: `getTheme(): "light"|"dark"|"system"`, `setTheme(t)`, `effectiveTheme(): "light"|"dark"`, `onThemeChange(cb)`. (Toggle lives in the shell.)
 - `core/config.ts`: `appConfig(): AppConfig` (static `app-config.json`: apiOrigin, firebase web config, firebaseSdkVersion, hlApiUrl, siteOrigin).
-- `core/stripe.ts`: `loadStripe(): Promise<StripeLike>` (loads https://js.stripe.com/v3/ once with `publicConfig().stripe_publishable_key`).
+- `core/stripe.ts`: `loadStripe(): Promise<StripeLike>` (loads https://js.stripe.com/v3/ once with `publicConfig().stripe_publishable_key`);
+  `estimateStripeCredit(cfg, amountMicro) → { feeMicro, creditMicro, estimated }` (fee rounded UP; null when config has no estimate);
+  `stripeFeeNotice(cfg, amountMicro?) → string` — REQUIRED wording on every Stripe deposit UI: credit = amount paid − actual processor fee (estimate shown as an estimate).
+- `core/keccak.ts`: `keccak256(bytes|string)`, `toChecksumAddress(addr)`, `isAddress(x)`.
 - `core/qr.ts`: `qrSvg(text: string, opts?: { ecc?: "L"|"M"|"Q"|"H"; size?: number }): SVGSVGElement`.
 - `core/router.ts`: `navigate(to, {replace?})`, `currentPath()`, `ROUTES`, types `PageContext`, `PageName`, `PageModule`.
 

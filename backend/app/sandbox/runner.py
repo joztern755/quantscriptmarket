@@ -466,14 +466,23 @@ def normalize_bars(bars: Mapping[str, Sequence[Any]]) -> dict[str, list[list[flo
     """Accept bars as dicts ``{"t","o","h","l","c","v"}`` (numbers or Hyperliquid strings) or rows
     ``[t, o, h, l, c, v]``; return rows sorted by ``t`` with strictly increasing timestamps."""
     out: dict[str, list[list[float | int]]] = {}
+    if not isinstance(bars, Mapping):
+        raise ValidationFailed("bars must be an object {coin: [bar, ...]}")
     for coin, seq in bars.items():
         rows: list[list[float | int]] = []
+        if not isinstance(coin, str) or not isinstance(seq, (list, tuple)):
+            raise ValidationFailed("bars must map coin -> list of bars")
         for b in seq:
-            if isinstance(b, Mapping):
-                row = [int(b["t"]), _num(b["o"]), _num(b["h"]), _num(b["l"]), _num(b["c"]), _num(b.get("v", 0.0))]
-            else:
-                t, o, h, l, c, v = b
-                row = [int(t), _num(o), _num(h), _num(l), _num(c), _num(v)]
+            try:
+                if isinstance(b, Mapping):
+                    row = [int(b["t"]), _num(b["o"]), _num(b["h"]), _num(b["l"]), _num(b["c"]), _num(b.get("v", 0.0))]
+                else:
+                    t, o, h, l, c, v = b
+                    row = [int(t), _num(o), _num(h), _num(l), _num(c), _num(v)]
+                if min(row[1:5]) < 0 or row[5] < 0:
+                    raise ValueError("prices/volume must be ≥ 0")
+            except (KeyError, TypeError, ValueError, OverflowError) as e:
+                raise ValidationFailed(f"bad bar for {coin}: {e}") from None
             rows.append(row)
         rows.sort(key=lambda r: r[0])
         for a, b in zip(rows, rows[1:]):

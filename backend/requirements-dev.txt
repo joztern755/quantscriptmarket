@@ -1,0 +1,12 @@
+# Dev / CI tooling (never installed in the runtime image). Same lock rule as requirements.txt:
+#     make lock   # also writes requirements-dev.lock (hashes) from this file + requirements.txt constraints
+# Versions confirmed as upstream release tags on 2026-09-30; "# verify" until the lock resolves them.
+-c requirements.txt
+
+pytest==9.1.1          # verify
+httpx==0.28.1          # verify  (FastAPI/Starlette TestClient)
+ruff==0.16.9           # verify
+mypy==1.20.2           # verify
+pip-audit==2.10.1      # verify
+bandit==1.9.4          # verify
+pip-tools==7.6.1       # verify  (generates the *.lock files)

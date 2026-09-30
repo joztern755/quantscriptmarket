@@ -1,0 +1,19 @@
+# Allow-list: the build context is backend/, and only what the runtime needs gets in.
+# Anything not re-included below (tests, caches, .env, keys, local venvs, docs) never reaches the image.
+*
+!app/
+!migrations/
+!scripts/
+!requirements.txt
+!requirements.lock
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/service-account*.json

@@ -49,7 +49,7 @@ spec:
             - {name: FIREBASE_PROJECT_ID, value: "${PROJECT_ID}"}
             - {name: KMS_KEY_NAME, value: "${KMS_KEY_NAME}"}
             # IAM database auth through the sidecar: no password; the proxy injects the SA's OAuth token
-            - {name: DATABASE_URL, value: "postgresql://${DB_IAM_USER_API_URLENC}@127.0.0.1:5432/${DB_NAME}?sslmode=disable"}
+            - {name: DATABASE_URL, value: "postgresql://${DB_IAM_USER_API_URLENC}@127.0.0.1:5432/${DB_NAME}?sslmode=disable&application_name=api&options=-c%20statement_timeout%3D15s%20-c%20lock_timeout%3D5s%20-c%20idle_in_transaction_session_timeout%3D30s"}
             - {name: WEB_ORIGIN, value: "https://${WEB_DOMAIN}"}
             - {name: API_ORIGIN, value: "https://${API_DOMAIN}"}
             - {name: HL_API_URL, value: "https://api.hyperliquid.xyz"}

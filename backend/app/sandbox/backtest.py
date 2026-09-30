@@ -454,6 +454,9 @@ def backtest_on_data(source: str, data: MarketData, *, params: BacktestParams | 
         raise ValidationFailed(f"data timeframe {data.timeframe} != script TIMEFRAME {meta.timeframe}")
     interval = meta.interval_ms
     ts, aligned = align_bars(data.candles, meta.markets)
+    for c in meta.markets:
+        if any(r[1] <= 0 or r[4] <= 0 for r in aligned[c]):
+            raise ValidationFailed(f"non-positive open/close price in {c} candles")
     lens = {c: len(data.candles[c]) for c in meta.markets}
     start = meta.lookback - 1
     if len(ts) < meta.lookback + 2:

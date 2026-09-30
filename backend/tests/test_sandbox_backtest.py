@@ -57,11 +57,12 @@ class SimulationTests(unittest.TestCase):
         self.assertAlmostEqual(r.curve[1][1], 10_000.0)                      # bar 1: flat, missed the jump
         self.assertEqual(r.trades[0]["t"], 2 * DAY)
         self.assertEqual(r.trades[0]["price"], 200.0)
-        e_after_fee = 10_000 * (1 - FEE)
-        self.assertAlmostEqual(r.curve[3][1], e_after_fee * 1.1, places=6)  # 200 → 220
+        # 50 units bought at 200; at bar 3's open the <2% top-up is skipped (churn rule); 200 → 220
+        self.assertAlmostEqual(r.curve[3][1], 10_000 - 10_000 * FEE + 50 * 20.0, places=6)
+        self.assertEqual(len(r.trades), 1)
 
     def test_short_pnl(self):
-        r = sim([100.0, 100.0, 90.0], [-1.0, -1.0, -1.0])
+        r = sim([100.0, 100.0, 90.0], [-1.0, -1.0, -1.0], opens=[100.0, 100.0, 100.0])
         e = 10_000 * (1 - FEE)
         self.assertAlmostEqual(r.curve[2][1], e + 100 * 10.0, places=6)  # 100 units short, −10 each
 
@@ -269,11 +270,10 @@ class EndToEndTests(unittest.TestCase):
         self.assertGreater(rep["trade_count"], 0)
         self.assertGreater(rep["funding_paid"], 0)  # net long with positive funding pays
         self.assertEqual(rep["buy_and_hold"]["full"]["exposure"], 1.0)
-        self.assertFalse(rep["listing_eligible_history"])  # 445 simulated days … see next assertion
-        self.assertLess(rep["period"]["sim_days"], 450)
         self.assertEqual(set(rep["latest_signal"]["weights"]), {"BTC"})
-        # ≥1y listing rule: flag computed from simulated days
-        self.assertEqual(rep["listing_eligible_history"], rep["period"]["sim_days"] >= 365)
+        # ≥1y listing rule: bars 5..699, first signal at 254 → 445 simulated days
+        self.assertAlmostEqual(rep["period"]["sim_days"], 445.0)
+        self.assertTrue(rep["listing_eligible_history"])
         json.dumps(rep, allow_nan=False)  # report must be strict-JSON serialisable
 
     def test_multi_market_alignment_and_bh(self):
