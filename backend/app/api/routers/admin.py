@@ -39,7 +39,6 @@ from app.errors import Conflict, Forbidden, NotFound, ValidationFailed
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[user_limit("admin", 120, 60)])
 
 PayoutKind = Literal["withdrawal", "payout"]
-MIN_HISTORY_DAYS_TO_LIST = 365
 
 
 def _flag_key(key: str) -> str:
@@ -153,9 +152,16 @@ def _apply_change(conn: Any, svc: Services, ctx: AuthCtx, ch: dict) -> None:
             kyc = svc.store.get_kyc(conn, str(st["owner_user_id"]))
             if not kyc or kyc["status"] != "approved":
                 raise Conflict("the creator's KYC is not approved")
-            days = ((ver.get("backtest") or {}).get("period") or {}).get("sim_days") or 0
-            if float(days) < MIN_HISTORY_DAYS_TO_LIST:
-                raise Conflict("backtest covers less than one year; cannot list", sim_days=days)
+            # SPEC §12 (owner): ≥ risk.min_listing_history_days (180) of backtestable history to list; versions
+            # under short_history_warning_days (365) list with a "Short history (N days)" warning instead.
+            bt = ver.get("backtest") or {}
+            days = bt.get("history_days")
+            if not isinstance(days, (int, float)) or isinstance(days, bool):
+                days = (bt.get("period") or {}).get("sim_days") or 0
+            min_days = svc.settings.risk.min_listing_history_days
+            if float(days) < min_days:
+                raise Conflict(f"backtest covers less than {min_days} days of history; cannot list",
+                               history_days=days, min_days=min_days)
         svc.store.publish_version(conn, vid, svc.now())
         svc.store.set_strategy_status(conn, sid, "listed")
     elif kind == "strategy_price":

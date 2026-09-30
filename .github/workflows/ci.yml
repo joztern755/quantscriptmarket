@@ -39,7 +39,7 @@ jobs:
         run: python3 infra/pin.py check
       - name: Image digests pinned (warning until `make pin` has run; deploy enforces)
         run: |
-          if grep -rn 'sha256:PIN_ME' backend/Dockerfile infra/gcp/env.sh; then
+          if grep -rn 'sha256:PIN_ME' backend/Dockerfile sandbox/Dockerfile infra/gcp/env.sh; then
             echo "::warning::container images not yet pinned by digest — run 'make pin' (deploy refuses PIN_ME)"
           fi
       - name: Lock files present (warning until `make lock` has run; deploy enforces)
@@ -214,7 +214,11 @@ jobs:
       - name: Build sandbox image
         run: |
           if [ -f sandbox/Dockerfile ]; then
-            DOCKER_BUILDKIT=1 docker build -f sandbox/Dockerfile -t aijalon-sandbox:ci .
+            args=""
+            if grep -q 'sha256:PIN_ME' sandbox/Dockerfile; then
+              echo "::warning::sandbox base image not pinned yet — CI smoke build uses the tag"; args="--build-arg PYTHON_IMAGE=python:3.12-slim"
+            fi
+            DOCKER_BUILDKIT=1 docker build $args -f sandbox/Dockerfile -t aijalon-sandbox:ci .
             test "$(docker run --rm --entrypoint id aijalon-sandbox:ci -u)" = "10001"
           else
             echo "::warning::sandbox/Dockerfile not present"

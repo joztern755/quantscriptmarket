@@ -3,7 +3,7 @@ import type { PageContext } from "../core/router.js";
 import { h, mount, skeleton, errorState, emptyState, note, button, confirmDialog, toast } from "../core/ui.js";
 import { api, newIdempotencyKey } from "../core/api.js";
 import { fmtUsd, fmtDate } from "../core/format.js";
-import type { Post } from "./_shared/types.js";
+import type { Post, PostSummary } from "./_shared/types.js";
 import { renderMarkdown } from "./_shared/markdown.js";
 import { ensurePageCss, listOf, isAbortError, errCode, pageHead, replaceQuery, inlineMd } from "./_shared/util.js";
 
@@ -54,9 +54,9 @@ async function renderList(root: HTMLElement, ctx: PageContext): Promise<void> {
     mount(list, skeleton(6));
     try {
       const q = filter ? `?strategy=${encodeURIComponent(filter)}` : "";
-      const res = await api.get<unknown>(`/public/posts${q}`, { signal: ctx.signal, auth: !!ctx.user });
+      const res = await api.get<unknown>(`/public/posts${q}`, { signal: ctx.signal });
       if (!ctx.isCurrent() || my !== seq) return;
-      const posts = listOf<Post>(res, "posts").filter((p) => (price === "free" ? p.price_micro === 0 : price === "paid" ? p.price_micro > 0 : true));
+      const posts = listOf<PostSummary>(res).filter((p) => (price === "free" ? p.price_micro === 0 : price === "paid" ? p.price_micro > 0 : true));
       if (!posts.length) {
         mount(list, emptyState("No posts yet", filter ? "This strategy has no posts yet." : "Creators haven't published anything yet."));
         return;
@@ -70,7 +70,7 @@ async function renderList(root: HTMLElement, ctx: PageContext): Promise<void> {
   await load();
 }
 
-function postItem(p: Post): HTMLElement {
+function postItem(p: PostSummary): HTMLElement {
   return h(
     "article",
     { class: "post-item" },
@@ -78,17 +78,17 @@ function postItem(p: Post): HTMLElement {
     h(
       "div",
       { class: "row small muted" },
-      p.price_micro > 0 ? h("span", { class: "pill warn" }, p.purchased ? "Purchased" : fmtUsd(p.price_micro)) : h("span", { class: "pill good" }, "Free"),
-      p.strategy_slug ? h("a", { href: `#/s/${encodeURIComponent(p.strategy_slug)}` }, p.strategy_name ?? p.strategy_slug) : null,
-      p.creator_name ? h("span", null, p.creator_name) : null,
+      p.price_micro > 0 ? h("span", { class: "pill warn" }, fmtUsd(p.price_micro)) : h("span", { class: "pill good" }, "Free"),
+      p.strategy_slug ? h("a", { href: `#/s/${encodeURIComponent(p.strategy_slug)}` }, p.strategy_slug) : null,
+      p.creator_display_name ? h("span", null, p.creator_display_name) : null,
       p.published_at ? h("span", null, fmtDate(p.published_at)) : null,
     ),
-    p.excerpt ? inlineMd("p", p.excerpt, "small") : null,
+    p.preview ? inlineMd("p", p.preview, "small") : null,
   );
 }
 
 async function renderOne(root: HTMLElement, ctx: PageContext, id: string): Promise<void> {
-  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) {
+  if (!/^[0-9a-fA-F-]{36}$/.test(id)) {
     mount(root, emptyState("Post not found", undefined, h("a", { class: "btn", href: "#/posts" }, "All posts")));
     return;
   }
@@ -97,7 +97,10 @@ async function renderOne(root: HTMLElement, ctx: PageContext, id: string): Promi
   const load = async (): Promise<void> => {
     mount(root, skeleton(10));
     try {
-      const p = await api.get<Post>(`/public/posts/${encodeURIComponent(id)}`, { signal: ctx.signal, auth: !!ctx.user });
+      // Signed in: GET /v1/posts/{id} (body when free, purchased or own). Anonymous: the public copy (free bodies only).
+      const p = ctx.user
+        ? await api.get<Post>(`/posts/${encodeURIComponent(id)}`, { signal: ctx.signal })
+        : await api.get<Post>(`/public/posts/${encodeURIComponent(id)}`, { signal: ctx.signal });
       if (!ctx.isCurrent()) return;
       ctx.setTitle(p.title);
       draw(p);
@@ -128,8 +131,7 @@ async function renderOne(root: HTMLElement, ctx: PageContext, id: string): Promi
           h(
             "div",
             { class: "row small muted" },
-            p.creator_name ? h("span", null, p.creator_name) : null,
-            p.strategy_slug ? h("a", { href: `#/s/${encodeURIComponent(p.strategy_slug)}` }, p.strategy_name ?? p.strategy_slug) : null,
+            p.strategy_slug ? h("a", { href: `#/s/${encodeURIComponent(p.strategy_slug)}` }, p.strategy_slug) : null,
             p.published_at ? h("span", null, fmtDate(p.published_at)) : null,
           ),
         ),
@@ -137,8 +139,7 @@ async function renderOne(root: HTMLElement, ctx: PageContext, id: string): Promi
           ? h(
               "div",
               { class: "panel stack" },
-              p.excerpt ? h("div", { class: "prose" }, renderMarkdown(p.excerpt)) : null,
-              h("p", null, `This post costs ${fmtUsd(p.price_micro)}, charged once to your prepaid fee balance. You keep access afterwards.`),
+              h("p", null, `This post costs ${fmtUsd(p.price_micro)}, charged once to your prepaid fee balance. You keep access afterwards. Paid posts need the Pro or Max plan.`),
               ctx.user
                 ? h(
                     "div",
@@ -162,6 +163,10 @@ async function renderOne(root: HTMLElement, ctx: PageContext, id: string): Promi
                             ctx.navigate("/dashboard/balance");
                             return;
                           }
+                          if (errCode(err) === "forbidden") {
+                            toast(err instanceof Error ? err.message : "Paid posts need the Pro or Max plan.", "warn");
+                            return;
+                          }
                           throw err;
                         }
                       },
@@ -170,7 +175,7 @@ async function renderOne(root: HTMLElement, ctx: PageContext, id: string): Promi
                   )
                 : h("a", { class: "btn primary", href: `#/signin?next=${encodeURIComponent("/posts/" + p.id)}` }, "Sign in to buy"),
             )
-          : h("div", { class: "prose" }, renderMarkdown(p.body ?? p.excerpt ?? "")),
+          : h("div", { class: "prose" }, renderMarkdown(p.body ?? "")),
         note("Posts reflect the author's views and are not investment advice. Trading perpetual futures can lose all allocated funds.", "info"),
       ),
     );

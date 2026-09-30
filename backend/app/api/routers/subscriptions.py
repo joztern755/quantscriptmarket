@@ -48,9 +48,11 @@ _CHANGEABLE = ("pending", "active", "past_due", "reduce_only", "paused_user")
 def _out(row: dict) -> S.SubscriptionOut:
     return S.SubscriptionOut(
         id=row["id"], strategy_id=row["strategy_id"], strategy_slug=row.get("strategy_slug"),
-        strategy_name=row.get("strategy_name"), trading_address=row["trading_address"],
+        strategy_name=row.get("strategy_name"), strategy_markets=list(row.get("strategy_markets") or []),
+        trading_address=row["trading_address"],
         allocation_micro=int(row["allocation_micro"]), max_leverage_x100=int(row["max_leverage_x100"]),
-        status=row["status"], current_period_end=row.get("current_period_end"),
+        status=row["status"], cancel_positions=row.get("cancel_positions"), cancelled_at=row.get("cancelled_at"),
+        current_period_end=row.get("current_period_end"),
         cum_pnl_micro=int(row.get("cum_pnl_micro") or 0), hwm_micro=int(row.get("hwm_micro") or 0),
         created_at=row["created_at"])
 
@@ -119,7 +121,7 @@ def create_subscription(body: S.SubscriptionCreateIn, ctx: AuthCtx = Depends(ste
         raise ValidationFailed("builder address not configured")
     approved = svc.hl.max_builder_fee(master, s.builder_address)
     if approved < econ.builder_fee_tenths_bp:
-        raise Conflict("approve the builder fee in your wallet first",
+        raise Conflict("approve the builder fee in your wallet first", reason="builder_fee_not_approved",
                        approved_tenths_bp=approved, required_tenths_bp=econ.builder_fee_tenths_bp)
 
     def work(conn: Any) -> S.SubscriptionCreateOut:
@@ -131,9 +133,10 @@ def create_subscription(body: S.SubscriptionCreateIn, ctx: AuthCtx = Depends(ste
             raise Conflict("strategy is not priced yet")
         price, ps_bps = int(st["price_monthly_micro"]), int(st["profit_share_bps"])
         if body.expected_price_monthly_micro is not None and body.expected_price_monthly_micro != price:
-            raise Conflict("the price changed; please review again", price_monthly_micro=price)
+            raise Conflict("the price changed; please review again", reason="terms_changed", price_monthly_micro=price)
         if body.expected_profit_share_bps is not None and body.expected_profit_share_bps != ps_bps:
-            raise Conflict("the profit share changed; please review again", profit_share_bps=ps_bps)
+            raise Conflict("the profit share changed; please review again", reason="terms_changed",
+                           profit_share_bps=ps_bps)
         version = svc.store.current_versions(conn, [sid]).get(sid)
         if version is None:
             raise Conflict("strategy has no published version yet")
@@ -161,13 +164,15 @@ def create_subscription(body: S.SubscriptionCreateIn, ctx: AuthCtx = Depends(ste
             raise ValidationFailed("leverage above the allowed maximum", max_x100=_leverage_cap_x100(svc, version))
         live = svc.store.count_live_subscriptions(conn, ctx.user_id)
         if not svc.domain.plan_allows(user["plan"], live + 1):
-            raise Forbidden("your plan's strategy limit is reached; upgrade or cancel one", plan=user["plan"])
+            raise Forbidden("your plan's strategy limit is reached; upgrade or cancel one", reason="plan_limit",
+                            plan=user["plan"])
         _check_allocation_caps(conn, svc, ctx.user_id,
                                svc.store.total_live_allocation(conn, ctx.user_id) + allocation, allocation)
         if svc.store.active_agent_for_master(conn, ctx.user_id, master) is None:
             raise Conflict("approve the trading agent in your wallet first", reason="agent_not_active")
         if svc.store.live_subscription_on_address(conn, addr) is not None:
-            raise Conflict("this trading address already runs a strategy; use a sub-account")
+            raise Conflict("this trading address already runs a strategy; use a sub-account",
+                           reason="trading_address_in_use")
         reserve = econ.min_topup_micro if (ps_bps > 0 or econ.platform_profit_share_bps > 0) else 0
         ledger_ops.require_balance(conn, svc, ctx.user_id, price + reserve)
 

@@ -25,19 +25,35 @@ Per subscription:
   subscription until an admin resets the counter (any fill resets it). Pre-trade guard rejections and
   exchange/info outages (``ExternalServiceError``) do not count: they are market-wide or not the subscription's
   fault and would otherwise trip every subscriber at once (same contract as ``domain.risk``).
+- The subscription is re-read under the lock (``SubscriptionRepo.get_subscription``): a cancel that lands during a
+  tick is honoured before anything is sent ("leave" → never touched again).
+
+Closing subscriptions (SPEC §12, cancel with "close"): independent of signals, every tick builds a synthetic
+all-zero ``BarSignal`` (``source="closing"``) over the strategy's markets, keyed by a retry epoch
+(``now`` floored to ``closing_retry_seconds``). Each coin with an on-chain position is planned with target 0 in
+reduce-only mode (orders are forced reduce-only and never exceed the position). Unknown-outcome orders of ANY bar
+are resolved first (never re-sent blindly). When every strategy market is flat on-chain the status becomes
+``cancelled`` (+ "positions_closed" alert). ``max_attempts_per_bar`` orders per coin per epoch are allowed; after
+that a "closing_residual" alert is raised and the subscription stays ``closing`` (retried next epoch).
+
+Cloids come from ``app.hl.client.make_cloid`` (single source of the platform prefix and derivation): the leg
+string is ``"{coin}|{attempt}"``, so a given (subscription, bar, coin, attempt) always maps to the same cloid.
 """
 from __future__ import annotations
 
-import hashlib
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 from app.errors import ExternalServiceError, GuardRejected
+from app.hl.client import CLOID_PREFIX, is_platform_cloid
+from app.hl.client import make_cloid as _hl_make_cloid
 from app.logging import get_logger
 
 from .ports import (
+    CLOSING_SOURCE,
+    CLOSING_STATUS,
     ORDER_FILLED,
     ORDER_NOT_SUBMITTED,
     ORDER_PARTIAL,
@@ -75,8 +91,8 @@ from .ports import (
 
 log = get_logger("app.execution.executor")
 
-# First 4 bytes of every cloid we place. hl/fills.py attributes fills to subscriptions by this prefix (SPEC §1.1).
-CLOID_PREFIX = "a17a1000"
+# CLOID_PREFIX (re-exported): first 4 bytes of every cloid we place; hl/fills.py attributes fills by it (SPEC §1.1).
+__all__ = ["CLOID_PREFIX", "make_cloid", "is_our_cloid", "closing_epoch", "Executor", "ExecutorConfig", "TickReport"]
 
 _RESULT_TO_STATUS = {
     "filled": ORDER_FILLED,
@@ -90,13 +106,22 @@ _UNRESOLVED = PENDING_ORDER_STATUSES + (ORDER_RESTING,)
 
 
 def make_cloid(subscription_id: str, bar_close: datetime, coin: str, attempt: int) -> str:
-    """Deterministic 128-bit Hyperliquid client order id: ``0x`` + prefix(8 hex) + sha256(...)[:24 hex]."""
-    material = f"{subscription_id}|{bar_close.isoformat()}|{coin}|{attempt}".encode()
-    return "0x" + CLOID_PREFIX + hashlib.sha256(material).hexdigest()[:24]
+    """Deterministic 128-bit Hyperliquid client order id for (subscription, bar, coin, attempt), derived by
+    ``app.hl.client.make_cloid`` with leg ``"{coin}|{attempt}"`` (one derivation, one prefix, platform-wide)."""
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+        raise ValueError("attempt must be a non-negative int")
+    return _hl_make_cloid(subscription_id, bar_close, f"{coin}|{attempt}")
 
 
 def is_our_cloid(cloid: str | None) -> bool:
-    return bool(cloid) and cloid.lower().startswith("0x" + CLOID_PREFIX)
+    return is_platform_cloid(cloid)
+
+
+def closing_epoch(now: datetime, retry_seconds: int) -> datetime:
+    """Retry window key for a closing subscription: ``now`` floored to ``retry_seconds`` (UTC epoch based)."""
+    step = max(60, int(retry_seconds))
+    ts = int(now.timestamp())
+    return datetime.fromtimestamp(ts - ts % step, tz=now.tzinfo)
 
 
 @dataclass(frozen=True)
@@ -109,6 +134,8 @@ class ExecutorConfig:
     signal_max_age_seconds: int = 36 * 3600  # RiskLimits.signal_max_age_hours
     unknown_order_grace_seconds: int = 120   # an unseen cloid younger than this may still be in flight
     lock_prefix: str = "exec:sub:"
+    closing_retry_seconds: int = 3600        # closing: max_attempts_per_bar orders per coin per this window
+    max_closing_per_tick: int = 500
 
     @classmethod
     def from_settings(cls, settings: Any, **overrides: Any) -> "ExecutorConfig":
@@ -143,6 +170,9 @@ class TickReport:
     reduce_only_skips: int = 0
     no_market_data: int = 0
     unresolved_orders: int = 0
+    closing_seen: int = 0
+    closings_completed: int = 0
+    closing_residuals: int = 0
     errors: int = 0
     elapsed_seconds: float = 0.0
     error_subscriptions: list[str] = field(default_factory=list)
@@ -225,6 +255,9 @@ class Executor:
             return report
 
         queues: list[list[tuple[SubscriptionView, BarSignal, int]]] = []
+        closing = self._closing_work(tick)
+        if closing:
+            queues.append(closing)
         for sig in self.signals.latest_signals():
             report.signals_seen += 1
             q = self._due_for_signal(sig, tick)
@@ -241,13 +274,27 @@ class Executor:
                 break
             report.processed += 1
             try:
-                self._run_subscription(sub, sig, delay, tick)
+                if sig.source == CLOSING_SOURCE:
+                    self._run_closing(sub, sig, tick)
+                else:
+                    self._run_subscription(sub, sig, delay, tick)
             except Exception as exc:  # isolation: one subscription never stops the others
                 self._on_subscription_error(sub, sig, exc, tick)
 
         report.elapsed_seconds = self.clock.monotonic() - t0
         log.info("tick_done", extra={"fields": report.as_dict()})
         return report
+
+    def _closing_work(self, tick: _Tick) -> list[tuple[SubscriptionView, BarSignal, int]]:
+        """One synthetic all-zero signal per closing subscription (no jitter: the user asked to exit now)."""
+        epoch = closing_epoch(tick.now, self.cfg.closing_retry_seconds)
+        out = []
+        for sub in self.subs.closing_subscriptions(self.cfg.max_closing_per_tick):
+            sig = BarSignal(strategy_version_id=sub.strategy_version_id, bar_close=epoch,
+                            weights_bps={c: 0 for c in sub.markets}, source=CLOSING_SOURCE)
+            out.append((sub, sig, 0))
+        tick.report.closing_seen = len(out)
+        return out
 
     def _due_for_signal(self, sig: BarSignal, tick: _Tick) -> list[tuple[SubscriptionView, BarSignal, int]]:
         now, report = tick.now, tick.report
@@ -284,8 +331,10 @@ class Executor:
             if self.subs.is_bar_done(sub.id, sig.bar_close):
                 report.already_done += 1
                 return
-            if sub.status not in TRADABLE_STATUSES:
+            fresh = self.subs.get_subscription(sub.id)   # a cancel/close may have landed since due_subscriptions
+            if fresh is None or fresh.status not in TRADABLE_STATUSES:
                 return
+            sub = fresh
             if sub.consecutive_rejections >= self.cfg.breaker_threshold:
                 report.breaker_open += 1
                 return
@@ -319,8 +368,55 @@ class Executor:
                 self.subs.mark_bar_done(sub.id, sig.bar_close, "residual" if residual else "ok")
                 report.bars_completed += 1
 
+    def _run_closing(self, sub: SubscriptionView, sig: BarSignal, tick: _Tick) -> None:
+        """SPEC §12 "close": flatten every strategy market reduce-only, then cancelled."""
+        report = tick.report
+        with self.locks.try_lock(self.cfg.lock_prefix + sub.id) as held:
+            if not held:
+                report.locked += 1
+                return
+            fresh = self.subs.get_subscription(sub.id)
+            if fresh is None or fresh.status != CLOSING_STATUS:
+                return
+            sub = fresh
+            if sub.consecutive_rejections >= self.cfg.breaker_threshold:
+                report.breaker_open += 1
+                self._alert("warn", "closing_blocked_breaker", {"subscription": sub.id, "count": sub.consecutive_rejections},
+                            user_id=sub.user_id, dedup=f"closing_breaker:{sub.id}:{sig.bar_close.isoformat()}")
+                return
+            # Never send anything while an earlier order's outcome (any bar) is unknown.
+            pending = list(self.subs.unresolved_orders(sub.id))
+            if pending:
+                for o in pending:
+                    self._resolve_order(sub, o, tick)
+                if any(o.status in _UNRESOLVED for o in self.subs.unresolved_orders(sub.id)):
+                    report.unresolved_orders += 1
+                    return
+            coins = sorted(set(sub.markets))
+            positions = self.positions.positions(sub.trading_address, coins)
+            open_coins = [c for c in coins if (positions.get(c) or Position.flat(c)).szi != 0]
+            if not open_coins:
+                if self.subs.finish_closing(sub.id, tick.now):
+                    report.closings_completed += 1
+                    self._alert("info", "positions_closed", {"subscription": sub.id, "strategy": sub.strategy_id,
+                                                             "markets": ",".join(coins)},
+                                user_id=sub.user_id, dedup=f"positions_closed:{sub.id}")
+                    log.info("closing_completed", extra={"fields": {"subscription_id": sub.id}})
+                return
+            to_place: list[list[_PendingOrder]] = []
+            try:
+                for coin in open_coins:
+                    state, legs = self._prepare_coin(sub, sig, coin, positions.get(coin) or Position.flat(coin),
+                                                     True, tick, closing=True)
+                    if legs:
+                        to_place.append(legs)
+                if to_place:
+                    self._place_all(sub, sig, 0, to_place, tick)
+            except _BreakerTripped:
+                return
+
     def _prepare_coin(self, sub: SubscriptionView, sig: BarSignal, coin: str, pos: Position, reduce_only_sub: bool,
-                      tick: _Tick) -> tuple[str, list[_PendingOrder]]:
+                      tick: _Tick, *, closing: bool = False) -> tuple[str, list[_PendingOrder]]:
         """Returns (state, orders_to_place). state: done | residual | wait."""
         report, flags = tick.report, tick.flags
         weight = int(sig.weights_bps[coin])
@@ -348,6 +444,14 @@ class Executor:
         submitted = [o for o in orders if o.status != ORDER_NOT_SUBMITTED]
         if len(submitted) >= self.cfg.max_attempts_per_bar or len(orders) >= 2 * self.cfg.max_attempts_per_bar:
             last = orders[-1] if orders else None
+            if closing:
+                # still holding a position after the attempts of this epoch: keep closing, tell the user + ops
+                report.closing_residuals += 1
+                self._alert("warn", "closing_residual", {
+                    "subscription": sub.id, "coin": coin, "position_szi": str(pos.szi),
+                    "attempts": len(submitted), "epoch": sig.bar_close.isoformat()},
+                    user_id=sub.user_id, dedup=f"closing_residual:{sub.id}:{sig.bar_close.isoformat()}:{coin}")
+                return "residual", []
             if last is not None and last.status != ORDER_FILLED:
                 self._alert("info", "execution_residual", {
                     "subscription_id": sub.id, "coin": coin, "bar_close": sig.bar_close.isoformat(),

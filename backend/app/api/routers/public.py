@@ -6,8 +6,10 @@ wallets only after their month ends). Public backtests omit the trade list and t
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta
 from typing import Any, Literal, Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Path, Query
 
@@ -21,6 +23,44 @@ router = APIRouter(prefix="/public", tags=["public"], dependencies=[ip_limit("pu
 UNPROVEN_WARNING = "Backtest of a newly uploaded script can be fitted to history; not proven live yet"
 _PUBLIC_BACKTEST_DROP = ("trades", "latest_signal", "data_notes")
 SLUG_PATTERN = v.SLUG_RE.pattern
+
+# SPEC §12 (owner, 30 Sep 2026): SILVER is a FREE showcase; its card and page say so plainly.
+SHOWCASE_GENERIC = ("Free showcase of the engine: $0/month and 0% profit share. The 0.1% builder fee still applies "
+                    "to any orders placed for you.")
+SHOWCASE_TEXT = {
+    "silver": (SHOWCASE_GENERIC + " The live signal has been CASH since 1980-01-15 under the current setting (the M2 "
+               "filter is blocking entries), so subscribers may see no trades for a long time."),
+}
+
+
+def _history_days(version: Optional[dict]) -> Optional[int]:
+    """Backtestable history of a version: the report's `history_days` (data-jobs helper) when present, else the
+    simulated span `period.sim_days`. None = no report (in-house feed strategies: decades of terminal history)."""
+    bt = (version or {}).get("backtest")
+    if not isinstance(bt, dict):
+        return None
+    hd = bt.get("history_days")
+    if isinstance(hd, (int, float)) and not isinstance(hd, bool) and math.isfinite(hd):
+        return int(hd)
+    days = (bt.get("period") or {}).get("sim_days") if isinstance(bt.get("period"), dict) else None
+    if isinstance(days, (int, float)) and not isinstance(days, bool) and math.isfinite(days):
+        return int(math.floor(days))
+    return None
+
+
+def _risk_ack_text(s: S.StrategySummary, max_lev_x: Optional[int]) -> str:
+    markets = ", ".join(s.markets) or "its markets"
+    lev = f"up to {max_lev_x}× leverage" if max_lev_x else "leverage"
+    parts = [f"I understand that {s.name} trades {markets} perpetual futures on Hyperliquid in my own account with "
+             f"{lev} on the allocation I choose; that it can lose some or all of that allocation; that backtests and "
+             "past results do not predict future results; and that a new script version resets its live track record."]
+    if s.not_live_proven:
+        parts.append("It is not proven live yet.")
+    if s.short_history_days is not None:
+        parts.append(f"Its backtest covers only {s.short_history_days} days of history.")
+    if s.showcase_text:
+        parts.append(s.showcase_text)
+    return " ".join(parts)
 
 
 def _public_backtest(bt: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -51,18 +91,30 @@ def _summaries(conn: Any, svc: Services, rows: list[dict]) -> list[S.StrategySum
     ids = [str(r["id"]) for r in rows]
     versions = svc.store.current_versions(conn, ids)
     holds = svc.store.holds(conn, ids)
-    econ, now = svc.settings.economics, svc.now()
+    econ, risk, now = svc.settings.economics, svc.settings.risk, svc.now()
     out = []
     for r in rows:
         sid = str(r["id"])
         ver = versions.get(sid)
-        stats, _ = _stats(conn, svc, sid, ver, now, None)
+        stats, not_proven = _stats(conn, svc, sid, ver, now, None)
+        hold = holds.get(sid)
+        live_since = ver.get("live_since") if ver else None
+        history = _history_days(ver)
+        price, ps = r["price_monthly_micro"], int(r["profit_share_bps"] or 0)
+        showcase = bool(r["in_house"]) and price == 0 and ps == 0
         out.append(S.StrategySummary(
-            id=r["id"], slug=r["slug"], name=r["name"], in_house=r["in_house"], markets=list(r["markets"] or []),
-            timeframe=r["timeframe"], status=r["status"], price_monthly_micro=r["price_monthly_micro"],
-            profit_share_bps=int(r["profit_share_bps"] or 0), platform_profit_share_bps=econ.platform_profit_share_bps,
-            platform_profit_share_mode=econ.platform_profit_share_mode, holds=holds.get(sid),
-            current_version=ver["version"] if ver else None, live_since=ver["live_since"] if ver else None,
+            id=r["id"], slug=r["slug"], name=r["name"], description=r.get("description"), in_house=r["in_house"],
+            markets=list(r["markets"] or []), timeframe=r["timeframe"], status=r["status"],
+            price_monthly_micro=price, profit_share_bps=ps, platform_profit_share_bps=econ.platform_profit_share_bps,
+            platform_profit_share_mode=econ.platform_profit_share_mode, holds=hold,
+            signal_state="unknown" if hold is None else ("holds" if hold else "trades"),
+            current_version=ver["version"] if ver else None, live_since=live_since,
+            live_days=max(0, (now - live_since).days) if live_since else None, not_live_proven=bool(not_proven),
+            max_leverage=int(ver["max_leverage"]) if ver and ver.get("max_leverage") else None,
+            history_days=history,
+            short_history_days=history if history is not None and history < risk.short_history_warning_days else None,
+            free_showcase=showcase,
+            showcase_text=(SHOWCASE_TEXT.get(r["slug"], SHOWCASE_GENERIC) if showcase else None),
             stats=stats))
     return out
 
@@ -95,7 +147,7 @@ def strategy_detail(slug: str = Path(..., pattern=SLUG_PATTERN, max_length=64), 
         rating = svc.store.rating_summary(conn, sid)
     return S.StrategyDetail(
         **summary.model_dump(),
-        description=st.get("description"),
+        risk_ack_text=_risk_ack_text(summary, summary.max_leverage),
         versions=[S.StrategyVersionPublic(version=ver["version"], published_at=ver["published_at"],
                                           live_since=ver["live_since"], is_current=ver is current)
                   for ver in versions],
@@ -156,19 +208,34 @@ def public_posts(strategy: Optional[str] = Query(None, pattern=v.SLUG_RE.pattern
     return S.Page[S.PostSummary](items=[S.PostSummary(**r) for r in rows], next_cursor=nxt)
 
 
+@router.get("/posts/{post_id}", response_model=S.PostOut)
+def public_post(post_id: UUID, svc: Services = Depends(get_services)) -> S.PostOut:
+    """Anonymous read of a published post: the body only when the post is free (paid bodies need
+    GET /v1/posts/{id} after purchase)."""
+    with svc.db.begin() as conn:
+        p = svc.store.get_post(conn, str(post_id))
+    if p is None or p.get("published_at") is None:
+        raise NotFound("post not found")
+    free = int(p["price_micro"]) == 0
+    return S.PostOut(id=p["id"], title=p["title"], price_micro=int(p["price_micro"]),
+                     strategy_slug=p.get("strategy_slug"), published_at=p.get("published_at"),
+                     body=p.get("body") if free else None, purchased=False)
+
+
 @router.get("/config", response_model=S.PublicConfigOut)
 def public_config(svc: Services = Depends(get_services)) -> S.PublicConfigOut:
     s, e, cfg = svc.settings, svc.settings.economics, svc.config
-    pct = getattr(s, "stripe_fee_estimate_pct_bps", None)
-    fixed = getattr(s, "stripe_fee_estimate_fixed_micro", None)
+    bps = int(getattr(s, "stripe_fee_estimate_bps", 0) or 0)
+    fixed = int(getattr(s, "stripe_fee_estimate_fixed_micro", 0) or 0)
+    estimate_known = bps > 0 and not e.stripe_fee_absorbed
     return S.PublicConfigOut(
         builder_address=s.builder_address,
         treasury_address=s.treasury_address,
         agent_name=s.agent_name,
         hl_chain="Mainnet" if s.hl_is_mainnet else "Testnet",
         stripe_publishable_key=getattr(s, "stripe_publishable_key", None) or None,
-        stripe_fee_estimate=(S.StripeFeeEstimateOut(pct_bps=int(pct), fixed_micro=int(fixed or 0))
-                             if pct is not None and not e.stripe_fee_absorbed else None),
+        stripe_fee_estimate_bps=bps if estimate_known else None,
+        stripe_fee_estimate_fixed_micro=fixed if estimate_known else None,
         restricted_jurisdictions=list(s.restricted_countries),
         legal_versions=dict(cfg.legal_versions),
         economics=S.EconomicsOut(
@@ -189,7 +256,10 @@ def public_config(svc: Services = Depends(get_services)) -> S.PublicConfigOut:
         features={"creator_uploads": bool(s.feature_creator_uploads),
                   "payouts": cfg.launch.payouts_enabled},
         platform_max_leverage=s.risk.platform_max_leverage,
+        max_user_leverage_x100=cfg.launch.max_user_leverage_x100,
         min_allocation_micro=S.MIN_ALLOCATION_MICRO,
+        min_listing_history_days=s.risk.min_listing_history_days,
+        short_history_warning_days=s.risk.short_history_warning_days,
         launch_phase=cfg.launch.phase,
     )
 

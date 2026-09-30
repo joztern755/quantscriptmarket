@@ -60,8 +60,8 @@ cmd_preflight() {
   log "preflight"
   local bad=0
   [[ -f "${REPO_ROOT}/backend/requirements.lock" ]] || { warn "backend/requirements.lock missing (make lock)"; bad=1; }
-  if grep -q 'sha256:PIN_ME' "${REPO_ROOT}/backend/Dockerfile" "${HERE}/env.sh"; then
-    warn "image digests not pinned (PIN_ME) in backend/Dockerfile or infra/gcp/env.sh (make pin)"; bad=1
+  if grep -q 'sha256:PIN_ME' "${REPO_ROOT}/backend/Dockerfile" "${REPO_ROOT}/sandbox/Dockerfile" "${HERE}/env.sh"; then
+    warn "image digests not pinned (PIN_ME) in backend/Dockerfile, sandbox/Dockerfile or infra/gcp/env.sh (make pin)"; bad=1
   fi
   if [[ -f "${REPO_ROOT}/${SANDBOX_DOCKERFILE}" ]] && grep -Eq '^FROM [^@ ]+( |$)' "${REPO_ROOT}/${SANDBOX_DOCKERFILE}"; then
     warn "${SANDBOX_DOCKERFILE}: base image not pinned by digest (go-live gate G1)"

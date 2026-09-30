@@ -44,9 +44,9 @@ export function loadStripe(): Promise<StripeLike> {
  * The ACTUAL credit is decided by the server from Stripe's balance transaction.
  */
 export function estimateStripeCredit(cfg: PublicConfig, amountMicro: number): { feeMicro: number | null; creditMicro: number | null; estimated: boolean } {
-  const est = cfg.stripe_fee_estimate;
-  if (!est) return { feeMicro: null, creditMicro: null, estimated: false };
-  const fee = Math.ceil((amountMicro * est.pct_bps) / 10_000) + est.fixed_micro; // round fee UP → credit estimate never overstated
+  const bps = cfg.stripe_fee_estimate_bps;
+  if (bps === null || cfg.economics.stripe_fee_absorbed) return { feeMicro: null, creditMicro: null, estimated: false };
+  const fee = Math.ceil((amountMicro * bps) / 10_000) + (cfg.stripe_fee_estimate_fixed_micro ?? 0); // round fee UP → credit estimate never overstated
   return { feeMicro: fee, creditMicro: Math.max(0, amountMicro - fee), estimated: true };
 }
 

@@ -134,6 +134,7 @@ class StrategySummary(Out):
     id: UUID
     slug: str
     name: str
+    description: Optional[str] = None
     in_house: bool
     markets: list[str]
     timeframe: str
@@ -143,8 +144,16 @@ class StrategySummary(Out):
     platform_profit_share_bps: int
     platform_profit_share_mode: str
     holds: Optional[bool] = None                # True = "HOLDS — no active signals"
+    signal_state: Literal["trades", "holds", "unknown"] = "unknown"   # same information as `holds`, for badges
     current_version: Optional[int] = None
     live_since: Optional[datetime] = None
+    live_days: Optional[int] = None             # whole days since the current version's live_since
+    not_live_proven: bool = True                # < 90 days of live signals → "not proven live" warning
+    max_leverage: Optional[int] = None          # current version's MAX_LEVERAGE (effective cap = min with platform/launch)
+    history_days: Optional[int] = None          # backtestable history of the current version (None = unknown/long)
+    short_history_days: Optional[int] = None    # = history_days when < risk.short_history_warning_days (SPEC §12)
+    free_showcase: bool = False                 # in-house, $0 and 0% profit share (SPEC §12 SILVER)
+    showcase_text: Optional[str] = None         # plain statement shown on the card and page when free_showcase
     stats: StrategyStats
 
 
@@ -156,10 +165,10 @@ class StrategyVersionPublic(Out):
 
 
 class StrategyDetail(StrategySummary):
-    description: Optional[str] = None
     versions: list[StrategyVersionPublic]
-    backtest: Optional[dict[str, Any]] = None
+    backtest: Optional[dict[str, Any]] = None   # sandbox report (app.sandbox.backtest) minus trades/latest_signal/data_notes
     backtest_warning: Optional[str] = None
+    risk_ack_text: str                          # strategy-specific acknowledgement shown by the subscribe gate
     rating_avg_x100: Optional[int] = None
     rating_count: int = 0
 
@@ -219,26 +228,27 @@ class ReferralTierOut(Out):
     share_of_pool_bps: int
 
 
-class StripeFeeEstimateOut(Out):
-    pct_bps: int
-    fixed_micro: int
-
-
 class PublicConfigOut(Out):
     builder_address: str
     treasury_address: str
     agent_name: str
     hl_chain: Literal["Mainnet", "Testnet"]
     stripe_publishable_key: Optional[str] = None
-    stripe_fee_estimate: Optional[StripeFeeEstimateOut] = None
+    # Stripe fees are passed to the user (SPEC §1): estimate shown before paying; names = config.Settings fields.
+    # Both null when unknown (not configured) or when economics.stripe_fee_absorbed.
+    stripe_fee_estimate_bps: Optional[int] = None
+    stripe_fee_estimate_fixed_micro: Optional[int] = None
     restricted_jurisdictions: list[str]
-    legal_versions: dict[str, str]
+    legal_versions: dict[str, str]              # consent doc key (terms, risk, privacy, …) → current version
     economics: EconomicsOut
     plans: list[PlanOut]
     referral_tiers: list[ReferralTierOut]
     features: dict[str, bool]
     platform_max_leverage: int
+    max_user_leverage_x100: Optional[int] = None   # launch-phase cap (None = platform cap only)
     min_allocation_micro: int
+    min_listing_history_days: int
+    short_history_warning_days: int
     launch_phase: str
 
 
@@ -275,6 +285,7 @@ class MeOut(Out):
     created_at: datetime
     consents_complete: bool
     wallets: list[WalletOut]
+    kyc_status: Optional[str] = None            # creator KYC: pending | approved | rejected (None = not started)
 
 
 class MePatchIn(In):
@@ -310,7 +321,7 @@ class ConsentItem(In):
     context: Literal["site_entry", "subscribe", "creator"]
     strategy_id: Optional[UUID] = None
     accepted_at: Optional[Annotated[str, StringConstraints(max_length=40)]] = None   # client clock; audit only
-    doc_text_sha256: Optional[Sha256Hex] = None     # sha256 of the exact rendered text the user saw
+    doc_text_sha256: Sha256Hex                      # sha256 of the exact legal/<file>.md bytes the user was shown
     country: Optional[Country] = None               # optional residence attestation (jurisdiction doc only)
 
     @model_validator(mode="after")
@@ -463,10 +474,13 @@ class SubscriptionOut(Out):
     strategy_id: UUID
     strategy_slug: Optional[str] = None
     strategy_name: Optional[str] = None
+    strategy_markets: list[str] = Field(default_factory=list)
     trading_address: str
     allocation_micro: int
     max_leverage_x100: int
     status: str
+    cancel_positions: Optional[str] = None      # close | leave once cancelled/closing (SPEC §12)
+    cancelled_at: Optional[datetime] = None
     current_period_end: Optional[datetime] = None
     cum_pnl_micro: int = 0
     hwm_micro: int = 0
@@ -482,6 +496,7 @@ class SubscriptionCreateOut(Out):
 # ---------------------------------------------------------------------------------------------------- balance / deposits
 class BalanceOut(Out):
     fee_balance_micro: int
+    withdrawable_micro: int                     # USDC-funded part (card-funded credit is spend-only)
     withdrawals_pending_micro: int
     estimated_monthly_need_micro: int
     reserve_required_micro: int
@@ -735,7 +750,7 @@ class StrategyEarningsOut(Out):
     strategy_id: UUID
     slug: str
     active_subscribers: int
-    earned_micro: int
+    earned_micro: Optional[int] = None          # not broken down per strategy yet (see total_earned_micro)
 
 
 class EarningsOut(Out):

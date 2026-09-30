@@ -29,7 +29,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Iterable, Protocol, Sequence, runtime_checkable
 
 from app.errors import Conflict, InsufficientBalance, NotFound, ValidationFailed
 

@@ -6,15 +6,14 @@ import { h, mount, skeleton, errorState, emptyState, note, stat, kv, lineChart, 
 import { api, publicConfig } from "../core/api.js";
 import { feeSummary } from "../core/gate.js";
 import { fmtUsd, fmtPct, fmtBps, fmtNum, fmtDate, shortAddr } from "../core/format.js";
-import type { StrategyDetail, StrategyVersion, ShowcaseWallet, Review, Post } from "./_shared/types.js";
+import type { StrategyDetail, StrategyVersionPublic, ShowcaseWallet, Review, PostSummary } from "./_shared/types.js";
 import { profitShare, builderSplit } from "./_shared/fees.js";
 import { backtestPanel } from "./_shared/backtest.js";
 import {
   ensurePageCss,
   listOf,
   isAbortError,
-  equityPoints,
-  toMs,
+  roiPct,
   strategyBadges,
   marketChips,
   explorerAddressUrl,
@@ -59,7 +58,8 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
 
 function draw(root: HTMLElement, ctx: PageContext, s: StrategyDetail): void {
   const subscribeHref = `#/subscribe/${encodeURIComponent(s.slug)}`;
-  const canSubscribe = !s.status || s.status === "listed";
+  const canSubscribe = s.status === "listed" && s.price_monthly_micro !== null;
+  const price = s.price_monthly_micro ?? 0;
   const subBtn = canSubscribe
     ? h("a", { class: "btn primary", href: subscribeHref }, "Subscribe")
     : h("span", { class: "muted small" }, "Not accepting new subscribers");
@@ -77,15 +77,19 @@ function draw(root: HTMLElement, ctx: PageContext, s: StrategyDetail): void {
       h(
         "div",
         { class: "stack tight page-head" },
-        h("div", { class: "eyebrow" }, s.in_house ? "In-house strategy" : s.creator_name ? `By ${s.creator_name}` : "Strategy"),
+        h("div", { class: "eyebrow" }, s.in_house ? "In-house strategy" : "Creator strategy"),
         h("div", { class: "row between" }, h("h1", { class: "page-title" }, s.name), subBtn),
         strategyBadges(s),
         marketChips(s.markets),
+        s.showcase_text ? note(h("span", null, h("b", null, "Free showcase. "), s.showcase_text), "info") : null,
         s.description ? h("p", { class: "muted" }, s.description) : null,
+        typeof s.short_history_days === "number"
+          ? note(`Short history (${s.short_history_days} days): this version's backtest covers less than a year of market data, next to the "not proven live" warning below.`, "warn")
+          : null,
         h(
           "p",
           { class: "small" },
-          h("b", { class: "mono" }, s.price_monthly_micro > 0 ? fmtUsd(s.price_monthly_micro) : "Free"),
+          h("b", { class: "mono" }, price > 0 ? fmtUsd(price) : "Free"),
           " / month · profit share ",
           h("b", { class: "mono" }, fmtBps(s.profit_share_bps)),
           s.max_leverage ? [" · strategy max leverage ", h("b", { class: "mono" }, `${s.max_leverage}×`)] : null,
@@ -94,7 +98,7 @@ function draw(root: HTMLElement, ctx: PageContext, s: StrategyDetail): void {
       ),
       liveRecord(s),
       versionHistory(s),
-      backtestPanel(s.backtest ?? null),
+      backtestPanel(s.backtest, { warning: s.backtest_warning, shortHistoryDays: s.short_history_days }),
       panel("Fees", feesBox),
       panel(
         "Showcase wallets",
@@ -111,7 +115,7 @@ function draw(root: HTMLElement, ctx: PageContext, s: StrategyDetail): void {
   void (async () => {
     const cfg = await publicConfig();
     if (!ctx.isCurrent()) return;
-    const rows = feeSummary(cfg, { price_monthly_micro: s.price_monthly_micro, profit_share_bps: s.profit_share_bps });
+    const rows = feeSummary(cfg, { price_monthly_micro: price, profit_share_bps: s.profit_share_bps });
     const e = cfg.economics;
     const ps = profitShare(e, s.profit_share_bps, 1_000_000_000); // on $1,000 of new profit
     const bs = builderSplit(e, 10_000_000_000); // on $10,000 of notional traded
@@ -135,22 +139,17 @@ function draw(root: HTMLElement, ctx: PageContext, s: StrategyDetail): void {
 }
 
 function liveRecord(s: StrategyDetail): HTMLElement {
-  const subs = typeof s.subscribers === "number" ? s.subscribers : null;
-  const hidden = s.stats_hidden === true || s.pnl_micro === null || s.pnl_micro === undefined || (subs !== null && subs < MIN_SUBSCRIBERS_FOR_STATS);
-  const cur = s.current_version ?? null;
-  const liveSince = cur?.live_since ?? s.live_since ?? null;
-  const pts = equityPoints(s.equity);
-  const markers = (s.versions ?? [])
-    .filter((v) => v.live_since && (v.version > 1 || v.reset))
-    .map((v) => ({ t: toMs(v.live_since), label: `v${v.version} — reset` }))
-    .filter((m) => Number.isFinite(m.t));
-  const roi = typeof s.roi_pct === "number" ? s.roi_pct : null;
+  const st = s.stats;
+  const subs = st.subscribers;
+  const hidden = st.pnl_micro === null || (subs !== null && subs < MIN_SUBSCRIBERS_FOR_STATS);
+  const liveSince = s.live_since;
+  const roi = roiPct(st.roi_bps);
   return panel(
     "Live on-chain record",
     h(
       "p",
       { class: "small muted" },
-      cur ? `Current version v${cur.version}` : "Current version",
+      s.current_version !== null ? `Current version v${s.current_version}` : "Current version",
       liveSince ? ` live since ${fmtDate(liveSince)}.` : " — not live yet.",
       " Results are measured from real fills on Hyperliquid for this version only; earlier versions do not count.",
     ),
@@ -158,22 +157,19 @@ function liveRecord(s: StrategyDetail): HTMLElement {
       "div",
       { class: "stats" },
       stat("Live ROI", roi === null ? "—" : h("span", { class: roi >= 0 ? "pos" : "neg" }, fmtPct(roi, { sign: true })), "since current version"),
-      stat("Made for users", hidden ? "hidden" : fmtUsd(s.pnl_micro as number, { sign: true }), hidden ? `needs ≥ ${MIN_SUBSCRIBERS_FOR_STATS} subscribers` : "aggregate, net of fees"),
+      stat("Made for users", hidden ? "hidden" : fmtUsd(st.pnl_micro as number, { sign: true }), hidden ? (st.hidden_reason === "not_live" ? "not live yet" : `needs ≥ ${MIN_SUBSCRIBERS_FOR_STATS} subscribers`) : "aggregate, net of fees"),
       stat("Subscribers", subs === null ? "—" : fmtNum(subs, 0)),
-      stat("Days live", typeof s.live_days === "number" ? fmtNum(s.live_days, 0) : "—", typeof s.live_days === "number" && s.live_days >= LIVE_PROVEN_DAYS ? "live-proven" : `< ${LIVE_PROVEN_DAYS} days: not proven`),
+      stat("Days live", typeof s.live_days === "number" ? fmtNum(s.live_days, 0) : "—", s.not_live_proven ? `< ${LIVE_PROVEN_DAYS} days: not proven` : "live-proven"),
     ),
-    hidden
+    hidden && st.hidden_reason !== "not_live"
       ? note(`Aggregate $ made for users is hidden until the strategy has at least ${MIN_SUBSCRIBERS_FOR_STATS} subscribers, so no individual subscriber's results can be inferred.`, "info")
       : null,
-    pts.length >= 2
-      ? lineChart({ series: [{ name: "Live equity (index)", points: pts, tone: "accent" }], markers, ariaLabel: `${s.name} live equity since current version`, yFormat: (v) => fmtNum(v, 1) })
-      : emptyState("No live history yet", "The chart appears after the current version has traded on-chain."),
   );
 }
 
 function versionHistory(s: StrategyDetail): HTMLElement {
-  const versions = [...(s.versions ?? [])].sort((a, b) => b.version - a.version);
-  const curV = s.current_version?.version ?? versions[0]?.version;
+  const versions = [...s.versions].sort((a, b) => b.version - a.version);
+  const curV = versions.find((v) => v.is_current)?.version ?? s.current_version ?? versions[0]?.version;
   if (!versions.length) return panel("Version history", h("p", { class: "muted small" }, "No published versions."));
   return panel(
     "Version history",
@@ -181,13 +177,12 @@ function versionHistory(s: StrategyDetail): HTMLElement {
     h(
       "ol",
       { class: "timeline" },
-      ...versions.map((v: StrategyVersion) =>
+      ...versions.map((v: StrategyVersionPublic) =>
         h(
           "li",
-          { class: [v.version === curV && "current", (v.version > 1 || v.reset) && "reset"] },
-          h("div", { class: "row" }, h("b", null, `v${v.version}`), v.version === curV ? badge("current", "good") : null, v.version > 1 || v.reset ? h("span", { class: "reset-tag" }, "performance reset") : null),
+          { class: [v.version === curV && "current", v.version > 1 && "reset"] },
+          h("div", { class: "row" }, h("b", null, `v${v.version}`), v.version === curV ? badge("current", "good") : null, v.version > 1 ? h("span", { class: "reset-tag" }, "performance reset") : null),
           h("div", { class: "small muted" }, v.published_at ? `Published ${fmtDate(v.published_at)}` : "Unpublished", v.live_since ? ` · live since ${fmtDate(v.live_since)}` : ""),
-          v.note ? h("div", { class: "small" }, v.note) : null,
         ),
       ),
     ),
@@ -202,38 +197,31 @@ async function loadShowcase(ctx: PageContext, s: StrategyDetail, box: HTMLElemen
       return;
     }
     const cols: Column<ShowcaseWallet>[] = [
-      { key: "month", label: "Month", value: (r) => r.period_month, primary: true, mono: true },
+      { key: "month", label: "Month", value: (r) => r.period_month.slice(0, 7), primary: true, mono: true },
       {
         key: "addr",
         label: "Wallet",
         value: (r) => h("a", { href: explorerAddressUrl(r.address) ?? "#", target: "_blank", rel: "noopener noreferrer", class: "mono" }, shortAddr(r.address), " ↗"),
       },
-      { key: "roi", label: "Month ROI", value: (r) => (typeof r.roi_pct === "number" ? fmtPct(r.roi_pct, { sign: true }) : "—"), align: "right", mono: true },
+      { key: "rev", label: "Revealed", value: (r) => fmtDate(r.revealed_at), hideOnMobile: true },
     ];
     mount(box, table({ columns: cols, rows: revealed.sort((a, b) => b.period_month.localeCompare(a.period_month)), rowKey: (r) => r.period_month + r.address }));
   };
-  if (Array.isArray(s.showcase)) {
-    draw(s.showcase);
-    return;
-  }
   try {
     const res = await api.get<unknown>(`/public/showcase/${encodeURIComponent(s.slug)}`, { signal: ctx.signal });
     if (!ctx.isCurrent()) return;
-    draw(listOf<ShowcaseWallet>(res, "wallets", "showcase"));
+    draw(listOf<ShowcaseWallet>(res));
   } catch (err) {
     if (isAbortError(err) || !ctx.isCurrent()) return;
     mount(box, errorState(err, () => void loadShowcase(ctx, s, box)));
   }
 }
 
-async function loadReviews(ctx: PageContext, s: StrategyDetail & { reviews?: Review[]; rating_avg?: number | null }, box: HTMLElement): Promise<void> {
+async function loadReviews(ctx: PageContext, s: StrategyDetail, box: HTMLElement): Promise<void> {
   let reviews: Review[] = [];
   try {
-    if (Array.isArray(s.reviews)) reviews = s.reviews;
-    else {
-      const res = await api.get<unknown>(`/public/strategies/${encodeURIComponent(s.slug)}/reviews`, { signal: ctx.signal });
-      reviews = listOf<Review>(res, "reviews");
-    }
+    const res = await api.get<unknown>(`/public/strategies/${encodeURIComponent(s.slug)}/reviews`, { signal: ctx.signal });
+    reviews = listOf<Review>(res);
   } catch (err) {
     if (isAbortError(err) || !ctx.isCurrent()) return;
     if (errCode(err) !== "not_found") {
@@ -242,10 +230,11 @@ async function loadReviews(ctx: PageContext, s: StrategyDetail & { reviews?: Rev
     }
   }
   if (!ctx.isCurrent()) return;
-  const avg = reviews.length ? reviews.reduce((a, r) => a + r.rating, 0) / reviews.length : null;
+  const avg = s.rating_avg_x100 !== null && s.rating_count > 0 ? s.rating_avg_x100 / 100 : reviews.length ? reviews.reduce((a, r) => a + r.rating, 0) / reviews.length : null;
+  const count = Math.max(s.rating_count, reviews.length);
   mount(
     box,
-    avg !== null ? h("p", null, h("span", { class: "stars", "aria-hidden": "true" }, stars(avg)), " ", h("b", null, fmtNum(avg, 1)), h("span", { class: "muted" }, ` · ${reviews.length} review${reviews.length === 1 ? "" : "s"}`)) : null,
+    avg !== null ? h("p", null, h("span", { class: "stars", "aria-hidden": "true" }, stars(avg)), " ", h("b", null, fmtNum(avg, 1)), h("span", { class: "muted" }, ` · ${count} review${count === 1 ? "" : "s"}`)) : null,
     reviews.length
       ? h(
           "div",
@@ -254,13 +243,13 @@ async function loadReviews(ctx: PageContext, s: StrategyDetail & { reviews?: Rev
             h(
               "div",
               { class: "review stack tight" },
-              h("div", { class: "row between small" }, h("span", { class: "stars", "aria-label": `${r.rating} of 5` }, stars(r.rating)), h("span", { class: "muted" }, r.author ?? "Subscriber", r.created_at ? ` · ${fmtDate(r.created_at)}` : "")),
-              h("p", { class: "break" }, r.body),
+              h("div", { class: "row between small" }, h("span", { class: "stars", "aria-label": `${r.rating} of 5` }, stars(r.rating)), h("span", { class: "muted" }, r.author, ` · ${fmtDate(r.created_at)}`)),
+              r.body ? h("p", { class: "break" }, r.body) : null,
             ),
           ),
         )
       : emptyState("No reviews yet", "Reviews can be written by subscribers after 30 days."),
-    reviewForm(ctx, s, () => void loadReviews(ctx, { ...s, reviews: undefined }, box)),
+    reviewForm(ctx, s, () => void loadReviews(ctx, s, box)),
   );
 }
 
@@ -285,17 +274,17 @@ function reviewForm(ctx: PageContext, s: StrategyDetail, onDone: () => void): HT
           kind: "primary",
           onClick: async () => {
             const text = body.value.trim();
-            if (text.length < 10) {
-              toast("Please write at least a sentence.", "warn");
+            if (text.length > 0 && text.length < 10) {
+              toast("Please write at least a sentence (or leave it empty).", "warn");
               return;
             }
             try {
-              await api.post("/reviews", { strategy_id: s.id, rating: Number(rating.value), body: text }, { signal: ctx.signal });
+              await api.post("/reviews", { strategy_id: s.id, rating: Number(rating.value), body: text || null }, { signal: ctx.signal });
               toast("Review submitted.", "good");
               onDone();
             } catch (err) {
               const c = errCode(err);
-              if (c === "forbidden" || c === "conflict" || c === "validation_failed") toast(c === "conflict" ? "You have already reviewed this strategy." : "You can review after 30 days subscribed.", "warn");
+              if (c === "forbidden") toast("You can review after 30 days subscribed.", "warn");
               else throw err;
             }
           },
@@ -310,7 +299,7 @@ async function loadPosts(ctx: PageContext, s: StrategyDetail, box: HTMLElement):
   try {
     const res = await api.get<unknown>(`/public/posts?strategy=${encodeURIComponent(s.slug)}`, { signal: ctx.signal });
     if (!ctx.isCurrent()) return;
-    const posts = listOf<Post>(res, "posts").slice(0, 5);
+    const posts = listOf<PostSummary>(res).slice(0, 5);
     if (!posts.length) {
       mount(box, emptyState("No posts yet"));
       return;
@@ -323,7 +312,7 @@ async function loadPosts(ctx: PageContext, s: StrategyDetail, box: HTMLElement):
           { class: "post-item" },
           h("a", { class: "title", href: `#/posts/${encodeURIComponent(p.id)}` }, p.title),
           h("div", { class: "small muted" }, p.price_micro > 0 ? `Paid · ${fmtUsd(p.price_micro)}` : "Free", p.published_at ? ` · ${fmtDate(p.published_at)}` : ""),
-          p.excerpt ? inlineMd("p", p.excerpt, "small") : null,
+          p.preview ? inlineMd("p", p.preview, "small") : null,
         ),
       ),
     );

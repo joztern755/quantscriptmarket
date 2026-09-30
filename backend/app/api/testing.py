@@ -299,6 +299,10 @@ class FakeStore:
         self.w.agents[row["id"]] = row
         return dict(row)
 
+    def get_kyc(self, conn, user_id):
+        k = self.w.kyc.get(str(user_id))
+        return dict(k) if k else None
+
     # strategies
     def get_strategy(self, conn, strategy_id, *, for_update=False):
         st = self.w.strategies.get(str(strategy_id))

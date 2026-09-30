@@ -4,7 +4,7 @@ import { h, mount, table, tabs, skeleton, errorState, note, type Column } from "
 import { api } from "../core/api.js";
 import { fmtUsd, fmtPct, fmtNum } from "../core/format.js";
 import type { LeaderRow } from "./_shared/types.js";
-import { ensurePageCss, listOf, isAbortError, pageHead, replaceQuery, marketChips, MIN_SUBSCRIBERS_FOR_STATS, LIVE_PROVEN_DAYS, RISK_LINE } from "./_shared/util.js";
+import { ensurePageCss, listOf, isAbortError, pageHead, replaceQuery, roiPct, MIN_SUBSCRIBERS_FOR_STATS, LIVE_PROVEN_DAYS, RISK_LINE } from "./_shared/util.js";
 
 export const title = "Leaderboard";
 
@@ -49,12 +49,20 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
     try {
       const res = await api.get<unknown>(`/public/leaderboard?by=${by}&period=${period}`, { signal: ctx.signal });
       if (!ctx.isCurrent() || my !== seq) return;
-      const rows = listOf<LeaderRow>(res, "rows", "leaderboard", "strategies");
-      const cols: Column<LeaderRow & { rank: number }>[] = [
+      const rows = listOf<LeaderRow>(res, "entries");
+      const cols: Column<LeaderRow>[] = [
         { key: "rank", label: "#", value: (r) => String(r.rank), mono: true, hideOnMobile: true },
         { key: "name", label: "Strategy", value: (r) => h("a", { href: `#/s/${encodeURIComponent(r.slug)}` }, r.name), primary: true },
-        { key: "markets", label: "Markets", value: (r) => marketChips(r.markets), hideOnMobile: true },
-        { key: "roi", label: "ROI", value: (r) => (typeof r.roi_pct === "number" ? h("span", { class: r.roi_pct >= 0 ? "pos" : "neg" }, fmtPct(r.roi_pct, { sign: true })) : "—"), align: "right", mono: true },
+        {
+          key: "roi",
+          label: "ROI",
+          value: (r) => {
+            const roi = roiPct(r.roi_bps);
+            return roi === null ? "—" : h("span", { class: roi >= 0 ? "pos" : "neg" }, fmtPct(roi, { sign: true }));
+          },
+          align: "right",
+          mono: true,
+        },
         {
           key: "pnl",
           label: "$ made for users",
@@ -63,13 +71,12 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
           mono: true,
         },
         { key: "subs", label: "Subscribers", value: (r) => (typeof r.subscribers === "number" ? fmtNum(r.subscribers, 0) : "—"), align: "right", mono: true },
-        { key: "live", label: "Live days", value: (r) => (typeof r.live_days === "number" ? fmtNum(r.live_days, 0) : "—"), align: "right", mono: true, hideOnMobile: true },
       ];
       mount(
         body,
         table({
           columns: cols,
-          rows: rows.map((r, i) => ({ ...r, rank: i + 1 })),
+          rows,
           rowKey: (r) => r.slug,
           empty: "No live results for this period yet.",
           caption: `Leaderboard by ${by}, ${period}`,

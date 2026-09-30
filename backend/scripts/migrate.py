@@ -208,7 +208,7 @@ def make_driver(url: str, which: str) -> Driver:
             return PsycopgDriver(url)
         except ImportError:
             if which == "psycopg":
-                raise MigrationError("psycopg is not installed")
+                raise MigrationError("psycopg is not installed") from None
     return PsqlDriver(url)
 
 

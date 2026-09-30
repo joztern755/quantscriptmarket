@@ -3,7 +3,7 @@
 import { h, badge, loadCss, type Child } from "../../core/ui.js";
 import { parseUsdToMicro } from "../../core/format.js";
 import { renderInline } from "./markdown.js";
-import type { StrategySummary, EquityPoint } from "./types.js";
+import type { StrategySummary } from "./types.js";
 
 /** Days of live signals required before a strategy counts as live-proven (SPEC §10). */
 export const LIVE_PROVEN_DAYS = 90;
@@ -30,16 +30,17 @@ export function ensurePageCss(): void {
 type Rec = Record<string, unknown>;
 export const isRec = (v: unknown): v is Rec => typeof v === "object" && v !== null && !Array.isArray(v);
 
-/** Accept `[...]`, `{items:[...]}`, `{data:[...]}` or `{<key>:[...]}` list responses. */
-export function listOf<T>(x: unknown, ...keys: string[]): T[] {
+/** Items of a backend list response: `Page<T>` = `{items, next_cursor}` or a plain array (e.g. /agents,
+ *  /creator/strategies, /admin/flags, /public/showcase/{slug}); `key` picks a named array (e.g. PositionsOut.positions). */
+export function listOf<T>(x: unknown, key = "items"): T[] {
   if (Array.isArray(x)) return x as T[];
-  if (isRec(x)) {
-    for (const k of [...keys, "items", "data", "results"]) {
-      const v = x[k];
-      if (Array.isArray(v)) return v as T[];
-    }
-  }
+  if (isRec(x) && Array.isArray(x[key])) return x[key] as T[];
   return [];
+}
+
+/** Live ROI in percent from StrategyStats.roi_bps (null when hidden). */
+export function roiPct(roiBps: number | null | undefined): number | null {
+  return typeof roiBps === "number" && Number.isFinite(roiBps) ? roiBps / 100 : null;
 }
 
 /** ms epoch from ISO string / seconds / ms. NaN if invalid. */
@@ -52,7 +53,7 @@ export function toMs(t: unknown): number {
   return NaN;
 }
 
-/** Accepts [{t,v}] or [[t,v]] equity arrays. */
+/** Sandbox equity curves are `[[t_ms, equity], …]`. */
 export function equityPoints(arr: unknown): { t: number; v: number }[] {
   if (!Array.isArray(arr)) return [];
   const out: { t: number; v: number }[] = [];
@@ -60,11 +61,6 @@ export function equityPoints(arr: unknown): { t: number; v: number }[] {
     if (Array.isArray(p) && p.length >= 2) {
       const t = toMs(p[0]);
       const v = Number(p[1]);
-      if (Number.isFinite(t) && Number.isFinite(v)) out.push({ t, v });
-    } else if (isRec(p)) {
-      const e = p as unknown as EquityPoint;
-      const t = toMs(e.t);
-      const v = Number(e.v);
       if (Number.isFinite(t) && Number.isFinite(v)) out.push({ t, v });
     }
   }
@@ -99,16 +95,18 @@ export function errMessage(err: unknown): string {
   return "Something went wrong.";
 }
 
-export function isNotLiveProven(s: Pick<StrategySummary, "live_days">): boolean {
-  return typeof s.live_days !== "number" || s.live_days < LIVE_PROVEN_DAYS;
+export function isNotLiveProven(s: Pick<StrategySummary, "not_live_proven">): boolean {
+  return s.not_live_proven !== false;
 }
 
-/** Status badges for a strategy card/header. */
+/** Status badges for a strategy card/header (SPEC §9, §12). */
 export function strategyBadges(s: StrategySummary): HTMLElement {
   const wrap = h("span", { class: "row tight-row" });
+  if (s.free_showcase) wrap.appendChild(badge("Free showcase", "info"));
   if (s.signal_state === "trades") wrap.appendChild(badge("Trades", "good"));
   else if (s.signal_state === "holds") wrap.appendChild(badge("Holds — no active signals", "muted"));
   if (isNotLiveProven(s)) wrap.appendChild(badge(`Not live-proven (< ${LIVE_PROVEN_DAYS} days)`, "warn"));
+  if (typeof s.short_history_days === "number") wrap.appendChild(badge(`Short history (${s.short_history_days} days)`, "warn"));
   if (s.status && s.status !== "listed") wrap.appendChild(badge(s.status, s.status === "paused" ? "warn" : "muted"));
   return wrap;
 }

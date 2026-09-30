@@ -158,6 +158,7 @@ def _build(services: Optional[Services], role: str) -> FastAPI:
         for r in (public, me, consents, wallets, agents, subscriptions, balance, deposits, withdrawals, positions,
                   alerts, reviews, posts, referrals, creator, admin, webhooks):
             app.include_router(r.router, prefix="/v1")
+        from app.api.routers import kyc_webhook; app.include_router(kyc_webhook.router, prefix="/v1")
 
     cfg = services.config
     # add_middleware prepends: the LAST added is the OUTERMOST.

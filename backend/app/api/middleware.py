@@ -175,7 +175,7 @@ class BodyLimitMiddleware:
 
 class EdgeGuardMiddleware:
     EXEMPT_PREFIXES = ("/v1/internal/",)
-    EXEMPT_PATHS = ("/healthz", "/v1/webhooks/stripe")
+    EXEMPT_PATHS = ("/healthz", "/v1/webhooks/stripe", "/v1/webhooks/kyc", "/v1/webhooks/telegram")
 
     def __init__(self, app: ASGIApp, *, get_services: Callable[[], Any]) -> None:
         self.app = app

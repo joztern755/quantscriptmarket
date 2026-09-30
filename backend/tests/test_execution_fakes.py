@@ -106,6 +106,24 @@ class FakeSubRepo:
     def get_order(self, cloid: str) -> OrderRecord | None:
         return self.orders.get(cloid)
 
+    def get_subscription(self, subscription_id: str) -> SubscriptionView | None:
+        s = self.subs.get(subscription_id)
+        return self._view(s) if s is not None else None
+
+    def closing_subscriptions(self, limit: int) -> Sequence[SubscriptionView]:
+        return [self._view(s) for s in self.subs.values() if s.status == "closing"][:limit]
+
+    def unresolved_orders(self, subscription_id: str) -> Sequence[OrderRecord]:
+        return sorted((o for o in self.orders.values() if o.subscription_id == subscription_id
+                       and o.status in ("submitting", "unknown", "resting")), key=lambda o: (o.bar_close, o.attempt))
+
+    def finish_closing(self, subscription_id: str, now: datetime) -> bool:
+        s = self.subs.get(subscription_id)
+        if s is None or s.status != "closing":
+            return False
+        self.subs[subscription_id] = replace(s, status="cancelled")
+        return True
+
     def insert_order(self, record: OrderRecord) -> bool:
         if record.cloid in self.orders:
             return False
@@ -400,7 +418,7 @@ class FakeSettlementRepo:
         self.pnl: dict[str, list[tuple[datetime, int]]] = {}     # sub -> [(time, micro)]
         self.settled: set[tuple[str, date]] = set()
         self.fills: dict[str, BuilderFeeFill] = {}
-        self.recognised: dict[str, str] = {}
+        self.recognised: dict[tuple[str, str], str] = {}   # (trading_address, tid) -> ledger tx id
         self.plans: dict[str, PlanAccount] = {}
 
     def add_pnl(self, sub_id: str, when: datetime, micro: int) -> None:
@@ -429,10 +447,11 @@ class FakeSettlementRepo:
         self.subs[subscription_id] = replace(self.subs[subscription_id], current_period_end=period_end)
 
     def unrecognised_builder_fee_fills(self, until: datetime, limit: int) -> Sequence[BuilderFeeFill]:
-        return [f for t, f in sorted(self.fills.items()) if t not in self.recognised and f.time <= until][:limit]
+        return [f for t, f in sorted(self.fills.items())
+                if (f.trading_address, f.tid) not in self.recognised and f.time <= until][:limit]
 
-    def mark_builder_fee_recognised(self, tid: str, ledger_tx_id: str) -> None:
-        self.recognised[tid] = ledger_tx_id
+    def mark_builder_fee_recognised(self, trading_address: str, tid: str, ledger_tx_id: str) -> None:
+        self.recognised[(trading_address, tid)] = ledger_tx_id
 
     def plans_due(self, now: datetime) -> Sequence[PlanAccount]:
         return [p for p in self.plans.values() if p.plan != "free" and p.plan_period_end and p.plan_period_end <= now]

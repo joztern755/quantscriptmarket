@@ -206,7 +206,8 @@ def earnings(ctx: AuthCtx = Depends(creator_user), svc: Services = Depends(get_s
     return S.EarningsOut(
         payable_micro=payable, payouts_pending_micro=pending, total_earned_micro=total,
         by_strategy=[S.StrategyEarningsOut(strategy_id=r["strategy_id"], slug=r["slug"],
-                                           active_subscribers=int(r["active_subscribers"] or 0)) for r in by_strategy],
+                                           active_subscribers=int(r["active_subscribers"] or 0),
+                                           earned_micro=r.get("earned_micro")) for r in by_strategy],
         recent=[S.LedgerEntryOut(tx_id=r["tx_id"], kind=r["kind"], memo=r.get("memo"),
                                  amount_micro=-int(r["raw_amount_micro"]), created_at=r["created_at"]) for r in recent])
 

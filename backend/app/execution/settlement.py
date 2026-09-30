@@ -12,8 +12,10 @@ For ``settle_date`` D (PnL cut-off = D 00:00 UTC):
    active → past_due → reduce_only after the grace period; back to active once the balance covers what is due.
 3. Platform plan renewals (``plan:{user_id}:{period_end date}``); unpaid → past_due, after grace → downgraded
    to free.
-4. Builder-fee revenue recognition per fill (``bf:{tid}``): builder receivable debited, creator / referrer /
-   platform credited per ``domain.fees.split_builder_fee`` with the referrer's current tier.
+4. Builder-fee revenue recognition per fill (``bf:{trading_address}:{tid}`` — a tid identifies the TRADE and is
+   shared by both counterparties, so the fill key is (trading_address, tid) like the fills UNIQUE constraint):
+   builder receivable debited, creator / referrer / platform credited per ``domain.fees.split_builder_fee`` with
+   the referrer's current tier.
 
 Ledger sign convention (SPEC §4): + debit / − credit, Σ per transaction = 0. The user fee balance is a
 liability, so the user's available balance is ``−balance(user:{id}:fee_balance)``.
@@ -85,8 +87,10 @@ def plan_key(user_id: str, period_end: datetime) -> str:
     return f"plan:{user_id}:{period_end.astimezone(timezone.utc).date().isoformat()}"
 
 
-def builder_fee_key(tid: str) -> str:
-    return f"bf:{tid}"
+def builder_fee_key(trading_address: str, tid: str) -> str:
+    if not trading_address or not str(tid):
+        raise ValueError("builder fee key needs trading_address and tid")
+    return f"bf:{trading_address.lower()}:{tid}"
 
 
 def _lines(*pairs: tuple[str, int]) -> list[LedgerLine]:
@@ -304,7 +308,7 @@ class Settlement:
                     self._recognise_fill(f, report)
                     progressed += 1
                 except Exception as exc:
-                    self._fail(report, f"builder_fee:{f.tid}", exc)
+                    self._fail(report, f"builder_fee:{f.trading_address}:{f.tid}", exc)
             if progressed == 0 or len(fills) < self.page:
                 return
 
@@ -313,9 +317,9 @@ class Settlement:
         if fee < 0:
             raise ValueError("negative builder fee")
         attributed = f.subscription_id is not None
-        if not attributed:
-            self._alert("warn", "builder_fee_unattributed_fill", {"tid": f.tid, "fee_micro": fee},
-                        dedup=f"bf_unattributed:{f.tid}")
+        if not attributed and fee > 0:   # our builder fee on a fill we cannot attribute (crash window) → ops look
+            self._alert("warn", "builder_fee_unattributed_fill", {"tid": f.tid, "fee_micro": fee, "address": f.trading_address},
+                        dedup=f"bf_unattributed:{f.trading_address}:{f.tid}")
         has_creator = attributed and not f.in_house and bool(f.creator_user_id)
         ref = self.referrals.referrer_share(f.user_id) if (attributed and f.user_id) else None
         split = self.fees.split_builder_fee(fee, in_house=not has_creator,
@@ -332,9 +336,9 @@ class Settlement:
             tx_id = None
             if fee > 0:
                 tx_id, _ = self.ledger.post_transaction(
-                    idempotency_key=builder_fee_key(f.tid), kind="builder_fee",
+                    idempotency_key=builder_fee_key(f.trading_address, f.tid), kind="builder_fee",
                     memo=f"builder fee fill tid={f.tid}", lines=_lines(*pairs), created_by=self.created_by)
-            self.repo.mark_builder_fee_recognised(f.tid, tx_id or "")
+            self.repo.mark_builder_fee_recognised(f.trading_address, f.tid, tx_id or "")
         report.builder_fills_recognised += 1
         report.builder_fees_recognised_micro += fee
 

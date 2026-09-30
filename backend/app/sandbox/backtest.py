@@ -48,7 +48,8 @@ from app.sandbox.runner import SERIES_LIMITS, RunLimits, SeriesResult, normalize
 from app.sandbox.validate import TIMEFRAME_MS, StrategyMeta, ensure_valid
 
 __all__ = [
-    "BacktestParams", "MarketData", "CandleFetcher", "HyperliquidInfoFetcher", "fetch_market_data",
+    "BacktestParams", "MarketData", "CandleFetcher", "HyperliquidInfoFetcher", "StoredCandleSource",
+    "StoredFirstFetcher", "fetch_market_data",
     "align_bars", "simulate", "compute_metrics", "backtest_on_data", "run_backtest",
     "UNPROVEN_WARNING", "HL_MAX_CANDLES",
 ]
@@ -231,6 +232,55 @@ class HyperliquidInfoFetcher:
         return [out[t] for t in sorted(out)]
 
 
+class StoredCandleSource(Protocol):
+    """Our own candle history (SPEC §12; ``app.jobs_data.candles.DbCandleSource``): closed candles, API-shaped dicts
+    ``{"t","o","h","l","c","v","n"}`` with exact decimal strings, oldest first, ``start_ms <= t <= end_ms``."""
+
+    def stored_candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list[dict[str, Any]]: ...
+
+
+class StoredFirstFetcher:
+    """``CandleFetcher`` that reads stored candles first and asks the API (``api``, e.g. ``HyperliquidInfoFetcher``)
+    only for the ranges the store does not cover: before its first candle (store not backfilled yet) and after its
+    last one (bars since the last sync). Stored values win where both exist (a stored candle is immutable).
+    ``source_notes[coin]`` records which range came from where; ``fetch_market_data`` copies it into the report's
+    ``data_notes`` (SPEC §12: "record the data range used"). Funding always comes from the API."""
+
+    def __init__(self, store: StoredCandleSource, api: CandleFetcher) -> None:
+        self.store, self.api = store, api
+        self.source_notes: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _range(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+        return {"first_t": int(rows[0]["t"]), "last_t": int(rows[-1]["t"]), "bars": len(rows)} if rows else None
+
+    def candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+        step = TIMEFRAME_MS[interval]
+        stored = sorted(self.store.stored_candles(coin, interval, start_ms, end_ms), key=lambda c: int(c["t"]))
+        out: dict[int, dict[str, Any]] = {int(c["t"]): c for c in stored}
+        api_rows: list[dict[str, Any]] = []
+        if not stored:
+            api_rows = self.api.candles(coin, interval, start_ms, end_ms)
+        else:
+            first, last = int(stored[0]["t"]), int(stored[-1]["t"])
+            if first - step > start_ms:           # store starts later than asked (not backfilled): fill the head
+                api_rows += self.api.candles(coin, interval, start_ms, first - 1)
+            if last + step <= end_ms:             # bars after the last stored one
+                api_rows += self.api.candles(coin, interval, last + step, end_ms)
+        used_api = []
+        for c in api_rows:
+            t = int(c["t"])
+            if start_ms <= t <= end_ms and t not in out:
+                out[t] = c
+                used_api.append(c)
+        used_api.sort(key=lambda c: int(c["t"]))
+        self.source_notes[coin] = {"interval": interval, "stored": self._range(stored), "api": self._range(used_api)}
+        return [out[t] for t in sorted(out)]
+
+    def funding(self, coin: str, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+        return self.api.funding(coin, start_ms, end_ms)
+
+
 def fetch_market_data(meta: StrategyMeta, fetcher: CandleFetcher, *, start_ms: int | None = None,
                       end_ms: int | None = None, now_ms: int | None = None,
                       include_funding: bool = True) -> MarketData:
@@ -257,10 +307,18 @@ def fetch_market_data(meta: StrategyMeta, fetcher: CandleFetcher, *, start_ms: i
         rows = rows[lead:]
         candles[coin] = normalize_bars({coin: rows})[coin]
         notes["coins"][coin] = {"bars": len(rows), "dropped_leading_zero_volume": lead,
-                                "hit_hl_candle_cap": len(raw) >= HL_MAX_CANDLES}
+                                "hit_hl_candle_cap": len(raw) >= HL_MAX_CANDLES,
+                                "first_t": int(rows[0]["t"]) if rows else None,
+                                "last_t": int(rows[-1]["t"]) if rows else None}
+        sources = getattr(fetcher, "source_notes", None)
+        if isinstance(sources, dict) and coin in sources:
+            notes["coins"][coin]["sources"] = sources[coin]
         if include_funding and rows:
             evs = fetcher.funding(coin, int(rows[0]["t"]), end + step)
             funding[coin] = [[int(e["time"]), float(e["fundingRate"])] for e in evs]
+    firsts = [c["first_t"] for c in notes["coins"].values() if c.get("first_t") is not None]
+    lasts = [c["last_t"] for c in notes["coins"].values() if c.get("last_t") is not None]
+    notes["data_range"] = {"first_t": min(firsts) if firsts else None, "last_t": max(lasts) if lasts else None}
     return MarketData(timeframe=meta.timeframe, candles=candles, funding=funding, notes=notes)
 
 

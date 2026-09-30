@@ -1,10 +1,11 @@
 """Consents (append-only evidence): POST /consents (batch) and GET /consents/status.
 
 Only valid MFA session required (this is how a new user clears the consent gate). Every item must match the
-CURRENT document version; `doc_text_sha256` is the hash of the exact rendered text the user saw — when the
-server knows the canonical hash for that version (settings.legal_doc_hashes) a mismatch is refused and a missing
-client hash is filled with the canonical one; without either the consent is refused (the DB column is NOT NULL:
-we never record a consent without evidence of which text was accepted).
+CURRENT document version and carry `doc_text_sha256` = sha256 of the exact legal/<file>.md bytes the web showed
+(the web fetches the file as bytes and hashes it with WebCrypto). The server compares it with the canonical hash of
+the current file (config.legal_doc_hashes, keyed here by consent doc via deps.LEGAL_DOC_FILES): a mismatch is
+refused (409 legal_text_mismatch). In prod a missing canonical hash (legal/ not shipped with the image) refuses the
+consent (503) — we never record a consent without evidence of which text was accepted.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ from app.api.deps import (
     AuthCtx,
     JurisdictionBlocked,
     Services,
+    ServiceUnavailable,
     current_user,
     get_services,
     user_limit,
@@ -54,10 +56,12 @@ def post_consents(body: S.ConsentBatchIn, ctx: AuthCtx = Depends(current_user),
                 raise Conflict("this document has been updated; please review the current version",
                                doc=item.doc, current_version=current)
             canonical: Optional[str] = cfg.legal_doc_hashes.get(item.doc)
-            if canonical and item.doc_text_sha256 and item.doc_text_sha256 != canonical:
+            if canonical is None and settings.is_prod:
+                raise ServiceUnavailable("legal documents are not available on the server", doc=item.doc)
+            if canonical is not None and item.doc_text_sha256 != canonical:
                 raise Conflict("the document text you accepted differs from the current text; please reload",
-                               doc=item.doc)
-            text_hash = item.doc_text_sha256 or canonical
+                               doc=item.doc, reason="legal_text_mismatch")
+            text_hash = item.doc_text_sha256
             if not text_hash:
                 raise ValidationFailed("doc_text_sha256 is required", doc=item.doc)
             if item.doc == "creator_agreement" and not settings.feature_creator_uploads:

@@ -93,7 +93,7 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
       .filter((s) => !state.market || (s.markets ?? []).includes(state.market))
       .filter((s) => {
         if (!state.status) return true;
-        if (state.status === "proven") return typeof s.live_days === "number" && s.live_days >= LIVE_PROVEN_DAYS;
+        if (state.status === "proven") return !s.not_live_proven;
         return s.signal_state === state.status;
       })
       .sort((a, b) => sortVal(b, state.sort) - sortVal(a, state.sort) || a.name.localeCompare(b.name));
@@ -109,7 +109,7 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
       );
       return;
     }
-    mount(list, ...rows.map((s) => strategyCard(s, { featured: !!s.featured })));
+    mount(list, ...rows.map((s) => strategyCard(s, { featured: s.free_showcase && s.in_house })));
   }
 
   function reset(): void {
@@ -126,7 +126,7 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
     try {
       const res = await api.get<unknown>("/public/strategies", { signal: ctx.signal });
       if (!ctx.isCurrent()) return;
-      all = listOf<StrategySummary>(res, "strategies");
+      all = listOf<StrategySummary>(res);
       update();
     } catch (err) {
       if (isAbortError(err) || !ctx.isCurrent()) return;
@@ -138,7 +138,7 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
 }
 
 function sortVal(s: StrategySummary, key: SortKey): number {
-  const v = key === "roi" ? s.roi_pct : key === "pnl" ? s.pnl_micro : s.subscribers;
+  const v = key === "roi" ? s.stats.roi_bps : key === "pnl" ? s.stats.pnl_micro : s.stats.subscribers;
   return typeof v === "number" && Number.isFinite(v) ? v : -Infinity;
 }
 

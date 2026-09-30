@@ -18,11 +18,12 @@ def get_balance(ctx: AuthCtx = Depends(consented_user), svc: Services = Depends(
     with svc.db.begin() as conn:
         bal = ledger_ops.spendable(conn, svc, ctx.user_id)
         pending = svc.store.pending_withdrawals_total(conn, ctx.user_id)
+        withdrawable = min(bal, max(0, int(svc.store.withdrawable_usdc(conn, ctx.user_id))))
         prices = svc.store.live_subscription_prices(conn, ctx.user_id)
         user = svc.store.get_user(conn, ctx.user_id)
     plan_price = svc.domain.plan_price(user["plan"]) if user["plan"] != "free" else 0
     need = svc.domain.estimate_monthly_need(prices, plan_price)
-    return S.BalanceOut(fee_balance_micro=bal, withdrawals_pending_micro=pending, estimated_monthly_need_micro=need,
+    return S.BalanceOut(fee_balance_micro=bal, withdrawable_micro=withdrawable, withdrawals_pending_micro=pending, estimated_monthly_need_micro=need,
                         reserve_required_micro=econ.min_topup_micro if prices else 0,
                         min_topup_micro=econ.min_topup_micro)
 

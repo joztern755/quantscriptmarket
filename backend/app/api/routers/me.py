@@ -37,6 +37,7 @@ def _me_out(conn, svc: Services, user: dict) -> S.MeOut:
         country_attested=user.get("country_attested"), mfa_enrolled=bool(user.get("mfa_enrolled")),
         created_at=user["created_at"], consents_complete=not missing_consents(conn, svc, uid),
         wallets=[S.WalletOut(**w) for w in svc.store.list_wallets(conn, uid)],
+        kyc_status=(svc.store.get_kyc(conn, uid) or {}).get("status"),
     )
 
 

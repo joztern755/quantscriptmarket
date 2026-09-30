@@ -243,6 +243,8 @@ export interface HlResult {
   status: "ok" | "err";
   response: unknown;
   error?: string;
+  /** The nonce actually signed (for usdSend = its `time`, ms) — e.g. POST /v1/deposits/usdc/confirm {time_ms}. */
+  nonce?: number;
 }
 
 function hlUrl(path: "/exchange" | "/info"): string {
@@ -294,7 +296,8 @@ export async function hlInfo<T>(body: Record<string, unknown>): Promise<T> {
 
 export async function signAndSubmit(wallet: Wallet, built: BuiltAction): Promise<HlResult> {
   const sig = await wallet.signTypedDataV4(built.typedData);
-  return postExchange({ action: built.action, nonce: built.nonce, signature: splitSignature(sig) });
+  const res = await postExchange({ action: built.action, nonce: built.nonce, signature: splitSignature(sig) });
+  return { ...res, nonce: built.nonce };
 }
 
 async function liveConfig() {

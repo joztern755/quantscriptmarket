@@ -61,7 +61,30 @@ DEFAULT_LEGAL_VERSIONS: dict[str, str] = {
     "creator_agreement": "2026-09-30",
     "subscription_ack": "2026-09-30",
 }
+# Consent doc key (DB enum consent_doc, SPEC §4; the API and web speak these keys) → legal/<file>.md. The web
+# serves the same files at /legal/<file>.md (web/build.mjs DOC_FILES, core/gate.ts LEGAL_SLUGS).
+LEGAL_DOC_FILES: dict[str, str] = {
+    "terms": "terms",
+    "risk": "risk-disclosure",
+    "privacy": "privacy",
+    "jurisdiction": "jurisdiction",
+    "waiver": "liability-waiver",
+    "creator_agreement": "creator-agreement",
+    "subscription_ack": "subscription-ack",
+}
 ALLOWED_SIGN_IN_PROVIDERS = frozenset({"google.com", "apple.com"})
+
+
+def legal_by_doc(meta: Optional[dict]) -> dict[str, str]:
+    """{file stem or doc key: value} (config._legal_meta is keyed by file stem) → {consent doc key: value}."""
+    meta = dict(meta or {})
+    out: dict[str, str] = {}
+    for doc, stem in LEGAL_DOC_FILES.items():
+        if stem in meta:
+            out[doc] = str(meta[stem])
+        elif doc in meta:
+            out[doc] = str(meta[doc])
+    return out
 
 
 # ============================================================================================================
@@ -102,7 +125,7 @@ class ApiConfig:
     pepper: bytes
     kyc_provider: str
     legal_versions: dict[str, str]
-    legal_doc_hashes: dict[str, str]          # doc -> sha256 of the current rendered text ({} = not enforced)
+    legal_doc_hashes: dict[str, str]          # doc key -> sha256 of the served legal/<file>.md bytes
     launch: "LaunchConfig"
     max_body_bytes: int = 128 * 1024
     max_upload_body_bytes: int = 1024 * 1024
@@ -162,7 +185,7 @@ def _pepper(settings: Settings) -> bytes:
 
 def api_config(settings: Settings) -> ApiConfig:
     legal = dict(DEFAULT_LEGAL_VERSIONS)
-    legal.update(getattr(settings, "legal_versions", None) or {})
+    legal.update(legal_by_doc(getattr(settings, "legal_versions", None)))
     return ApiConfig(
         edge_auth_secret=getattr(settings, "edge_auth_secret", "") or "",
         scheduler_sa_email=(getattr(settings, "scheduler_sa_email", "") or "").lower(),
@@ -171,7 +194,7 @@ def api_config(settings: Settings) -> ApiConfig:
         pepper=_pepper(settings),
         kyc_provider=getattr(settings, "kyc_provider", "") or "",
         legal_versions=legal,
-        legal_doc_hashes=dict(getattr(settings, "legal_doc_hashes", None) or {}),
+        legal_doc_hashes=legal_by_doc(getattr(settings, "legal_doc_hashes", None)),
         launch=_launch(settings),
     )
 

@@ -22,7 +22,7 @@ pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app.api.deps import DEFAULT_LEGAL_VERSIONS, SITE_DOCS  # noqa: E402
+from app.api.deps import DEFAULT_LEGAL_VERSIONS, SITE_DOCS, api_config  # noqa: E402
 from app.api.main import create_app, create_executor_app  # noqa: E402
 from app.api.testing import FakeWorld, make_services, make_settings  # noqa: E402
 
@@ -51,10 +51,15 @@ def login(svc, world, uid="fb-user", *, stale=False, mfa=True, email="u@example.
     return {"Authorization": f"Bearer {tok}"}
 
 
+def doc_hash(doc: str) -> str:
+    """sha256 of the served legal/<file>.md (what the web sends); the server verifies it (409 on mismatch)."""
+    return api_config(make_settings()).legal_doc_hashes.get(doc, "a" * 64)
+
+
 def site_consents(country=None) -> dict:
     items = []
     for d in SITE_DOCS:
-        item = {"doc": d, "doc_version": DEFAULT_LEGAL_VERSIONS[d], "context": "site_entry", "doc_text_sha256": "a" * 64,
+        item = {"doc": d, "doc_version": DEFAULT_LEGAL_VERSIONS[d], "context": "site_entry", "doc_text_sha256": doc_hash(d),
                 "accepted_at": "2026-09-30T11:59:00Z"}
         if d == "jurisdiction" and country:
             item["country"] = country
@@ -229,6 +234,11 @@ def test_consent_version_hash_and_jurisdiction_rules():
     del no_hash["consents"][0]["doc_text_sha256"]
     r = c.post("/v1/consents", headers=h, json=no_hash)
     assert r.status_code == 422
+    if svc.config.legal_doc_hashes.get("terms"):
+        wrong = site_consents()
+        wrong["consents"][1]["doc_text_sha256"] = "0" * 64
+        r = c.post("/v1/consents", headers=h, json=wrong)
+        assert r.status_code == 409 and r.json()["error"]["details"]["reason"] == "legal_text_mismatch"
     r = c.post("/v1/consents", headers=h, json=site_consents(country="US"))
     assert r.status_code == 451
     bad_ctx = {"consents": [{"doc": "subscription_ack", "doc_version": "2026-09-30", "context": "site_entry",
@@ -343,7 +353,8 @@ def _subscribe_world(c_world, svc, *, price=20 * USD, ps=1000, balance=50 * USD)
 
 def _ack(c, h, st):
     body = {"consents": [{"doc": "subscription_ack", "doc_version": DEFAULT_LEGAL_VERSIONS["subscription_ack"],
-                          "context": "subscribe", "strategy_id": st["id"], "doc_text_sha256": "c" * 64}]}
+                          "context": "subscribe", "strategy_id": st["id"],
+                          "doc_text_sha256": doc_hash("subscription_ack")}]}
     assert c.post("/v1/consents", headers=h, json=body).status_code == 200
 
 
@@ -478,7 +489,7 @@ def _admins(world):
 
 def test_payout_two_admins_required():
     world, svc, c = build()
-    u = _user_with_wallet(world, balance=100 * USD)
+    _user_with_wallet(world, balance=100 * USD)
     a1, a2 = _admins(world)
     r = c.post("/v1/withdrawals", headers={**login(svc, world), "Idempotency-Key": key()},
                json={"amount": "30", "to_address": W1})

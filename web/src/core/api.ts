@@ -169,14 +169,17 @@ export const api = {
 
 export type ConsentDoc = "terms" | "risk" | "privacy" | "waiver" | "jurisdiction" | "creator_agreement" | "subscription_ack";
 
+/** GET /v1/public/config — mirrors backend/app/api/schemas.py PublicConfigOut (see docs/API_CONTRACT.md). */
 export interface PublicConfig {
   builder_address: string;
   treasury_address: string;
   agent_name: string;
   hl_chain: "Mainnet" | "Testnet";
   stripe_publishable_key: string | null;
-  /** Stripe processor fees are passed to the user (credit = paid − actual fee). Estimate only; null = unknown. */
-  stripe_fee_estimate: { pct_bps: number; fixed_micro: number } | null;
+  /** Stripe processor fees are passed to the user (credit = paid − actual fee). Estimate only; null = unknown.
+   *  Names = backend config.Settings.stripe_fee_estimate_bps / stripe_fee_estimate_fixed_micro. */
+  stripe_fee_estimate_bps: number | null;
+  stripe_fee_estimate_fixed_micro: number | null;
   restricted_jurisdictions: string[];
   legal_versions: Record<"terms" | "risk" | "privacy" | "waiver" | "jurisdiction", string> & Partial<Record<ConsentDoc, string>>;
   economics: {
@@ -192,9 +195,18 @@ export interface PublicConfig {
     post_min_price_micro: number;
     min_topup_micro: number;
     past_due_grace_hours: number;
+    stripe_fee_absorbed: boolean;
   };
   plans: { key: "free" | "pro" | "max"; price_monthly_micro: number; max_active_strategies: number | null; features: string[] }[];
-  features: { creator_uploads: boolean };
+  referral_tiers: { name: string; min_active_users: number; min_notional_30d_micro: number; share_of_pool_bps: number }[];
+  features: { creator_uploads: boolean; payouts: boolean };
+  platform_max_leverage: number;
+  /** Launch-phase leverage cap ×100 (null = platform cap only). */
+  max_user_leverage_x100: number | null;
+  min_allocation_micro: number;
+  min_listing_history_days: number;
+  short_history_warning_days: number;
+  launch_phase: string;
   _fallback?: true;
 }
 
@@ -212,7 +224,14 @@ const ECON_DEFAULTS: PublicConfig["economics"] = {
   post_min_price_micro: 2_000_000,
   min_topup_micro: 10_000_000,
   past_due_grace_hours: 72,
+  stripe_fee_absorbed: false,
 };
+
+const TIER_DEFAULTS: PublicConfig["referral_tiers"] = [
+  { name: "starter", min_active_users: 0, min_notional_30d_micro: 0, share_of_pool_bps: 5000 },
+  { name: "partner", min_active_users: 10, min_notional_30d_micro: 1_000_000_000_000, share_of_pool_bps: 7500 },
+  { name: "elite", min_active_users: 100, min_notional_30d_micro: 25_000_000_000_000, share_of_pool_bps: 10000 },
+];
 
 const ADDR = /^0x[0-9a-f]{40}$/;
 
@@ -228,6 +247,8 @@ export function normalizePublicConfig(raw: unknown, fallback = false): PublicCon
   for (const k of Object.keys(ECON_DEFAULTS) as (keyof typeof ECON_DEFAULTS)[]) {
     if (k === "platform_profit_share_mode") {
       economics.platform_profit_share_mode = econRaw[k] === "carved_out" ? "carved_out" : "on_top";
+    } else if (k === "stripe_fee_absorbed") {
+      economics.stripe_fee_absorbed = econRaw[k] === true;
     } else {
       (economics as Record<string, number | string>)[k] = num(econRaw[k], ECON_DEFAULTS[k] as number);
     }
@@ -239,14 +260,17 @@ export function normalizePublicConfig(raw: unknown, fallback = false): PublicCon
     ? r.restricted_jurisdictions.filter((x): x is string => typeof x === "string" && /^[A-Z]{2}$/.test(x))
     : ac.fallback.restricted_jurisdictions;
   const lower = (v: unknown) => (typeof v === "string" && ADDR.test(v.toLowerCase()) ? v.toLowerCase() : "");
-  const sfe = r.stripe_fee_estimate as Record<string, unknown> | null | undefined;
+  const intOrNull = (v: unknown): number | null => (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null);
+  const feeBps = intOrNull(r.stripe_fee_estimate_bps);
+  const feats = (r.features && typeof r.features === "object" ? r.features : {}) as Record<string, unknown>;
   const cfg: PublicConfig = {
     builder_address: lower(r.builder_address),
     treasury_address: lower(r.treasury_address),
     agent_name: typeof r.agent_name === "string" && /^[A-Za-z0-9_-]{1,16}$/.test(r.agent_name) ? r.agent_name : "aijalon",
     hl_chain: r.hl_chain === "Testnet" ? "Testnet" : "Mainnet",
     stripe_publishable_key: typeof r.stripe_publishable_key === "string" && /^pk_(live|test)_[A-Za-z0-9]+$/.test(r.stripe_publishable_key) ? r.stripe_publishable_key : null,
-    stripe_fee_estimate: sfe && typeof sfe === "object" && typeof sfe.pct_bps === "number" && typeof sfe.fixed_micro === "number" ? { pct_bps: sfe.pct_bps, fixed_micro: sfe.fixed_micro } : null,
+    stripe_fee_estimate_bps: feeBps,
+    stripe_fee_estimate_fixed_micro: feeBps === null ? null : intOrNull(r.stripe_fee_estimate_fixed_micro) ?? 0,
     restricted_jurisdictions: juris,
     legal_versions: legal as PublicConfig["legal_versions"],
     economics,
@@ -255,7 +279,14 @@ export function normalizePublicConfig(raw: unknown, fallback = false): PublicCon
       { key: "pro", price_monthly_micro: 20_000_000, max_active_strategies: 3, features: [] },
       { key: "max", price_monthly_micro: 50_000_000, max_active_strategies: null, features: [] },
     ],
-    features: { creator_uploads: Boolean((r.features as Record<string, unknown> | undefined)?.creator_uploads ?? true) },
+    referral_tiers: Array.isArray(r.referral_tiers) ? (r.referral_tiers as PublicConfig["referral_tiers"]) : TIER_DEFAULTS,
+    features: { creator_uploads: Boolean(feats.creator_uploads ?? true), payouts: feats.payouts === true },
+    platform_max_leverage: num(r.platform_max_leverage, 5),
+    max_user_leverage_x100: intOrNull(r.max_user_leverage_x100),
+    min_allocation_micro: num(r.min_allocation_micro, 100_000_000),
+    min_listing_history_days: num(r.min_listing_history_days, 180),
+    short_history_warning_days: num(r.short_history_warning_days, 365),
+    launch_phase: typeof r.launch_phase === "string" ? r.launch_phase : "internal",
   };
   if (fallback) cfg._fallback = true;
   return cfg;

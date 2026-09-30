@@ -7,7 +7,7 @@ import json
 import os
 import unittest
 from dataclasses import replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 
 try:  # the cryptography native backend is broken on some dev boxes (pyo3 panic); never skip in CI
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey

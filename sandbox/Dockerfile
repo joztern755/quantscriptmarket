@@ -26,7 +26,9 @@
 # RLIMIT_FSIZE=0 (cannot write files), cwd in a throw-away temp dir, and no code is ever loaded from
 # a writable path. Where a read-only root FS is available (GKE / docker run --read-only
 # --tmpfs /tmp:rw,noexec,nosuid,size=64m), use it.
-FROM python:3.12-slim
+# pin-image: python:3.12-slim
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:PIN_ME
+FROM ${PYTHON_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

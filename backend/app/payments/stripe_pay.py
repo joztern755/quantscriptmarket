@@ -77,6 +77,7 @@ __all__ = [
     "TopupIntent",
     "create_topup_intent",
     "stripe_fee_micro",
+    "make_fee_lookup",
     "StripeFeeNotReady",
     "FEE_EXPAND",
     "WebhookVerificationError",
@@ -201,6 +202,51 @@ def stripe_fee_micro(pi: Mapping[str, Any], gross_micro: int) -> int:
     if amount <= 0 or fee < 0 or fee >= amount:
         raise ValidationFailed("balance_transaction amount/fee out of range")
     return gross_micro * fee // amount
+
+
+def _has_balance_transaction(pi: Mapping[str, Any]) -> bool:
+    charge = pi.get("latest_charge")
+    return isinstance(charge, Mapping) and isinstance(charge.get("balance_transaction"), Mapping)
+
+
+def _gross_micro_of(pi: Mapping[str, Any]) -> int:
+    """Gross USD value (micro) of what a succeeded top-up PaymentIntent actually received — the same figure
+    ``handle_event`` credits before the fee (USD: cents × 10_000; MYR: pro-rata of the locked ``credit_micro``)."""
+    meta = pi.get("metadata") or {}
+    currency = str(pi.get("currency", "")).lower()
+    amount = _int(pi.get("amount"), "amount")
+    received = _int(pi.get("amount_received"), "amount_received")
+    record = _record_from_meta(meta, str(pi.get("id", "")), currency, amount)
+    if record is None:
+        raise ValidationFailed("not a complete fee-balance top-up PaymentIntent")
+    if received <= 0:
+        raise ValidationFailed("amount_received is zero")
+    return _credit_for(record, received)
+
+
+def make_fee_lookup(gateway: StripeGateway | None) -> Callable[[dict], int]:
+    """Fee port for ``handle_event(..., fee_lookup=)`` (API: ``StripeAdapter.handle_event``).
+
+    Returns ``lookup(pi) -> fee_micro``: the ACTUAL Stripe fee for the PaymentIntent, read from its charge's
+    ``balance_transaction`` and applied as a share of the gross credit (``stripe_fee_micro``). If the PaymentIntent
+    it is given was not expanded (a raw webhook object has ``latest_charge`` as an id string), it re-fetches it
+    through ``gateway`` with ``FEE_EXPAND``. Still no balance transaction → ``StripeFeeNotReady`` (webhook answers
+    non-2xx, Stripe redelivers later; nothing is credited meanwhile). Malformed data → ``ValidationFailed`` (the
+    handler turns it into a manual-review alert, never a guessed credit).
+    """
+
+    def lookup(pi: dict) -> int:
+        pi_id = str(pi.get("id", ""))
+        src: Mapping[str, Any] = pi
+        if not _has_balance_transaction(src):
+            if gateway is None:
+                raise StripeFeeNotReady("balance_transaction not expanded and no gateway to fetch it")
+            src = gateway.retrieve_payment_intent(pi_id, expand=FEE_EXPAND)
+            if not isinstance(src, Mapping) or src.get("id") != pi_id:
+                raise ValidationFailed("re-fetched PaymentIntent id mismatch")
+        return stripe_fee_micro(src, _gross_micro_of(src))
+
+    return lookup
 
 
 def _form_encode(params: Mapping[str, Any], prefix: str = "") -> list[tuple[str, str]]:

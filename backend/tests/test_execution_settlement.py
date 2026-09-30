@@ -246,27 +246,34 @@ class PlanRenewalTest(unittest.TestCase):
         e.assert_ledger_balanced(self)
 
 
+A1, A2, A3 = ("0x" + "a1" * 20, "0x" + "a2" * 20, "0x" + "a3" * 20)
+
+
 class BuilderFeeRecognitionTest(unittest.TestCase):
     def test_split_per_fill_with_referral_and_idempotent(self):
         e = Env(referrals={"user1": ("ref1", 5000)})
         t = datetime(2026, 10, 1, 8, tzinfo=UTC)
         e.repo.fills = {
-            "t1": BuilderFeeFill("t1", "sub1", "user1", "creator1", False, 1000, t),
-            "t2": BuilderFeeFill("t2", "sub2", "user2", None, True, 999, t),
-            "t3": BuilderFeeFill("t3", None, None, None, False, 500, t),
-            "t4": BuilderFeeFill("t4", "sub1", "user1", "creator1", False, 10, datetime(2026, 10, 2, 1, tzinfo=UTC)),
+            "t1": BuilderFeeFill("t1", "sub1", "user1", "creator1", False, 1000, t, A1),
+            "t2": BuilderFeeFill("t2", "sub2", "user2", None, True, 999, t, A2),
+            "t3": BuilderFeeFill("t3", None, None, None, False, 500, t, A3),
+            "t4": BuilderFeeFill("t4", "sub1", "user1", "creator1", False, 10, datetime(2026, 10, 2, 1, tzinfo=UTC), A1),
+            # the same trade (tid) seen from the counterparty's account (another of our users) is a distinct fill
+            "t1b": BuilderFeeFill("t1", "sub2", "user2", None, True, 1000, t, A2),
         }
         r = e.run(NOW)
-        self.assertEqual(r.builder_fills_recognised, 3)                     # t4 is after the cut-off
-        self.assertEqual(set(e.ledger.txs["bf:t1"][2]), {
+        self.assertEqual(r.builder_fills_recognised, 4)                     # t4 is after the cut-off
+        self.assertEqual(set(e.ledger.txs[f"bf:{A2}:t1"][2]), {
+            LedgerLine("builder:hl_receivable", 1000), LedgerLine("platform:revenue:builder", -1000)})
+        self.assertEqual(set(e.ledger.txs[f"bf:{A1}:t1"][2]), {
             LedgerLine("builder:hl_receivable", 1000), LedgerLine("creator:creator1:payable", -500),
             LedgerLine("referrer:ref1:payable", -100), LedgerLine("platform:revenue:builder", -400)})
-        self.assertEqual(set(e.ledger.txs["bf:t2"][2]), {
+        self.assertEqual(set(e.ledger.txs[f"bf:{A2}:t2"][2]), {
             LedgerLine("builder:hl_receivable", 999), LedgerLine("platform:revenue:builder", -999)})
-        self.assertEqual(set(e.ledger.txs["bf:t3"][2]), {
+        self.assertEqual(set(e.ledger.txs[f"bf:{A3}:t3"][2]), {
             LedgerLine("builder:hl_receivable", 500), LedgerLine("platform:revenue:builder", -500)})
         self.assertIn("builder_fee_unattributed_fill", e.alerts.kinds())
-        self.assertEqual(r.builder_fees_recognised_micro, 2499)
+        self.assertEqual(r.builder_fees_recognised_micro, 3499)
         n = len(e.ledger.txs)
         e.run(NOW + timedelta(minutes=1))
         self.assertEqual(len(e.ledger.txs), n)

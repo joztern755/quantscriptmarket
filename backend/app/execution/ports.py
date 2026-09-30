@@ -21,8 +21,14 @@ from typing import Any, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 # Value objects
 # ---------------------------------------------------------------------------------------------------------------------
 
-# Subscription statuses (SPEC §4). Only these are ever traded by the executor.
+# Subscription statuses (SPEC §4). Only these are ever traded by the executor on strategy signals.
 TRADABLE_STATUSES = ("active", "past_due", "reduce_only")
+# SPEC §12 cancel flow: "close" → status ``closing``: the executor flattens every strategy market reduce-only (target
+# weight 0, whatever the signals say) until the on-chain positions are 0, then sets ``cancelled``. "leave" →
+# ``cancelled`` at once: the executor never touches the account again for that subscription.
+CLOSING_STATUS = "closing"
+# BarSignal.source of the synthetic all-zero signal the executor builds for a closing subscription.
+CLOSING_SOURCE = "closing"
 
 
 @dataclass(frozen=True)
@@ -35,7 +41,7 @@ class SubscriptionView:
     trading_address: str            # master or sub-account (lower-case); orders use vault_address when ≠ master
     allocation_micro: int
     max_leverage_x100: int
-    status: str                     # pending|active|past_due|reduce_only|paused_user|cancelled
+    status: str                     # pending|active|past_due|reduce_only|paused_user|closing|cancelled
     markets: tuple[str, ...]        # strategy market whitelist (e.g. ("xyz:SILVER",))
     consecutive_rejections: int = 0  # circuit-breaker counter
     strategy_max_leverage_x100: int | None = None
@@ -48,7 +54,7 @@ class BarSignal:
     strategy_version_id: str
     bar_close: datetime
     weights_bps: Mapping[str, int]  # coin -> weight × 10000 (signed)
-    source: str = "terminal"        # sandbox|terminal
+    source: str = "terminal"        # sandbox|terminal (|closing: synthetic, built by the executor)
 
 
 @dataclass(frozen=True)
@@ -140,7 +146,7 @@ class OrderRecord:
     strategy_version_id: str
     bar_close: datetime
     attempt: int                    # 0-based attempt number within (subscription, bar, coin)
-    cloid: str                      # deterministic (see executor.make_cloid)
+    cloid: str                      # deterministic (executor.make_cloid → app.hl.client.make_cloid)
     coin: str
     is_buy: bool
     sz: Decimal
@@ -232,6 +238,8 @@ class ProfitShareCharge:
 
 @dataclass(frozen=True)
 class BuilderFeeFill:
+    """One fill whose builder fee is not yet recognised. A Hyperliquid ``tid`` identifies the TRADE (shared by both
+    counterparties), so a fill is identified by ``(trading_address, tid)`` (fills UNIQUE constraint)."""
     tid: str
     subscription_id: str | None
     user_id: str | None
@@ -239,6 +247,7 @@ class BuilderFeeFill:
     in_house: bool
     builder_fee_micro: int
     time: datetime
+    trading_address: str
 
 
 @dataclass(frozen=True)
@@ -296,6 +305,19 @@ class SubscriptionRepo(Protocol):
         """Orders already recorded for (subscription, bar, coin), ordered by attempt."""
 
     def get_order(self, cloid: str) -> OrderRecord | None: ...
+
+    def get_subscription(self, subscription_id: str) -> SubscriptionView | None:
+        """Fresh view (any status). The executor re-reads under the advisory lock, so a cancel ("leave") or a
+        switch to ``closing`` that lands while a tick is running is honoured before any order is sent."""
+
+    def closing_subscriptions(self, limit: int) -> Sequence[SubscriptionView]:
+        """Subscriptions in status ``closing`` (SPEC §12), independent of any signal."""
+
+    def unresolved_orders(self, subscription_id: str) -> Sequence[OrderRecord]:
+        """Orders of the subscription (any bar) whose outcome is unknown (submitting | unknown | resting)."""
+
+    def finish_closing(self, subscription_id: str, now: datetime) -> bool:
+        """closing → cancelled (cancelled_at = now). Atomic on the current status; False if it was not closing."""
 
     def insert_order(self, record: OrderRecord) -> bool:
         """Insert the order *intent* (status ``submitting``) BEFORE sending. Must be atomic on the unique cloid:
@@ -439,7 +461,8 @@ class SettlementRepo(Protocol):
 
     def unrecognised_builder_fee_fills(self, until: datetime, limit: int) -> Sequence[BuilderFeeFill]: ...
 
-    def mark_builder_fee_recognised(self, tid: str, ledger_tx_id: str) -> None: ...
+    def mark_builder_fee_recognised(self, trading_address: str, tid: str, ledger_tx_id: str) -> None:
+        """Mark the fill ``(trading_address, tid)`` recognised; ``ledger_tx_id`` "" = nothing was posted."""
 
     def plans_due(self, now: datetime) -> Sequence[PlanAccount]:
         """Paid plans (pro/max) whose plan_period_end ≤ now."""

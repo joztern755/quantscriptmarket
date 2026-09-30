@@ -129,6 +129,12 @@ class Settings:
     stripe_publishable_key: str
     legal_versions: dict                            # {doc: version} — filled from legal/*.md "Version:" lines at build
     legal_doc_hashes: dict                          # {doc: sha256 of the exact served text}
+    kyc_provider: str                               # "manual" (internal phase) | "sumsub"
+    kyc_app_token: str
+    kyc_secret_key: str
+    kyc_webhook_secret: str
+    kyc_level_name: str
+    kyc_api_base: str
     economics: Economics = field(default_factory=Economics)
     risk: RiskLimits = field(default_factory=RiskLimits)
 
@@ -221,6 +227,12 @@ def get_settings() -> Settings:
         stripe_publishable_key=os.environ.get("STRIPE_PUBLISHABLE_KEY", ""),
         legal_versions=_legal_meta()[0],
         legal_doc_hashes=_legal_meta()[1],
+        kyc_provider=os.environ.get("KYC_PROVIDER", "manual"),
+        kyc_app_token=os.environ.get("KYC_APP_TOKEN", ""),
+        kyc_secret_key=os.environ.get("KYC_SECRET_KEY", ""),
+        kyc_webhook_secret=os.environ.get("KYC_WEBHOOK_SECRET", ""),
+        kyc_level_name=os.environ.get("KYC_LEVEL_NAME", ""),
+        kyc_api_base=os.environ.get("KYC_API_BASE", "https://api.sumsub.com"),
     )
     if s.is_prod:
         required = ["builder_address", "treasury_address", "kms_key_name", "firebase_project_id", "signals_pubkey_b64",

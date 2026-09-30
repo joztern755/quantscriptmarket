@@ -123,24 +123,39 @@ if (existsSync(sriPath)) {
   log("WARN: web/sri.json absent — Firebase modules load WITHOUT SRI (see docs/WEB_CORE_API.md)");
 }
 
-const authOrigins = new Set();
-if (authDomain) authOrigins.add(`https://${authDomain}`);
-if (appCfg.firebase?.projectId && !/REPLACE_ME/.test(appCfg.firebase.projectId)) authOrigins.add(`https://${appCfg.firebase.projectId}.firebaseapp.com`);
+// The policy is the SAME as backend/app/security/csp.py web_csp(api_origin=, firebase_auth_domain=) — same
+// directives, sources and order; the host-by-host rationale lives there. Change both together (and re-run
+// `make csp-sync`). Only addition: the import map's hash when web/sri.json exists (inline <script type=importmap>).
+//   * gstatic is path-scoped to /firebasejs/ (the pinned SDK), not all of www.gstatic.com
+//   * Firebase Auth REST: identitytoolkit + securetoken only (no *.googleapis.com / www.googleapis.com)
+//   * auth iframe: 'self' when authDomain is our own origin (Hosting serves /__/auth/*), else that authDomain,
+//     else <projectId>.firebaseapp.com — never *.firebaseapp.com
+//   * Stripe: js.stripe.com + *.js.stripe.com (script, frame), hooks.stripe.com (3-D Secure frame), api.stripe.com
+const cspSource = (s) => {
+  if (!/^https:\/\/[A-Za-z0-9.*-]+(:\d+)?(\/[A-Za-z0-9._~\/-]*)?$/.test(s) || s === "https://*") fail(`refusing unsafe CSP source ${s}`);
+  return s;
+};
+const siteHost = new URL(String(appCfg.siteOrigin || "https://aijalon.trade")).host;
+const projectId = String(appCfg.firebase?.projectId || "");
+const authFrame = ["'self'"];
+if (authDomain) {
+  if (authDomain !== siteHost) authFrame.push(cspSource(`https://${authDomain}`));
+} else if (projectId && !/REPLACE_ME/.test(projectId)) {
+  authFrame.push(cspSource(`https://${projectId}.firebaseapp.com`));
+}
 
 const importMapHash = importMap ? `'sha256-${createHash("sha256").update(importMap).digest("base64")}'` : null;
 const directives = {
   "default-src": ["'self'"],
-  "script-src": ["'self'", "https://www.gstatic.com", "https://apis.google.com", "https://js.stripe.com", "https://*.js.stripe.com", ...(importMapHash ? [importMapHash] : [])],
+  "script-src": ["'self'", "https://www.gstatic.com/firebasejs/", "https://apis.google.com", "https://js.stripe.com", "https://*.js.stripe.com", ...(importMapHash ? [importMapHash] : [])],
   "style-src": ["'self'", "https://fonts.googleapis.com"],
-  "font-src": ["'self'", "https://fonts.gstatic.com"],
-  "img-src": ["'self'", "data:", "https://*.stripe.com", "https://lh3.googleusercontent.com"],
-  "connect-src": ["'self'", apiOrigin, hlOrigin, "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com", "https://www.googleapis.com", "https://api.stripe.com"],
-  "frame-src": [...authOrigins, "https://apis.google.com", "https://js.stripe.com", "https://*.js.stripe.com", "https://hooks.stripe.com"],
+  "img-src": ["'self'", "data:"],
+  "font-src": ["https://fonts.gstatic.com"],
+  "connect-src": ["'self'", cspSource(apiOrigin), cspSource(hlOrigin), "https://identitytoolkit.googleapis.com", "https://securetoken.googleapis.com", "https://api.stripe.com"],
+  "frame-src": [...authFrame, "https://js.stripe.com", "https://*.js.stripe.com", "https://hooks.stripe.com"],
   "object-src": ["'none'"],
   "base-uri": ["'none'"],
   "form-action": ["'self'"],
-  "manifest-src": ["'self'"],
-  "worker-src": ["'none'"],
 };
 const cspMeta = Object.entries(directives).map(([k, v]) => `${k} ${[...new Set(v)].join(" ")}`).join("; ");
 const cspHeader = `${cspMeta}; frame-ancestors 'none'; upgrade-insecure-requests`;

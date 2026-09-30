@@ -99,10 +99,10 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
     try {
       const res = await api.get<unknown>("/public/strategies", { signal: ctx.signal });
       if (!ctx.isCurrent()) return;
-      const all = listOf<StrategySummary>(res, "strategies");
+      const all = listOf<StrategySummary>(res);
       const featured =
         all.find((s) => s.slug === "silver") ??
-        all.find((s) => s.featured) ??
+        all.find((s) => s.free_showcase) ??
         all.find((s) => s.markets?.includes("xyz:SILVER")) ??
         all.find((s) => s.in_house);
       if (!featured) {

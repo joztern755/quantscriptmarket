@@ -2,7 +2,7 @@
 // Acceptance is stored locally (versions + time) and POSTed to /v1/consents after sign-in.
 // The gate re-appears whenever a document version in /v1/public/config changes.
 
-import { api, publicConfig, type ConsentDoc, type PublicConfig } from "./api.js";
+import { api, ApiError, publicConfig, type ConsentDoc, type PublicConfig } from "./api.js";
 import { currentUser } from "./auth.js";
 import { fmtBps, fmtTenthsBp, fmtUsd } from "./format.js";
 import { storage } from "./state.js";
@@ -25,6 +25,8 @@ type SiteDoc = (typeof SITE_DOCS)[number];
 interface LocalConsent {
   version: string;
   accepted_at: string;
+  /** sha256 (hex) of the exact legal/<file>.md bytes shown when the box was ticked (sent as doc_text_sha256). */
+  sha256?: string;
 }
 interface LocalState {
   site: Partial<Record<SiteDoc, LocalConsent>>;
@@ -60,12 +62,61 @@ export function siteGateAccepted(cfg: PublicConfig): boolean {
   return SITE_DOCS.every((d) => s.site[d]?.version === cfg.legal_versions[d]);
 }
 
-function recordSite(cfg: PublicConfig): void {
+function recordSite(cfg: PublicConfig, hashes: Partial<Record<SiteDoc, string>> = {}): void {
   const s = load();
   const now = new Date().toISOString();
-  for (const d of SITE_DOCS) s.site[d] = { version: cfg.legal_versions[d], accepted_at: now };
+  for (const d of SITE_DOCS) s.site[d] = { version: cfg.legal_versions[d], accepted_at: now, sha256: hashes[d] };
   save(s);
   memAccepted = { site: { ...s.site }, synced: { ...s.synced } };
+}
+
+function forgetSite(): void {
+  const s = load();
+  s.site = {};
+  save(s);
+  memAccepted = null;
+}
+
+// ---------------------------------------------------------------- legal text evidence (doc_text_sha256)
+
+const hashCache = new Map<string, Promise<string>>();
+
+function hex(buf: ArrayBuffer): string {
+  return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * sha256 (hex) of the exact bytes of dist/legal/<file>.md — the file the legal page renders and the backend
+ * hashes (config.legal_doc_hashes). Fetched as an ArrayBuffer (no text decoding) and hashed with WebCrypto.
+ * When `expectVersion` is given, the file's `Version:` line must match it (a stale cached copy is refused).
+ */
+export function legalDocHash(doc: ConsentDoc, expectVersion?: string): Promise<string> {
+  const slug = LEGAL_SLUGS[doc];
+  const key = `${slug}@${expectVersion ?? ""}`;
+  const hit = hashCache.get(key);
+  if (hit) return hit;
+  const p = (async () => {
+    const res = await fetch(new URL(`legal/${slug}.md`, document.baseURI).href, { credentials: "omit", cache: "no-cache" });
+    const ct = res.headers.get("content-type") ?? "";
+    if (!res.ok || /text\/html/i.test(ct)) throw new ApiError(0, "legal_doc_unavailable", "Couldn't load the legal documents. Check your connection and try again.");
+    const bytes = await res.arrayBuffer();
+    if (expectVersion) {
+      const head = new TextDecoder().decode(bytes.slice(0, 2048));
+      const m = /^\**Version:?\**:?\s*([0-9A-Za-z._-]+)/m.exec(head);
+      if (m && m[1] !== expectVersion) throw new ApiError(0, "legal_doc_stale", "The legal documents were just updated. Please reload the page.");
+    }
+    return hex(await crypto.subtle.digest("SHA-256", bytes));
+  })();
+  hashCache.set(key, p);
+  p.catch(() => hashCache.delete(key));
+  return p;
+}
+
+async function hashesFor<D extends ConsentDoc>(cfg: PublicConfig, docs: readonly D[]): Promise<Record<D, string>> {
+  const v = cfg.legal_versions as Partial<Record<ConsentDoc, string>>;
+  const out = {} as Record<D, string>;
+  await Promise.all(docs.map(async (d) => (out[d] = await legalDocHash(d, v[d]))));
+  return out;
 }
 
 let syncing: Promise<void> | null = null;
@@ -81,15 +132,24 @@ export function syncConsents(): Promise<void> {
     const s = state();
     const fp = fingerprint(cfg);
     if (s.synced[u.uid] === fp) return;
-    await api.post("/consents", {
-      consents: SITE_DOCS.map((d) => ({
-        doc: d,
-        doc_version: s.site[d]!.version,
-        context: "site_entry",
-        strategy_id: null,
-        accepted_at: s.site[d]!.accepted_at,
-      })),
-    });
+    const missing = SITE_DOCS.filter((d) => !s.site[d]!.sha256);
+    const fresh = missing.length ? await hashesFor(cfg, missing) : ({} as Record<SiteDoc, string>);
+    try {
+      await api.post("/consents", {
+        consents: SITE_DOCS.map((d) => ({
+          doc: d,
+          doc_version: s.site[d]!.version,
+          context: "site_entry",
+          strategy_id: null,
+          accepted_at: s.site[d]!.accepted_at,
+          doc_text_sha256: s.site[d]!.sha256 ?? fresh[d],
+        })),
+      });
+    } catch (err) {
+      // 409: a document changed since it was accepted here (version or text) → ask again.
+      if (err instanceof ApiError && err.status === 409) forgetSite();
+      throw err;
+    }
     const s2 = load();
     s2.synced[u.uid] = fp;
     save(s2);
@@ -146,13 +206,15 @@ export function gateForm(cfg: PublicConfig, onAccept: () => void): HTMLElement {
   const status = h("p", { class: "status", "aria-live": "polite" });
   const go = button("Enter aijalon.trade", {
     kind: "primary",
-    onClick: () => {
+    onClick: async () => {
       if (!boxes.every((b) => b.input.checked)) {
         status.className = "status err";
         status.textContent = "Tick every box to continue.";
         return;
       }
-      recordSite(cfg);
+      // Evidence of which text was accepted; offline → recorded without it and hashed again at sync time.
+      const hashes = cfg._fallback ? {} : await hashesFor(cfg, SITE_DOCS).catch(() => ({}));
+      recordSite(cfg, hashes);
       try {
         sessionStorage.removeItem(TICKS_KEY);
       } catch { /* ignore */ }
@@ -248,7 +310,7 @@ export async function subscribeGate(opts: { strategy: SubscribeGateStrategy; all
     `I understand that "${s.name}" trades ${s.markets.join(", ")} perpetuals with leverage in my own Hyperliquid account, that it can lose some or all of my allocation, that its backtest is not a promise of future results, and that a new script version resets its live track record.`;
   const acks = [
     checkbox(ackText, { required: true }),
-    checkbox(["I agree to the fees above and to the ", legalLink("terms", "Terms of Service", true), "."], { required: true }),
+    checkbox(["I have read the ", legalLink("subscription_ack", "Subscription Acknowledgement", true), " and agree to the fees above and to the ", legalLink("terms", "Terms of Service", true), "."], { required: true }),
     checkbox(["I have read the ", legalLink("risk", "Risk Disclosure", true), " and accept the ", legalLink("waiver", "Liability Waiver", true), " for this subscription."], { required: true }),
   ];
   const fees = feeSummary(cfg, s);
@@ -283,13 +345,11 @@ export async function subscribeGate(opts: { strategy: SubscribeGateStrategy; all
           const base = { context: "subscribe", strategy_id: s.id, accepted_at: now };
           const v = cfg.legal_versions;
           try {
+            if (!v.subscription_ack) throw new ApiError(0, "config_unavailable", "Couldn't load the current acknowledgement. Try again in a moment.");
+            const docs = ["subscription_ack", "terms", "risk", "waiver"] as const;
+            const hx = await hashesFor(cfg, docs);
             await api.post("/consents", {
-              consents: [
-                { doc: "subscription_ack", doc_version: v.subscription_ack ?? v.terms, ...base },
-                { doc: "terms", doc_version: v.terms, ...base },
-                { doc: "risk", doc_version: v.risk, ...base },
-                { doc: "waiver", doc_version: v.waiver, ...base },
-              ],
+              consents: docs.map((d) => ({ doc: d, doc_version: (v as Partial<Record<ConsentDoc, string>>)[d], doc_text_sha256: hx[d], ...base })),
             });
           } catch (err) {
             status.className = "status err";

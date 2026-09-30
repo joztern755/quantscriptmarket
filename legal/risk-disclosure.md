@@ -85,6 +85,15 @@ Perps charge or pay **funding** between longs and shorts, usually hourly. Fundin
 - Our random delays, per-user ordering and per-user agents make it **harder, but not impossible**, to link wallets or copy strategies. Analysts can **cluster** wallets that trade the same markets at similar times. Once your address is linked to a strategy, others may **copy, front-run or trade against** your positions and the strategy's.
 - We never publish your address or show it to creators. But we cannot stop on-chain analysis.
 
+## 9A. Platform orders are identifiable on-chain
+
+- **Every order we place for you carries two public markers.** The first is our **builder code**, which is attached to every order so that Hyperliquid can collect our builder fee. The second is the order's **client order ID**, which always starts with the same fixed aijalon.trade prefix. Both markers appear in Hyperliquid's public order and fill data. [VERIFY exactly where each marker is shown in public Hyperliquid data]
+- **This means anyone can tell that a trade came from aijalon.trade.** They can also make a list of the Hyperliquid accounts that trade through the Platform.
+- **The markers do not say who you are or which strategy you follow.** They do not contain your name, your email or the strategy's name. The rest of the order ID is a scrambled code that only we can link to your subscription. [VERIFY]
+- **Your identity or strategy can still be worked out.** Someone may connect your address to you from other sources, such as an exchange withdrawal, a social media post or an ENS-style name. Analysts can also **group together** Platform accounts that trade the same markets at around the same time, and so guess which accounts follow the same strategy. The markers make this easier, because they show which accounts to look at. Section 9 explains what can happen once this link is made.
+- **We cannot switch these markers off.** The builder code is how our fee is charged. The order ID prefix is how we match fills to your subscription, which lets us calculate your results and profit share correctly.
+- **What you can do:** use a separate Hyperliquid account just for the Platform, not your main wallet, and do not publicly link that account to your identity.
+
 ## 10. Hyperliquid network, smart contract and L1 risk
 
 - Hyperliquid is a relatively new L1 blockchain with its own validator set, bridge and software. It may suffer bugs, exploits, outages, chain halts, rollbacks or consensus failures.
