@@ -112,7 +112,7 @@ CERT_MAP_ENTRY="api-certmap-entry"
 : "${ARMOR_EDGE_HEADER_CHECK:=1}"                # also enforce X-Edge-Auth at Cloud Armor (the app checks too)
 
 # ---- secrets (names only; values are added by the owner, never committed) --------------------------------
-# name|who may read (space separated: api executor migrator)|generated? (1 = bootstrap generates a random value)
+# name|who may read (space separated: api executor migrator sandbox)|generated? (1 = bootstrap generates a random value)
 SECRETS_SPEC=(
   "STRIPE_SECRET_KEY|api|0"
   "STRIPE_WEBHOOK_SECRET|api|0"
@@ -125,6 +125,10 @@ SECRETS_SPEC=(
   "BUILDER_ADDRESS|api executor|0"
   "TREASURY_ADDRESS|api executor|0"
   "DB_MIGRATOR_PASSWORD|migrator|1"
+  # Sandbox inbound shared secret (X-Sandbox-Secret, app/sandbox/service.py refuses to start without it).
+  # The ONLY grant the sandbox SA has: it protects nothing but the sandbox itself, and the sandbox has no
+  # route to Google APIs (no Private Google Access / NAT), so it cannot be used from inside anyway.
+  "SANDBOX_SHARED_SECRET|api executor sandbox|1"
 )
 
 # ---- Cloud Scheduler (all UTC) ---------------------------------------------------------------------------

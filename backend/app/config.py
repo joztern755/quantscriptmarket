@@ -74,6 +74,8 @@ class RiskLimits:
     signal_max_age_hours: int = 36                  # applies to the feed's generated_at
     signal_max_bar_age_days: int = 4                # as_of bar may be older (TradFi weekends: Monday's newest bar is Friday)
     min_subscribers_for_public_stats: int = 5
+    min_listing_history_days: int = 180             # owner: ≥180 days to list
+    short_history_warning_days: int = 365           # "Short history" warning below this
 
 
 @dataclass(frozen=True)

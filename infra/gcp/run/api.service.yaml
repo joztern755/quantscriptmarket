@@ -81,6 +81,8 @@ spec:
               valueFrom: {secretKeyRef: {name: AUDIT_PEPPER, key: latest}}
             - name: EDGE_AUTH_SECRET
               valueFrom: {secretKeyRef: {name: EDGE_AUTH_SECRET, key: latest}}
+            - name: SANDBOX_SHARED_SECRET
+              valueFrom: {secretKeyRef: {name: SANDBOX_SHARED_SECRET, key: latest}}
             - name: BUILDER_ADDRESS
               valueFrom: {secretKeyRef: {name: BUILDER_ADDRESS, key: latest}}
             - name: TREASURY_ADDRESS

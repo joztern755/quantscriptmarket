@@ -79,6 +79,8 @@ spec:
               valueFrom: {secretKeyRef: {name: SIGNALS_PUBKEY_B64, key: latest}}
             - name: AUDIT_PEPPER_B64
               valueFrom: {secretKeyRef: {name: AUDIT_PEPPER, key: latest}}
+            - name: SANDBOX_SHARED_SECRET
+              valueFrom: {secretKeyRef: {name: SANDBOX_SHARED_SECRET, key: latest}}
             - name: BUILDER_ADDRESS
               valueFrom: {secretKeyRef: {name: BUILDER_ADDRESS, key: latest}}
             - name: TREASURY_ADDRESS

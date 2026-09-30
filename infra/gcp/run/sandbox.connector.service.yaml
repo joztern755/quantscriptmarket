@@ -2,9 +2,10 @@
 #   * gen1 execution environment (gVisor kernel) — backend/app/sandbox/runner.py relies on it;
 #   * ALL egress forced into ${SANDBOX_VPC}: no Cloud NAT, no Private Google Access, no internet route,
 #     deny-all egress firewall => no network at all;
-#   * aijalon-sandbox SA with ZERO IAM roles; no secrets, no env credentials;
+#   * aijalon-sandbox SA with no project roles; its only grant is reading SANDBOX_SHARED_SECRET (its own
+#     inbound auth), which it cannot even reach from inside (no route to Google APIs);
 #   * ingress internal + run.invoker only for the api and executor SAs (Cloud Run IAM authenticates callers);
-#   * one request per instance (containerConcurrency 1), capped instances, CPU/memory/time limits.
+#   * per-request process isolation + rlimits (runner.py), <=4 concurrent runs per instance, capped instances.
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
@@ -22,16 +23,16 @@ spec:
         commit: ${GIT_SHA_SHORT}
       annotations:
         autoscaling.knative.dev/minScale: "0"
-        autoscaling.knative.dev/maxScale: "10"
+        autoscaling.knative.dev/maxScale: "5"
         run.googleapis.com/execution-environment: ${SANDBOX_EXEC_ENV}
-        run.googleapis.com/cpu-throttling: "true"
+        run.googleapis.com/cpu-throttling: "false"
         # fallback when Direct VPC egress is unavailable for gen1: connector inside the isolated VPC
         run.googleapis.com/vpc-access-connector: projects/${PROJECT_ID}/locations/${REGION}/connectors/${SANDBOX_CONNECTOR}
         run.googleapis.com/vpc-access-egress: all-traffic
     spec:
       serviceAccountName: ${SA_SANDBOX}
-      containerConcurrency: 1
-      timeoutSeconds: 900
+      containerConcurrency: 4
+      timeoutSeconds: 300
       containers:
         - name: sandbox
           image: ${SANDBOX_IMAGE}
@@ -40,11 +41,14 @@ spec:
               containerPort: 8080
           resources:
             limits:
-              cpu: "1"
-              memory: 1Gi
+              cpu: "2"
+              memory: 2Gi
           env:
             - {name: APP_ENV, value: prod}
             - {name: SERVICE_ROLE, value: sandbox}
+            - {name: SANDBOX_MAX_CONCURRENT, value: "4"}
+            - name: SANDBOX_SHARED_SECRET
+              valueFrom: {secretKeyRef: {name: SANDBOX_SHARED_SECRET, key: latest}}
           startupProbe:
             tcpSocket: {port: 8080}
             periodSeconds: 2

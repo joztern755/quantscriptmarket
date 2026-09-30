@@ -27,7 +27,7 @@ PUBLIC_STRATEGY_STATUSES = ("listed", "paused")
 
 _USER_COLS = ("id, created_at, firebase_uid, email, display_name, role::text AS role, plan::text AS plan, "
               "plan_period_end, country_attested, referral_code, referred_by, referral_tier::text AS referral_tier, "
-              "status::text AS status, mfa_enrolled")
+              "status::text AS status, mfa_enrolled, device_fp_hash")
 _AGENT_COLS = ("id, created_at, user_id, master_address, agent_address, agent_name, status::text AS status, "
                "approved_at, revoked_at")
 _SUB_COLS = ("s.id, s.created_at, s.user_id, s.strategy_id, s.strategy_version_id, s.trading_address, "

@@ -1,0 +1,249 @@
+# CI for aijalon.trade. Runs on every PR and every push to a non-main branch; deploy.yml calls it (workflow_call)
+# on every push to main, so production is only ever built from a commit whose CI is green in the same run.
+#
+# Supply chain: every third-party action is pinned to a full commit SHA (the trailing comment is the tag it
+# was resolved from on 2026-09-30; `python3 infra/pin.py actions` re-resolves, `check` enforces). Container
+# images carry a `# pin-image:` marker and are pinned by `python3 infra/pin.py images`.
+#
+# Blocking: ruff, pytest (+ stdlib-only domain tests), DB tests on Postgres 16, migrations + privilege model,
+# bandit (medium+), pip-audit, gitleaks, action pinning, CSP consistency, web build + unit + Playwright smoke,
+# signals tests, Docker build (non-root). NON-blocking for now: mypy (flip `continue-on-error` to false once the
+# first run is clean — docs/DEPLOY.md go-live gate G7).
+name: CI
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "22"
+  TYPESCRIPT_VERSION: "6.0.2"     # same as the authoring environment (web/build.mjs uses a global tsc)
+  PLAYWRIGHT_VERSION: "1.56.1"    # same pin as terminal.aijalon's workflow
+
+jobs:
+  hygiene:
+    name: pinning, CSP, script syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Third-party actions pinned to commit SHAs
+        run: python3 infra/pin.py check
+      - name: Image digests pinned (warning until `make pin` has run; deploy enforces)
+        run: |
+          if grep -rn 'PIN_ME' backend/Dockerfile infra/gcp/env.sh; then
+            echo "::warning::container images not yet pinned by digest — run 'make pin' (deploy refuses PIN_ME)"
+          fi
+      - name: Lock files present (warning until `make lock` has run; deploy enforces)
+        run: |
+          for f in backend/requirements.lock backend/requirements-dev.lock; do
+            [ -f "$f" ] || echo "::warning::$f missing — run 'make lock' (hash-pinned installs)"
+          done
+      - name: CSP identical in infra/csp.txt and firebase.json
+        run: python3 infra/csp_sync.py check
+      - name: Shell syntax
+        run: |
+          set -e
+          for f in $(git ls-files '*.sh'); do bash -n "$f"; echo "ok $f"; done
+      - name: YAML / JSON syntax
+        run: |
+          python3 - <<'PY'
+          import glob, json, sys, yaml
+          bad = 0
+          for f in glob.glob(".github/workflows/*.yml") + glob.glob("infra/**/*.yaml", recursive=True):
+              try: yaml.safe_load(open(f))
+              except Exception as e: print("BAD", f, e); bad = 1
+          for f in ["firebase.json", ".firebaserc"]:
+              try: json.load(open(f))
+              except Exception as e: print("BAD", f, e); bad = 1
+          sys.exit(bad)
+          PY
+
+  secrets-scan:
+    name: gitleaks (full history)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE is only required for organisation-owned repos (this repo is user-owned).
+
+  backend:
+    name: backend (lint, tests, DB, security)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        # pin-image: postgres:16
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres   # throwaway CI container, not a secret
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/aijalon_ci
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Domain + sandbox tests with the STANDARD LIBRARY ONLY (SPEC §11), before any pip install
+        run: |
+          set -e
+          ls tests/test_domain_*.py >/dev/null 2>&1 || { echo "no domain tests yet"; exit 0; }
+          python -I -m unittest discover -s tests -t . -p 'test_domain_*.py' -v
+          if ls tests/test_sandbox_runner.py >/dev/null 2>&1; then
+            python -I -m unittest discover -s tests -t . -p 'test_sandbox_runner.py' -v
+          fi
+      - name: Install dependencies (hash-locked when the lock files exist)
+        run: |
+          set -e
+          python -m pip install --upgrade pip==25.2 >/dev/null
+          if [ -f requirements.lock ] && [ -f requirements-dev.lock ]; then
+            python -m pip install --require-hashes -r requirements.lock -r requirements-dev.lock
+          else
+            echo "::warning::installing without hashes (requirements*.lock missing — run 'make lock')"
+            python -m pip install -r requirements.txt -r requirements-dev.txt
+          fi
+          python -m pip check
+      - name: ruff
+        run: ruff check .
+      - name: mypy (non-blocking until clean — go-live gate G7)
+        continue-on-error: true
+        run: mypy
+      - name: pytest
+        run: python -m pytest
+      - name: DB integration tests on PostgreSQL 16 (migrations, ledger, append-only, roles)
+        run: |
+          if [ -x tests/db/run_db_tests.sh ] || [ -f tests/db/run_db_tests.sh ]; then
+            bash tests/db/run_db_tests.sh
+          else
+            echo "::warning::backend/tests/db/run_db_tests.sh not present"
+          fi
+      - name: Migrations apply cleanly + infra grants + privilege-model assertions
+        run: |
+          set -e
+          [ -f scripts/migrate.py ] || { echo "::warning::scripts/migrate.py not present"; exit 0; }
+          psql -X -v ON_ERROR_STOP=1 -d postgres -c "DROP DATABASE IF EXISTS aijalon_ci" -c "CREATE DATABASE aijalon_ci"
+          psql -X -v ON_ERROR_STOP=1 -d postgres \
+            -c "DO \$\$BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='ci-api@ci.iam') THEN CREATE ROLE \"ci-api@ci.iam\" LOGIN; END IF; IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='ci-exec@ci.iam') THEN CREATE ROLE \"ci-exec@ci.iam\" LOGIN; END IF; END\$\$;"
+          psql -X -v ON_ERROR_STOP=1 -d aijalon_ci -v db=aijalon_ci -f ../infra/gcp/sql/00_pre_migrate.sql || \
+            echo "::warning::pre-migrate SQL needs pgaudit (Cloud SQL only) — continuing"
+          DATABASE_URL="$TEST_DATABASE_URL" python scripts/migrate.py
+          DATABASE_URL="$TEST_DATABASE_URL" python scripts/migrate.py   # idempotent second run
+          for f in 10_grants.sql 20_verify.sql; do
+            psql -X -v ON_ERROR_STOP=1 -d aijalon_ci -v db=aijalon_ci \
+              -v api_user=ci-api@ci.iam -v executor_user=ci-exec@ci.iam -f ../infra/gcp/sql/$f
+          done
+      - name: bandit (medium+ severity, medium+ confidence)
+        run: bandit -c pyproject.toml -r app -ll -ii
+      - name: pip-audit (known vulnerabilities in pinned runtime deps)
+        run: |
+          if [ -f requirements.lock ]; then
+            pip-audit --strict --require-hashes --disable-pip -r requirements.lock
+          else
+            pip-audit --strict -r requirements.txt
+          fi
+
+  docker:
+    name: docker build (backend, sandbox)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build backend image
+        run: |
+          set -e
+          args=""
+          if grep -q 'sha256:PIN_ME' backend/Dockerfile; then
+            echo "::warning::base image not pinned yet — CI smoke build uses the tag"; args="--build-arg PYTHON_IMAGE=python:3.12-slim"
+          fi
+          [ -f backend/requirements.lock ] || args="$args --build-arg ALLOW_UNLOCKED=1"
+          docker build $args -f backend/Dockerfile -t aijalon-backend:ci backend
+      - name: Image runs as non-root, contains no tests / secrets / build tools
+        run: |
+          set -e
+          test "$(docker run --rm --entrypoint id aijalon-backend:ci -u)" = "10001"
+          docker run --rm --entrypoint sh aijalon-backend:ci -c '
+            test ! -e /srv/tests && test ! -e /srv/.env && ! command -v gcc && ! command -v pip &&
+            python -c "import app.api.main, app.config; print(\"imports ok\")"'
+      - name: Build sandbox image
+        run: |
+          if [ -f sandbox/Dockerfile ]; then
+            DOCKER_BUILDKIT=1 docker build -f sandbox/Dockerfile -t aijalon-sandbox:ci .
+            test "$(docker run --rm --entrypoint id aijalon-sandbox:ci -u)" = "10001"
+          else
+            echo "::warning::sandbox/Dockerfile not present"
+          fi
+
+  web:
+    name: web (build, unit, Playwright smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.pw-browsers
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: TypeScript (pinned)
+        run: npm install --global --no-fund --no-audit "typescript@${TYPESCRIPT_VERSION}"
+      - name: Build
+        run: node web/build.mjs
+      - name: Core unit tests
+        run: |
+          if [ -f web/tests/core.test.mjs ]; then node web/tests/core.test.mjs; else echo "::warning::no web unit tests"; fi
+      - name: Playwright smoke (entry gate, legal pages, no console errors, 2 viewports x 2 themes)
+        run: |
+          set -e
+          [ -f web/tests/smoke.mjs ] || { echo "::warning::web/tests/smoke.mjs not present"; exit 0; }
+          npm install --no-save --no-fund --no-audit "playwright@${PLAYWRIGHT_VERSION}"
+          npx playwright install --with-deps chromium
+          node web/tests/smoke.mjs
+
+  signals:
+    name: signals (Ed25519 feed adapter)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: node signals/test.js
+        run: |
+          if [ -f signals/test.js ]; then node signals/test.js; else echo "::warning::signals/test.js not present"; fi

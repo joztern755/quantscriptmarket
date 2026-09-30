@@ -235,7 +235,7 @@ step_sa() {
   if [[ "${API_FIREBASE_AUTH_ADMIN}" == "1" ]]; then
     bind_project "serviceAccount:${SA_API}" roles/firebaseauth.admin
   fi
-  # sandbox: NOTHING. scheduler: run.invoker on executor only (step_run). migrator: one secret (step_secrets).
+  # sandbox: NO project/KMS/SQL roles (only secretAccessor on SANDBOX_SHARED_SECRET, step_secrets). scheduler: run.invoker on executor only (step_run). migrator: one secret (step_secrets).
   # deployer (GitHub Actions via WIF): deploy Run + Hosting, push images, run the migrate job. It gets NO
   # secret accessor and NO KMS role. It can "act as" only the runtime SAs it deploys.
   bind_project "serviceAccount:${SA_DEPLOYER}" roles/run.developer
@@ -273,6 +273,7 @@ step_secrets() {
         api) member="serviceAccount:${SA_API}" ;;
         executor) member="serviceAccount:${SA_EXECUTOR}" ;;
         migrator) member="serviceAccount:${SA_MIGRATOR}" ;;
+        sandbox) member="serviceAccount:${SA_SANDBOX}" ;;
         *) die "unknown reader ${reader}" ;;
       esac
       gcloud secrets add-iam-policy-binding "${name}" --member="${member}" \
