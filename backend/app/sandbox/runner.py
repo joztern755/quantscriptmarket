@@ -418,6 +418,9 @@ def _spawn(request: dict[str, Any], limits: RunLimits) -> dict[str, Any]:
             raise ScriptRuntimeError(f"sandbox process died ({sig})", kind="crash", signal=sig)
         if rc == 3:
             raise ScriptRuntimeError("memory limit exceeded", kind="memory")
+        if out:
+            # bytes arrived but not exactly one frame with our nonce: the result channel was tampered with
+            raise ScriptRuntimeError("sandbox result channel corrupted; result discarded", kind="protocol")
         raise ScriptRuntimeError(f"sandbox produced no result (exit {rc})", kind="crash", exit_code=rc)
     return resp
 

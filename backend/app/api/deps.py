@@ -190,9 +190,10 @@ class AuditPort(Protocol):
 
 
 class LedgerPort(Protocol):
+    def ensure_account(self, conn: Any, code: str) -> None: ...                # kind inferred from the code
     def post(self, conn: Any, *, idempotency_key: str, kind: str, memo: str,
-             entries: list[tuple[str, int]], created_by: str) -> str: ...     # returns tx id
-    def balance(self, conn: Any, account_code: str) -> int: ...              # Σ amount_micro (debit +)
+             entries: list[tuple[str, int]], created_by: str) -> str: ...     # returns tx id (idempotent)
+    def balance(self, conn: Any, account_code: str) -> int: ...              # raw Σ amount_micro (debit +)
 
 
 @dataclass(frozen=True)
@@ -207,6 +208,7 @@ class AgentKeyPort(Protocol):
 
 
 class TypedDataPort(Protocol):
+    """Each returns {"typed_data": <EIP-712 for eth_signTypedData_v4>, "action": <exact /exchange action>}."""
     def approve_agent(self, *, agent_address: str, agent_name: str, nonce: int,
                       signature_chain_id: str) -> dict[str, Any]: ...
     def approve_builder_fee(self, *, builder: str, max_fee_rate: str, nonce: int,
@@ -225,26 +227,29 @@ class HlInfoPort(Protocol):
 
 
 class StripePort(Protocol):
-    def create_topup_intent(self, conn: Any, *, user_id: str, amount_micro: int,
-                            idempotency_key: str) -> dict[str, Any]: ...   # {payment_intent_id, client_secret}
-    def verify_webhook(self, payload: bytes, sig_header: str) -> Any: ...   # raises on bad signature
-    def handle_event(self, conn: Any, event: Any) -> dict[str, Any]: ...    # idempotent
+    def create_topup_intent(self, *, user_id: str, amount_micro: int, token: str) -> dict[str, Any]: ...
+    def verify_webhook(self, payload: bytes, sig_header: str) -> dict[str, Any]: ...   # raises on bad signature
+    def handle_event(self, event: dict[str, Any]) -> Any: ...   # stripe_pay.WebhookOutcome (pure; API applies it)
 
 
 class UsdcPort(Protocol):
-    def confirm_deposit(self, conn: Any, *, user_id: str, from_address: str,
-                        since_ms: Optional[int]) -> list[dict[str, Any]]: ...
+    def build_topup(self, *, master_address: str, amount_micro: int, signature_chain_id: str,
+                    time_ms: int) -> dict[str, Any]: ...                       # {typed_data, action, nonce, ...}
+    def detect(self, *, sender: str, since_ms: Optional[int]) -> list[Any]: ...  # on-chain transfers to treasury
+    def credit_from_detection(self, detection: Any,
+                              user_for_address: Callable[[str], Optional[str]]) -> Any: ...  # usdc.UsdcOutcome
 
 
 class NotifierPort(Protocol):
     def notify(self, conn: Any, *, user_id: Optional[str], severity: str, kind: str,
                payload: dict[str, Any]) -> None: ...
+    def notify_alert(self, conn: Any, alert: Any) -> None: ...   # app.alerts.notifier.Alert from other modules
 
 
 class SandboxPort(Protocol):
     def compile_nocode(self, spec: dict[str, Any]) -> str: ...
-    def validate(self, code: str) -> dict[str, Any]: ...         # {ok, errors, markets, timeframe, lookback, max_leverage}
-    def backtest(self, code: str, params: dict[str, Any]) -> dict[str, Any]: ...
+    def validate(self, code: str, known_markets: Optional[set[str]]) -> dict[str, Any]: ...  # {ok, errors, meta, code_hash}
+    def backtest(self, code: str, meta: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class CodeVaultPort(Protocol):
