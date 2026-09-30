@@ -287,18 +287,87 @@ step_sa() {
     bind_project "serviceAccount:${SA_API}" roles/firebaseauth.admin
   fi
   # sandbox: NO project/KMS/SQL roles (only secretAccessor on SANDBOX_SHARED_SECRET, step_secrets). scheduler: run.invoker on executor only (step_run). migrator: one secret (step_secrets).
-  # deployer (GitHub Actions via WIF): deploy Run + Hosting, push images, run the migrate job. It gets NO
-  # secret accessor and NO KMS role. It can "act as" only the runtime SAs it deploys.
-  bind_project "serviceAccount:${SA_DEPLOYER}" roles/run.developer
-  bind_project "serviceAccount:${SA_DEPLOYER}" roles/firebasehosting.admin
-  bind_project "serviceAccount:${SA_DEPLOYER}" roles/firebase.viewer
+  # ---- agent attestation key (REVIEW_WEB_INFRA H1): the executor signs, NOBODY else holds any role on it ----------
+  gcloud kms keys add-iam-policy-binding "${KMS_ATTEST_KEY}" "${kf[@]}" \
+    --member="serviceAccount:${SA_EXECUTOR}" --role=roles/cloudkms.signer >/dev/null
+  gcloud kms keys add-iam-policy-binding "${KMS_ATTEST_KEY}" "${kf[@]}" \
+    --member="serviceAccount:${SA_EXECUTOR}" --role=roles/cloudkms.publicKeyViewer >/dev/null
+  step_sa_ci
+}
+
+# CI identities (REVIEW_WEB_INFRA H2). Each GitHub environment can impersonate exactly one of them (step `wif`):
+#   builder  — push images to Artifact Registry, sign Binary Authorization attestations. No Run, no actAs.
+#   deployer — custom role aijalonRunDeployer (update/replace/execute the NAMED services + the migrate job; no
+#              create/delete/IAM/runWithOverrides), actAs ONLY api/executor/sandbox/migrator, pause/resume/run ONLY
+#              the `tick` and `executor-selftest` scheduler jobs. No Artifact Registry write, no Hosting, no secrets, no KMS.
+#   hosting  — roles/firebasehosting.admin ONLY (Hosting REST deploy of the credential-free web build).
+# Residual (documented in SPEC §2.1): actAs executor + update of the executor service still lets the deployer run
+# code AS the executor (KMS decrypt). Binary Authorization (step `binauthz`, BINAUTHZ_ENFORCE=1) closes that: only
+# images attested by the builder's KMS key deploy, and the deployer cannot attest.
+: "${DEPLOYER_RUN_CONDITIONS:=1}"   # 0 = bind the custom Run role without the resource-name condition [VERIFY]
+: "${DEPLOYER_SCHED_CONDITIONS:=1}" # 0 = scheduler operator role without the job-name condition [VERIFY]
+upsert_role() { # id title permissions(comma)
+  if exists gcloud iam roles describe "$1" --project="${PROJECT_ID}"; then
+    gcloud iam roles update "$1" --project="${PROJECT_ID}" --title="$2" --permissions="$3" --stage=GA --quiet >/dev/null
+  else
+    gcloud iam roles create "$1" --project="${PROJECT_ID}" --title="$2" --permissions="$3" --stage=GA --quiet >/dev/null
+  fi
+}
+bind_project_cond() { # member role expression title — condition from a file (the CEL has commas/quotes)
+  local f; f="$(mktemp)"
+  EXPR="$3" TITLE="$4" python3 -c 'import json,os;print(json.dumps({"expression":os.environ["EXPR"],"title":os.environ["TITLE"]}))' > "${f}"
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="$1" --role="$2" --condition-from-file="${f}" \
+    --quiet >/dev/null
+  rm -f "${f}"
+}
+unbind_project() { # member role — removes an unconditional legacy binding (no-op when absent)
+  gcloud projects remove-iam-policy-binding "${PROJECT_ID}" --member="$1" --role="$2" --condition=None --quiet \
+    >/dev/null 2>&1 || true
+}
+step_sa_ci() {
+  local id sa
+  for id in "${SA_BUILDER_ID}" "${SA_HOSTING_ID}"; do
+    exists gcloud iam service-accounts describe "$(sa_email "${id}")" || \
+      gcloud iam service-accounts create "${id}" --display-name="aijalon ${id#aijalon-}"
+  done
+  # builder
+  gcloud artifacts repositories add-iam-policy-binding "${AR_REPO}" --location="${REGION}" \
+    --member="serviceAccount:${SA_BUILDER}" --role=roles/artifactregistry.writer >/dev/null
+  bind_project "serviceAccount:${SA_BUILDER}" roles/serviceusage.serviceUsageConsumer
+  # hosting: Hosting only (no firebase.viewer: the REST deploy needs nothing else)
+  bind_project "serviceAccount:${SA_HOSTING}" roles/firebasehosting.admin
+  bind_project "serviceAccount:${SA_HOSTING}" roles/serviceusage.serviceUsageConsumer
+  # deployer: named services + migrate job only
+  upsert_role aijalonRunDeployer "aijalon deployer: update named Cloud Run services/jobs" \
+    "run.services.get,run.services.update,run.services.list,run.revisions.get,run.revisions.list,run.routes.get,run.routes.list,run.configurations.get,run.configurations.list,run.operations.get,run.operations.list,run.jobs.get,run.jobs.list,run.jobs.update,run.jobs.run,run.executions.get,run.executions.list,run.tasks.get,run.tasks.list,run.locations.list"
+  local base="projects/${PROJECT_ID}/locations/${REGION}"
+  local rcond="!(resource.type in ['run.googleapis.com/Service', 'run.googleapis.com/Job']) || resource.name in ['${base}/services/${API_SERVICE}', '${base}/services/${EXECUTOR_SERVICE}', '${base}/services/${SANDBOX_SERVICE}', '${base}/jobs/${MIGRATE_JOB}']"
+  if [[ "${DEPLOYER_RUN_CONDITIONS}" == "1" ]]; then
+    bind_project_cond "serviceAccount:${SA_DEPLOYER}" "projects/${PROJECT_ID}/roles/aijalonRunDeployer" "${rcond}" "named-run-resources-only"
+  else
+    warn "deployer Run role WITHOUT the resource-name condition (DEPLOYER_RUN_CONDITIONS=0)"
+    bind_project "serviceAccount:${SA_DEPLOYER}" "projects/${PROJECT_ID}/roles/aijalonRunDeployer"
+  fi
+  upsert_role aijalonSchedulerOperator "aijalon deployer: pause/resume/run named scheduler jobs" \
+    "cloudscheduler.jobs.get,cloudscheduler.jobs.pause,cloudscheduler.jobs.enable,cloudscheduler.jobs.run"
+  local scond="resource.name.endsWith('/jobs/tick') || resource.name.endsWith('/jobs/${SELFTEST_JOB}')"
+  if [[ "${DEPLOYER_SCHED_CONDITIONS}" == "1" ]]; then
+    bind_project_cond "serviceAccount:${SA_DEPLOYER}" "projects/${PROJECT_ID}/roles/aijalonSchedulerOperator" "${scond}" "tick-and-selftest-only"
+  else
+    warn "deployer scheduler role WITHOUT the job-name condition (DEPLOYER_SCHED_CONDITIONS=0)"
+    bind_project "serviceAccount:${SA_DEPLOYER}" "projects/${PROJECT_ID}/roles/aijalonSchedulerOperator"
+  fi
   bind_project "serviceAccount:${SA_DEPLOYER}" roles/serviceusage.serviceUsageConsumer
   for sa in "${SA_API}" "${SA_EXECUTOR}" "${SA_SANDBOX}" "${SA_MIGRATOR}"; do
     gcloud iam service-accounts add-iam-policy-binding "${sa}" \
       --member="serviceAccount:${SA_DEPLOYER}" --role=roles/iam.serviceAccountUser >/dev/null
   done
-  gcloud artifacts repositories add-iam-policy-binding "${AR_REPO}" --location="${REGION}" \
-    --member="serviceAccount:${SA_DEPLOYER}" --role=roles/artifactregistry.writer >/dev/null
+  # legacy (pre-H2) grants: project-wide run.developer, Hosting on the deployer, AR write on the deployer
+  unbind_project "serviceAccount:${SA_DEPLOYER}" roles/run.developer
+  unbind_project "serviceAccount:${SA_DEPLOYER}" roles/firebasehosting.admin
+  unbind_project "serviceAccount:${SA_DEPLOYER}" roles/firebase.viewer
+  gcloud artifacts repositories remove-iam-policy-binding "${AR_REPO}" --location="${REGION}" \
+    --member="serviceAccount:${SA_DEPLOYER}" --role=roles/artifactregistry.writer >/dev/null 2>&1 || true
 }
 
 gen_secret_value() { # name -> random value on stdout (never echoed to the terminal)
@@ -412,6 +481,10 @@ step_run() {
     gcloud run services add-iam-policy-binding "${SANDBOX_SERVICE}" --region="${REGION}" \
       --member="serviceAccount:${sa}" --role=roles/run.invoker >/dev/null
   done
+  # the deployer may UPDATE the migrate job but never create jobs (REVIEW_WEB_INFRA H2): create its placeholder here
+  exists gcloud run jobs describe "${MIGRATE_JOB}" --region="${REGION}" || \
+    gcloud run jobs create "${MIGRATE_JOB}" --region="${REGION}" --image=us-docker.pkg.dev/cloudrun/container/job \
+      --service-account="${SA_MIGRATOR}" --tasks=1 --max-retries=0 --labels=app=aijalon --quiet >/dev/null
 }
 
 armor_rule() { # priority action [--src-ip-ranges=..|--expression=..]
@@ -421,6 +494,42 @@ armor_rule() { # priority action [--src-ip-ranges=..|--expression=..]
   else
     gcloud compute security-policies rules create "${prio}" --security-policy="${LB_ARMOR_POLICY}" "$@" >/dev/null
   fi
+}
+
+# armor_edge_rule_rest PRIORITY  (secret on STDIN) — create or patch the X-Edge-Auth deny rule via the Compute REST API
+armor_edge_rule_rest() {
+  ARMOR_TOKEN="$(gcloud auth print-access-token)" ARMOR_PROJECT="${PROJECT_ID}" ARMOR_POLICY="${LB_ARMOR_POLICY}" \
+  ARMOR_PRIORITY="$1" python3 -c '
+import json, os, re, sys, time, urllib.error, urllib.request
+secret = sys.stdin.read().strip()
+if not re.fullmatch(r"[0-9a-f]{64}", secret):
+    sys.exit("EDGE_AUTH_SECRET must be 64 lowercase hex chars (bootstrap generates it)")
+tok, p, pol, prio = (os.environ[k] for k in ("ARMOR_TOKEN", "ARMOR_PROJECT", "ARMOR_POLICY", "ARMOR_PRIORITY"))
+base = f"https://compute.googleapis.com/compute/v1/projects/{p}/global/securityPolicies/{pol}"
+def call(method, url, body=None):
+    req = urllib.request.Request(url, method=method, data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read() or b"{}")
+rule = {"priority": int(prio), "action": "deny(403)",
+        "description": "deny requests without the Cloudflare-injected edge secret",
+        "match": {"expr": {"expression": "request.headers[\"x-edge-auth\"] != \"" + secret + "\""}}}
+try:
+    call("GET", f"{base}/getRule?priority={prio}")
+    op = call("POST", f"{base}/patchRule?priority={prio}", rule)
+except urllib.error.HTTPError as e:
+    if e.code not in (400, 404):
+        sys.exit(f"getRule: HTTP {e.code}")
+    op = call("POST", f"{base}/addRule", rule)
+name = op.get("name", "")
+for _ in range(60):
+    st = call("GET", f"https://compute.googleapis.com/compute/v1/projects/{p}/global/operations/{name}")
+    if st.get("status") == "DONE":
+        if st.get("error"):
+            sys.exit("armor rule: " + json.dumps(st["error"])[:300])
+        sys.exit(0)
+    time.sleep(2)
+sys.exit("armor rule: operation did not finish")'
 }
 
 cloudflare_ipv4() {
@@ -446,10 +555,11 @@ step_lb() {
       --description="api: only Cloudflare edge with X-Edge-Auth may reach the origin"
   gcloud compute security-policies rules update 2147483647 --security-policy="${LB_ARMOR_POLICY}" --action=deny-403 >/dev/null
   if [[ "${ARMOR_EDGE_HEADER_CHECK}" == "1" ]]; then
-    local edge; edge="$(gcloud secrets versions access latest --secret=EDGE_AUTH_SECRET)"
-    [[ "${edge}" =~ ^[0-9a-f]{64}$ ]] || die "EDGE_AUTH_SECRET must be 64 hex chars (bootstrap generates it)"
-    armor_rule 900 --action=deny-403 --expression="request.headers['x-edge-auth'] != '${edge}'" \
-      --description="deny requests without the Cloudflare-injected edge secret"
+    # REVIEW_WEB_INFRA M3: the secret goes Secret Manager -> stdin -> Compute REST body. It never appears in argv,
+    # `ps` or gcloud's command log. (It is still stored in the Armor policy and in the Admin Activity log of the
+    # patch — keep compute.securityPolicies.get / logging.viewer to the owner; Authenticated Origin Pulls (step
+    # `aop`) is the real origin authentication, this header is defence in depth.)
+    gcloud secrets versions access latest --secret=EDGE_AUTH_SECRET | armor_edge_rule_rest 900
   fi
   local ranges=() chunk=() i prio=1000
   mapfile -t ranges < <(cloudflare_ipv4)

@@ -66,7 +66,7 @@ never went live → `hidden_reason: "not_live"`. Cacheable 60 s like every `/pub
 |---|---|---|---|---|---|
 | GET `/me` | MFA | — | `MeOut {id, email, display_name, role, plan, status, referral_code, country_attested, mfa_enrolled, created_at, consents_complete, wallets[{address, verified_at}], kyc_status|null}` (**kyc_status new**: `pending` \| `provider_approved` (provider passed, awaiting our admin) \| `approved` \| `rejected`) | 403 suspended/not allow-listed | core state |
 | PATCH `/me` | MFA | `{display_name?, referral_code_used?}` | `MeOut` | 409 already bound, 403 self-referral/window, 404 code | main.ts (first-touch ref) |
-| POST `/me/plan` 🔑 | consent | `{plan: "free"\|"pro"\|"max"}` | `PlanChangeOut {plan, charged_micro, period_end|null, fee_balance_micro}` | 402 `insufficient_balance` (details `balance_micro`, `required_micro`) · 409 already on this plan · 409 too many active strategies for the plan (details `active`) | plan picker in the UI (see below) |
+| POST `/me/plan` 🔑 | **step-up** | `{plan: "free"\|"pro"\|"max"}` | `PlanChangeOut {plan, charged_micro, period_end|null, fee_balance_micro}` | 402 `insufficient_balance` (details `balance_micro`, `required_micro`) · 409 already on this plan · 409 too many active strategies for the plan (details `active`) | plan picker in the UI (see below) |
 | GET `/consents/status` | MFA | — | `{required, accepted, missing[], complete}` | — | — |
 | POST `/consents` | MFA | `{consents:[{doc, doc_version, context, strategy_id?, accepted_at?, doc_text_sha256, country?}]}` (1–10) | `ConsentStatusOut` | 409 version changed (details.current_version) · **409 reason `legal_text_mismatch`** · 422 missing hash · 451 restricted country · 503 prod without canonical hashes | gate.ts (site + subscribe), creator (creator_agreement) |
 
@@ -79,9 +79,10 @@ subscriptions than the target plan allows (`max_active_strategies`). Send a fres
 
 Sign-in security alerts (server-side, no web call): the API raises the mandatory `new_device_login` alert on a sign-in
 from a new country or a new device and `mfa_changed` when the Firebase second factor differs from the last one seen.
-The web SHOULD send **`X-Device-Id`** on every API call: a random 16–128 char `[A-Za-z0-9_-]` id created once and kept
-in `localStorage` (never derived from hardware; CORS allows the header). Without it the device is approximated from
-the User-Agent without version numbers.
+The web MUST send **`X-Device-Id`** on every API call (including the first, account-creating one): a random 16–128
+char `[A-Za-z0-9_-]` id created once and kept in `localStorage` (never derived from hardware; CORS allows the header).
+Without it the device is approximated from the User-Agent without version numbers for the new-device alert only —
+the user-agent approximation is never used for self-referral decisions (only X-Device-Id hashes are; see below).
 
 **Consent doc keys** (DB enum `consent_doc`, SPEC §4) and the file whose bytes are hashed:
 
@@ -135,7 +136,7 @@ withdrawals and every other type are refused. 429 rate limit · 502 Hyperliquid 
 | GET `/subscriptions` | consent | `?limit≤100&cursor` | `Page<SubscriptionOut>` | — | dashboard, subscribe |
 | GET `/subscriptions/{id}` | consent | — | `SubscriptionOut` | 404 | — |
 | POST `/subscriptions` 🔑 | step-up | `{strategy_id, trading_address, allocation_micro (≥ 100 USD), max_leverage_x100 (100–2000, ≤ the version's MAX_LEVERAGE; each market's own max leverage + liquidity guards apply at order time), expected_price_monthly_micro, expected_profit_share_bps}` (+ optional inline `ack`) | 201 `{subscription, charged_micro, fee_balance_micro}` | 402 `insufficient_balance` (price + reserve = min top-up when any profit share can accrue) · 409 reasons `contacts_required` (code), `builder_fee_not_approved`, `terms_changed`, `subscription_ack_required` (ack must be ≤ 30 min old), `agent_not_active`, `trading_address_in_use` · 403 reason `plan_limit` (403 allocation limit only if an operator limit is configured; none by default) · 404 not listed · 422 leverage (details.max_x100) | subscribe |
-| PATCH `/subscriptions/{id}` | step-up | `{allocation_micro?, max_leverage_x100?, paused?}` | `SubscriptionOut` | 409 not changeable / `agent_not_active` · 422 | dashboard (pause/resume/edit) |
+| PATCH `/subscriptions/{id}` | step-up | `{allocation_micro?, max_leverage_x100?, paused?}` | `SubscriptionOut` | 409 not changeable / `agent_not_active` / reason `strategy_not_listed` (resume) · **402 reason `renewal_due`** (resume after the paid period ended while paused; details `balance_micro`, `required_micro`) · 422 | dashboard (pause/resume/edit) |
 | DELETE `/subscriptions/{id}` | step-up | `{"positions": "close"\|"leave"}` (**required**) | `SubscriptionOut` (`closing` or `cancelled`) | 409 already cancelled | core `subscriptions.cancelButtons` from the dashboard |
 
 `SubscriptionOut`: `id, strategy_id, strategy_slug, strategy_name, strategy_markets[]` **(new)**, `trading_address, allocation_micro, max_leverage_x100, status (pending|active|past_due|reduce_only|paused_user|closing|cancelled), cancel_positions|null, cancelled_at|null` **(new)**, `current_period_end, cum_pnl_micro, hwm_micro, created_at`.
@@ -152,8 +153,8 @@ Dashboard cancel = "Cancel…" → modal with the two core buttons "Close positi
 | POST `/deposits/usdc/typed-data` | consent | `{amount_micro, from_address (verified), signature_chain_id}` | `{from_address, destination (= config treasury), amount_micro, time_ms, payload{typed_data, action, nonce}, exchange_url}` | 403 wallet | dashboard (checks destination = config treasury) |
 | POST `/deposits/usdc/confirm` 🔑 | consent | `{from_address?, time_ms?}` (web sends the signed usdSend time) | `{credited: DepositOut[], fee_balance_micro}` | 403 | dashboard |
 | GET `/withdrawals` | consent | `?limit&cursor` | `Page<PayoutOut>` (both kinds) | — | — |
-| POST `/withdrawals` 🔑 | step-up | `{amount_micro, to_address (verified wallet)}` | 201 `PayoutOut {id, kind, amount_micro, to_address, status, tx_hash, created_at}` | 402 (details.withdrawable_micro) · 403 payouts disabled (reason `payouts_disabled`) / not verified · 422 below min | dashboard |
-| POST `/payouts` 🔑 | step-up | `{amount_micro, source: "creator"\|"referrer", to_address}` | 201 `PayoutOut` | 402 · 403 `kyc_required` / `payouts_disabled` | creator earnings, referrals (**new UI**) |
+| POST `/withdrawals` 🔑 | step-up | `{amount_micro, to_address (verified wallet)}` | 201 `PayoutOut {id, kind, amount_micro, to_address, status, tx_hash, created_at}` | 402 (details.withdrawable_micro — USDC-funded UNSPENT money only) · 402 accrued profit share / reserve (details `accrued_profit_share_micro`, `reserve_micro`, `max_withdrawal_micro`) · 409 reason `subscription_past_due` · 403 reasons `payout_address_hold` / `security_hold` (details `until`), `payouts_disabled`, not verified · 422 below min | dashboard |
+| POST `/payouts` 🔑 | step-up | `{amount_micro, source: "creator"\|"referrer", to_address}` | 201 `PayoutOut` | 402 (details `available_micro`, `held_card_funded_micro`) · 403 `kyc_required` / `payouts_disabled` / `payout_address_hold` / `security_hold` | creator earnings, referrals (**new UI**) |
 
 Stripe fee (SPEC §1, owner): passed to the user. UI estimate = `ceil(amount × stripe_fee_estimate_bps / 10000) + stripe_fee_estimate_fixed_micro`; the webhook credits amount − actual fee.
 
@@ -164,10 +165,10 @@ Stripe fee (SPEC §1, owner): passed to the user. UI estimate = `ceil(amount × 
 | GET `/positions` | consent | — | `{positions:[{trading_address, coin, size (signed), entry_px, position_value, unrealized_pnl, leverage, liquidation_px}], unavailable[]}` | dashboard |
 | GET `/alerts` | consent | `?limit&cursor` | `Page<{id, severity, kind, payload{}, created_at, acked_at}>` | dashboard |
 | POST `/alerts/{id}/ack` | consent | — | `{ok: true}` | dashboard |
-| `/alerts/settings`, `/alerts/contacts`, `/alerts/telegram/link`, `/alerts/email/*`, `/alerts/prefs`, `/alerts/test` | consent | see `routers/alerts_settings.py` (alerts module) | | pages/alerts.ts, _shared/contacts.ts |
-| POST `/reviews` | consent | `{strategy_id, rating 1–5, body?}` | 201 `ReviewOut {id, rating, body, author, created_at}` (403 < 30 days subscribed) | strategy |
+| `/alerts/settings`, `/alerts/contacts`, `/alerts/telegram/link`, `/alerts/email/*`, `/alerts/prefs`, `/alerts/test` | consent | see `routers/alerts_settings.py` (alerts module). POST `/alerts/telegram/link` while a chat is already linked (re-link) needs **step-up** (401 `step_up_required`) and queues a critical `alert_contacts_changed` alert to the CURRENT chat + email | | pages/alerts.ts, _shared/contacts.ts |
+| POST `/reviews` | consent | `{strategy_id, rating 1–5, body?}` | 201 `ReviewOut {id, rating, body, author, created_at}` (403 < 30 days **actually subscribed** — cancelled subscriptions count only until they ended; details `subscribed_days`) | strategy |
 | GET `/posts/{id}` | consent | — | `PostOut {id, title, price_micro, strategy_slug, published_at, body|null, purchased}` | posts (signed in) |
-| POST `/posts/{id}/purchase` 🔑 | consent | — | 201 `{post_id, charged_micro, fee_balance_micro}` (402; 403 needs Pro/Max; 409 free/own) | posts |
+| POST `/posts/{id}/purchase` 🔑 | **step-up** | — | 201 `{post_id, charged_micro, fee_balance_micro}` (402; 403 needs Pro/Max; 409 free/own; 409 reason `post_price_above_cap`) | posts |
 | GET `/referrals` | consent | — | `{code, link, tier, share_of_pool_bps, active_referred_users_30d, referred_notional_30d_micro, referred_users_total, earnings_payable_micro, earnings_total_micro, next_tier|null}` | referrals |
 
 User alert kinds in `GET /alerts` (catalog `app/alerts/prefs.py`, payloads `app/alerts/user_templates.py`; Telegram +
@@ -184,10 +185,10 @@ fee-balance posting incl. settlement and USDC scans), `kyc_status` {status}.
 |---|---|---|---|---|---|
 | GET `/creator/strategies` | creator | — | **array** `CreatorStrategyOut {id, slug, name, status, markets, timeframe, price_monthly_micro, profit_share_bps, description, created_at}` | — | creator |
 | POST `/creator/strategies` | creator | `{slug (^[a-z0-9][a-z0-9-]{1,46}[a-z0-9]$), name, description?, markets[1–5], timeframe, price_monthly_micro, profit_share_bps (≤ cap 1200)}` | 201 `CreatorStrategyOut` | 409 slug taken · 422 cap/markets | creator (slug field **added**) |
-| PATCH `/creator/strategies/{id}` | creator step-up | `{name?, description?, price_monthly_micro?, profit_share_bps?}` (draft/review only) | `CreatorStrategyOut` | 409 listed | — |
+| PATCH `/creator/strategies/{id}` | creator step-up | `{name?, description?, price_monthly_micro?, profit_share_bps?}` (draft/review only; OWN strategies only — no admin override) | `CreatorStrategyOut` | 409 listed · 409 reason `listing_pending` (terms frozen while a listing proposal is pending) · 404 not yours | — |
 | GET `/creator/strategies/{id}/versions` | creator | — | **array** `CreatorVersionOut {id, version, code_hash, published_at, live_since, params{source,…}, backtest, created_at, warning}` | — | creator (reset warning) |
 | POST `/creator/strategies/{id}/versions` | creator step-up | `{source: "python", code}` or `{source: "nocode", spec}` | 201 `CreatorVersionOut` (validation + backtest run synchronously; `backtest.history_days` stamped from the candle store / backtest span) | 422 `details.errors` (validator strings or no-code `{path, message}`) | creator — uploading moves draft → review; there is **no** `/submit` or `GET …/versions/{vid}` endpoint (web polling removed) |
-| POST `/creator/posts` | creator step-up | `{title, body, strategy_id?, price_micro}` (no `excerpt`) | 201 `PostOut` | 403 `kyc_required` for paid | creator |
+| POST `/creator/posts` | creator step-up | `{title, body, strategy_id?, price_micro}` (no `excerpt`; price ≤ $500) | 201 `PostOut` | 403 `kyc_required` for paid · 422 above the price cap (details `max_micro`) | creator |
 | GET `/creator/posts` **(new)** | creator | `?limit≤100&cursor` | `Page<CreatorPostOut {id, title, price_micro, strategy_slug|null, published_at, created_at, body, sales, gross_sales_micro}>` (own posts, newest first, full bodies) | — | creator (my posts) |
 | GET `/creator/earnings` | creator | — | `{payable_micro, payouts_pending_micro, total_earned_micro, by_strategy[{strategy_id, slug, active_subscribers, earned_micro, builder_share_micro, subscription_share_micro, profit_share_micro, posts_micro}], general_posts_micro, other_micro, recent: LedgerEntryOut[]}` (**per-strategy breakdown new**) | — | creator |
 | POST `/creator/kyc/session` | creator | — | `{url ("" when manual), provider, status, manual}` | 409 approved · 409 reason `awaiting_admin` (provider passed, our admin confirms) | creator (manual → "reviewed by our team" notice) |
@@ -208,12 +209,12 @@ No-code spec = exactly `backend/app/sandbox/nocode.py` (SPEC §10): `{version: 1
 | GET `/admin/flags` | — | **array** `FlagOut {key, value, pending_value, pending_by ("admin:<uuid>"), pending_at, updated_by, updated_at}` | |
 | POST `/admin/flags` | `{key, value: bool, reason (5–500)}` | `{status: "applied"\|"pending", change?}` | engage = now; lift = pending |
 | POST `/admin/flags/{key}/approve` \| `/reject` | `{reason}` | `AdminActionOut` | different admin |
-| GET `/admin/changes` | `?status=pending\|approved\|rejected` | `Page<ChangeOut {id, kind, target, payload, reason, status, maker_admin, checker_admin, created_at, decided_at}>` | Approvals tab (**new UI**) |
-| POST `/admin/changes/{id}/approve` \| `/reject` | `{reason}` | `AdminActionOut` | strategy_list / strategy_price / user_unsuspend (KYC no longer uses the queue; a legacy `kyc_approve` entry can only be rejected) |
-| GET `/admin/payouts` | `?kind=withdrawal\|payout&status=` | `Page<AdminPayoutOut {id, kind, beneficiary, amount_micro, to_address, status, maker_admin, checker_admin, tx_hash, created_at}>` | web loads both kinds |
-| POST `/admin/payouts/{kind}/{id}/approve` | — | `AdminPayoutOut` | 1st then 2nd (different) admin |
-| POST `/admin/payouts/{kind}/{id}/reject` | `{reason}` | `AdminPayoutOut` | releases hold |
-| POST `/admin/payouts/{kind}/{id}/typed-data` | `{signature_chain_id}` | `{payout, payload{typed_data, action, nonce}, exchange_url}` | web **refuses unless the connected wallet = config `treasury_address`**, validates destination/amount |
+| GET `/admin/changes` | `?status=pending\|approved\|rejected\|cancelled` | `Page<ChangeOut {id, kind, target, payload, reason, status, maker_admin, checker_admin, created_at, decided_at}>` | Approvals tab (**new UI**) |
+| POST `/admin/changes/{id}/approve` \| `/reject` | `{reason}` | `AdminActionOut` | strategy_list / strategy_price / user_unsuspend / **user_suspend** (KYC no longer uses the queue; a legacy `kyc_approve` entry can only be rejected). Approval re-validates the CURRENT state: 409 reason `stale_change` (strategy delisted / back to draft, price or user status changed) or `terms_changed` (price / profit share / owner differ from the terms pinned in the proposal) |
+| GET `/admin/payouts` | `?kind=withdrawal\|payout&status=` | `Page<AdminPayoutOut {id, kind, beneficiary, amount_micro, to_address, status, maker_admin, checker_admin, tx_hash, created_at, send_issued_at, to_address_verified_at, wallet_age_hours, security_hold_until, hold_reasons[], recent_security_events[{action, at}]}>` | web loads both kinds; the context fields (open requests only) must be shown to the approving admins; read is audit-logged |
+| POST `/admin/payouts/{kind}/{id}/approve` | — | `AdminPayoutOut` | 1st then 2nd (different) admin; the 2nd approval is refused (409, reason `payout_address_hold` \| `security_hold`) while a hold applies |
+| POST `/admin/payouts/{kind}/{id}/reject` | `{reason}` | `AdminPayoutOut` | releases hold; **409 reason `send_in_progress`** for 72 h after typed data was issued (the signed usdSend could still execute) |
+| POST `/admin/payouts/{kind}/{id}/typed-data` | `{signature_chain_id}` | `{payout, payload{typed_data, action, nonce}, exchange_url}` | issued ONCE: the nonce is pinned on the first call and every later call returns the same payload. Web **refuses unless the connected wallet = config `treasury_address`**, validates destination/amount |
 | POST `/admin/payouts/{kind}/{id}/sent` | `{tx_hash, time_ms}` | `AdminPayoutOut` | web finds the hash in the treasury's `userNonFundingLedgerUpdates` (or asks); server verifies on-chain |
 | GET `/admin/held-deposits` | `?open=true\|false&limit&cursor` | `HeldDepositsOut {items: HeldDepositOut[] {tx_hash, held_tx_id, amount_micro, sender_address\|null, reason, memo, transfer_time, created_at, release_id, release_status, release_action}, next_cursor, suspense_balance_micro}` | "Held deposits" tab: transfers booked to `suspense:usdc_unattributed` (ledger kind `deposit_held`); `open` = not yet released (none or only `proposed`). `sender_address` null = held before 0009 |
 | GET `/admin/held-deposits/releases` | `?status=proposed\|approved\|sent\|rejected` | `Page<SuspenseReleaseOut {id, created_at, tx_hash, amount_micro, action (attribute\|refund), user_id, sender_address, sender_source (scan\|onchain), evidence, status, maker_admin, checker_admin, decided_at, decision_reason, release_tx_id, refund_tx_hash, refund_ledger_tx_id, sent_at}>` | |
@@ -226,8 +227,8 @@ No-code spec = exactly `backend/app/sandbox/nocode.py` (SPEC §10): `{version: 1
 | POST `/admin/strategies/{id}/list` | `{version_id, reason}` | pending change | approval checks price set, creator KYC, **≥ risk.min_listing_history_days (180)** (was a hard-coded 365) |
 | POST `/admin/strategies/{id}/pause` \| `/delist` \| `/reject` | `{reason}` | applied | |
 | POST `/admin/strategies/{id}/price` | `{price_monthly_micro, reason}` | pending (in-house only) | web's PATCH /admin/strategies/{id} did not exist |
-| GET `/admin/users` | `?q (≥3)` | `Page<AdminUserOut>` | |
-| POST `/admin/users/{id}/suspend` \| `/unsuspend` | `{reason}` | applied / pending | |
+| GET `/admin/users` | `?q (≥3)` | `Page<AdminUserOut>` | prefix search on e-mail (`%`/`_` are literal); audit-logged (`admin.read.users`, query hashed) |
+| POST `/admin/users/{id}/suspend` \| `/unsuspend` | `{reason}` | applied / pending | suspending another **admin** is a pending `user_suspend` change (second admin approves) |
 | POST `/admin/users/{id}/kyc` | `{decision: approved\|rejected, reason}` | `AdminActionOut {status: "applied"}` | **ONE admin** (owner 30 Sep 2026), step-up + audit. Manual provider: pending/rejected → approved. Sumsub: only `provider_approved` (provider GREEN; never auto-approved) → approved, else 409 reason `provider_not_approved`. 403 own KYC. 409 already approved/rejected. Rejection immediate. Listing and payouts keep two admins. |
 | GET `/admin/alerts` | `?severity=&unacked=&ops_only=` | `Page<AlertOut>` | |
 | POST `/admin/alerts/{id}/ack` | — | `{ok}` | |
@@ -256,3 +257,21 @@ Webhooks (`/webhooks/stripe`, `/webhooks/telegram`, `/webhooks/kyc`) and `/inter
 | Admin | `/flags/pending/{id}`, `/payouts/{id}`, `/strategies/{id}/review`, PATCH strategy, `?in_house=` | real routes incl. Approvals queue, kinds, reasons, KYC decisions |
 | No-code | per-coin indicators/rules, `c/h/l/v` sources | nocode.py format (cross-tested) |
 | Earnings | `earned_micro` required but never filled (500) | optional (null) |
+
+## Security-fix round — API / billing / account (docs/security/REVIEW_AUTH_API.md, REVIEW_MONEY.md; 0011)
+
+| Rule | Where | Web impact |
+|---|---|---|
+| Admin routes need role `admin` (DB) **and** a verified sign-in e-mail listed in `ADMIN_EMAILS` (comma-separated env/config). Prod without the list refuses to start (api) and denies every admin (403 reason `admin_allowlist_missing`); an unlisted admin gets 403 `admin_not_allowlisted`. The admin role can only be granted/removed by `promote_admin(email)` (SECURITY DEFINER; `infra/gcp/sql/30_promote_admin.sql`) — app_api is refused by a DB trigger. | deps.admin_user, 0011 | none |
+| Step-up on POST `/me/plan`, POST `/posts/{id}/purchase`, and Telegram re-link. | me, posts, alerts_settings | the web's existing 401 `step_up_required` retry covers it |
+| Unpause restores the pre-pause billing state (status + past_due_since — no fresh grace); a renewal that fell due while paused is charged on unpause (same ledger key as the settlement job) or refused with 402 `renewal_due`; unpause of a strategy that is not listed → 409 `strategy_not_listed`. | billing_ops.resume_subscription | show the 402 as "top up to resume" |
+| Delisting a strategy ENDS its subscriptions: trading ones → `closing` (`cancel_positions: close`, `end_reason: strategy_delisted`; the executor exits reduce-only, then `cancelled`; never billed or re-activated), user-paused / pending ones → `cancelled` (positions left as they are). Every affected user gets the mandatory critical alert `strategy_ended {strategy_id, strategy, subscription_id, positions: closing\|left_open, reason}`. Pending listing / price proposals of a delisted, paused or rejected strategy are auto-cancelled (status `cancelled`). | admin._set_status_now, billing_ops | dashboard shows `closing` as "strategy ended — exiting" |
+| Terms pinned: a subscription keeps the monthly price and profit share it was sold at (`subscriptions.price_monthly_micro / profit_share_bps`, set at subscribe, immutable). Price changes (in-house maker-checker, or a creator re-pricing before a re-listing) apply to NEW subscriptions only; existing subscribers are never re-priced (a future re-pricing flow must add notice + re-acknowledgement at renewal). | 0011 trigger, settlement repo | none |
+| Funding source: card top-ups (Stripe) are spend-only and spent FIRST; `withdrawable_micro` = USDC-funded unspent balance. Creator/referrer earnings paid from card-funded spending are held for 120 days (card dispute window) before they can be requested (`held_card_funded_micro`). | 0011 SQL functions, withdrawals | show held earnings as "available on …" |
+| Money out needs: a destination wallet verified ≥ 48 h ago (first verification time; re-verifying does not reset it); no security hold (48 h after an MFA change or a new-device / new-country sign-in); for fee-balance withdrawals, enough left for accrued profit share + $10 reserve per live subscription, and no past_due / reduce_only subscription. | billing_ops | explain the 403/402 reasons |
+| Chargeback / refund leaving a negative balance → the user's billable subscriptions go `reduce_only` at once (alert `subscription_reduce_only`); a full reversal marks the deposit `reversed`. | webhooks → billing_ops.after_payment_reversal | none |
+| Self-referral: at account creation (X-Ref-Code / `ref` claim), PATCH `/me` and wallet verification the referrer and referee are compared on verified wallets, **X-Device-Id** device hashes and sign-in networks (/24, /64; last 30 days). Same wallet/device → binding refused (403 at PATCH, silently not bound at sign-up); same network → bound but flagged (`users.referral_flagged_at`, ops alert): no referral reward until ops clears it. Rewards and tier counts need a referee with a real paid activity (not free showcase-only usage) and an ACTIVE referrer. | referral_guard, 0011, execution.pg | send `X-Device-Id` |
+| USDC top-ups are credited only for transfers made after the sender wallet was verified (older ones are held for manual review). | payments.usdc, deposits-scan | none |
+| Geo gate (through the edge): unknown location (`XX` or no `CF-IPCountry`) → 451 `jurisdiction_unknown`; Worker-relayed requests (`CF-Worker`) → 403. | middleware | show the 451 like the restricted-country page |
+| Public posts list hides posts of draft/unlisted/delisted strategies and of suspended creators; the leaderboard is cached 60 s per instance; Firebase revocation checks are cached ≤ 60 s per token. | public, caches | none |
+

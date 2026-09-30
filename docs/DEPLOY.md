@@ -428,7 +428,7 @@ make go-live      # resumes every Cloud Scheduler job (SCHEDULER_SPEC in infra/g
 | `deposits-scan` | every 5 min | `deposits-scan` | 300 s / 0 | treasury USDC transfers → fee balance (or `suspense:usdc_unattributed`) |
 | `candles-sync` | :05, :15, … :55 | `candles-sync` | 300 s / 0 | offset from `fills-ingest` so the two never start together (shared Hyperliquid weight budget) |
 | `fills-ingest` | every 10 min (:00, :10, …) | `fills-ingest` | 300 s / 0 | our fills → `fills` + trade alerts |
-| `fills-ingest-presettle` | 00:25 | `fills-ingest` | 300 s / 1 | last pass before settlement (a fill stored after its day was settled raises `fill_after_settlement`) |
+| `fills-ingest-presettle` | 00:25 | `fills-ingest` | 300 s / 1 | last pass before settlement (a fill stored after its day was settled is booked into the next settlement; ops event `fill_after_settlement`) |
 | `funding-scan` | hourly at :07 | `funding-scan` | 300 s / 1 | the 00:00 funding payment is stored at 00:07, before settlement |
 | `ingest-signals` | hourly at :50 | `ingest-signals` | 300 s / 1 | signed terminal feed (daily build ≈ 00:30 UTC) |
 | `reconcile` | hourly at :00 | `reconcile` | 900 s / 1 | positions, builder fees, treasury → report + alerts |
@@ -436,6 +436,7 @@ make go-live      # resumes every Cloud Scheduler job (SCHEDULER_SPEC in infra/g
 | `settle-daily` | 00:30 | `settle-daily` | 1800 s / 3 | settles yesterday: after `fills-ingest` (00:00/00:10/00:20/00:25) and `funding-scan` (00:07). A subscription whose trading address those jobs have not synced past the cut-off (+2 min) is **deferred** (nothing posted; ops event `settlement_deferred`, once per date) |
 | `settle-daily-retry` | 02:30, 06:30 | `settle-daily` | 1800 s / 3 | same route and body (`{}` = yesterday): settles the subscriptions deferred at 00:30 once the data jobs caught up; a no-op for everything already settled |
 | `referral-tiers` | 01:15 | `referral-tiers` | 900 s / 3 | after settlement on purpose: the next settlement uses the new tier |
+| `verify-chain` | 03:40 | `verify-chain` | 900 s / 3 | verifies every hash chain + running balances + earlier anchors, then anchors today's heads (DB + ops Telegram/email) — REVIEW_MONEY M7 |
 | `agent-expiry-scan` | 00:13, 06:13, 12:13, 18:13 | `agent-expiry-scan` | 300 s / 1 | `extraAgents` → expiring (14/7/3/1 d) / expired / revoked alerts |
 
 Data jobs stop themselves after 240 s and resume from `job_cursors`, so a deadline miss only delays work. Every job is idempotent; overlapping runs are safe. Run one by hand: `gcloud scheduler jobs run <job> --location=asia-southeast1` [VERIFY that a PAUSED job runs this way; if not: `resume` → `run` → `pause`].

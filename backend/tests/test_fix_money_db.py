@@ -474,7 +474,13 @@ class MoneyFixesDbTest(unittest.TestCase):
         d = datetime(2026, 10, 2, 0, 30, tzinfo=UTC)
         r = self.settlement(d).settle_daily(date(2026, 10, 2), d)
         self.assertEqual(r.profit_share_charged_micro, (usd(10_000) - usd(200)) * 1350 // 10_000)
-        self.assertEqual(-self.bal(f"creator:{c}:payable"), (usd(10_000) - usd(200)) * 1200 // 10_000)
+        ps = self.admin.fetchall("""SELECT e.amount_micro AS amt FROM ledger_transactions t
+                                     JOIN ledger_entries e ON e.tx_id = t.id JOIN ledger_accounts a ON a.id = e.account_id
+                                    WHERE t.idempotency_key = :k AND a.code = :c""",
+                                 {"k": f"ps:{sub}:2026-10-02", "c": f"creator:{c}:payable"})
+        self.assertEqual(ps, [{"amt": -((usd(10_000) - usd(200)) * 1200 // 10_000)}])
+        # + 50 % of the $200 builder fees of our three oid-verified fills
+        self.assertEqual(-self.bal(f"creator:{c}:payable"), (usd(10_000) - usd(200)) * 1200 // 10_000 + usd(100))
         self.ledger_ok()
 
     def test_h1_pause_and_leave_marked_to_market(self) -> None:
