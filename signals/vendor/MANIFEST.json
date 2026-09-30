@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "note": "Vendored CREST scripts. Each file is a byte-identical copy of the terminal repo's crest_<key>.js at source.commit; emit.js refuses to run a file whose sha256 differs from the one recorded here. Re-vendoring a script (new sha256) is a new strategy version (SPEC §4 strategy_versions.code_hash; resets the live record).",
+  "source": {
+    "repo": "joztern755/terminal.aijalon",
+    "commit": "2ef153ea1dd48e0ddd8ef5d066a40c4c1dfed29b",
+    "committed": "2026-09-28T04:31:50Z",
+    "vendored": "2026-09-30"
+  },
+  "scripts": {
+    "silver": {
+      "file": "crest_silver.js",
+      "sha256": "e60119a7222c352085cf6753be7231e05a201ba2ecb495812d4671fc44a942ed",
+      "bytes": 57245,
+      "version": "3.0",
+      "ticker": "SILVER",
+      "market": "xyz:SILVER",
+      "status": "trades",
+      "terminal_rows": "data/tradfi/SILVER.json",
+      "terminal_from": "1900-01-01",
+      "first_bar": "1968-01-02",
+      "ctx_refs": ["M2"],
+      "max_weight": 2,
+      "evidence": "Live run (run(rows, {wfId:'SILVER'}, ctx) on the tradfi-data branch of 2026-09-27, rows to 2026-09-25) reproduces crest/settings.json scripts.silver.full.pick.final = $1,263,062 exactly; state CASH since SELL 'take profit 20x' on 1980-01-15."
+    }
+  }
+}

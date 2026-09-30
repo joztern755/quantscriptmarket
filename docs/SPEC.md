@@ -18,14 +18,14 @@ All money is **integer micro-USD** (1 USD = 1_000_000). Rates are integer **basi
 | Builder fee split (per fill fee actually charged) | creator 0.05%, platform 0.03%, referral pool 0.02% (of notional) → i.e. of the collected fee: creator 50%, platform 30%, referral pool 20% | 5000/3000/2000 bps of fee |
 | Referral pool | referrer gets tier% of the pool; remainder → platform. No referrer → all to platform | see §1.2 |
 | In-house strategy | "creator" share → platform | — |
-| Profit share | creator sets 0–15% (0–1500 bps) of **net realized profit above high-water mark** | cap 1500 |
-| Platform profit share | 1.5% of the same profit (150 bps). Mode **[CONFIRM]**: `on_top` (user pays creator% + 1.5%) or `carved_out` (1.5% comes out of creator%) | `on_top` |
+| Profit share | creator sets 0–12% (0–1200 bps) of **net realized profit above high-water mark** | cap 1200 |
+| Platform profit share | 1.5% of the same profit (150 bps), charged ON TOP: user pays creator% + 1.5% → max 13.5% total (owner 30 Sep 2026). `carved_out` mode kept in code but unused | `on_top` |
 | Strategy subscription | creator sets monthly price (USD); platform keeps 3% (300 bps), creator 97% | — |
 | Paid post ("subletter") | creator sets price; platform keeps $1 per sale; min price $2 | $1 / $2 |
 | Platform plans | Free $0 (1 active strategy), Pro $20/mo (3 strategies, alerts by email/Telegram, paid posts), Max $50/mo (unlimited strategies, CSV/tax export, read API) | 0/20/50 |
 | Fee balance | Prepaid USD balance per user. Min top-up $10. Deductions: profit share (daily settlement), subscriptions (monthly, prepaid at start/renewal), paid posts (at purchase), platform plan (monthly) | — |
 | Insufficient balance | subscription → `past_due`; after grace (72h) → `reduce_only` (no new entries, exits allowed); alerts sent at 50%, 20%, 0% of estimated monthly need | 72h |
-| Stripe fee | absorbed by platform (credit the gross amount) **[CONFIRM]** | absorb |
+| Stripe fee | passed to the user: credit = amount received − actual Stripe fee (from the charge's balance_transaction), shown to the user before paying as "card/processor fee deducted" (owner 30 Sep 2026) | pass-through |
 
 ### 1.1 Profit share math (per subscription)
 - Attributed PnL = Σ over fills placed by us for this subscription (identified by our `cloid` prefix + account + coin) of `closedPnl − fee` (fee includes builder fee as reported by Hyperliquid — verify field semantics against real fills before go-live), plus funding payments on the strategy's coins while the subscription held a position.
@@ -133,7 +133,7 @@ Core tables (all have `id uuid pk default gen_random_uuid()`, `created_at timest
 - `wallets` (user_id, master_address unique lower-case, verified_at via signed message)
 - `agent_keys` (user_id, master_address, agent_address, agent_name, key_ciphertext bytea, kms_key_version, status pending_approval|active|revoked|rotated, approved_at, revoked_at) — ciphertext only; never selected by api role (column privilege)
 - `builder_approvals` (user_id, master_address, max_fee_rate_tenths_bp, verified_on_chain_at)
-- `strategies` (slug unique, name, owner_user_id, in_house bool, markets text[], timeframe, price_monthly_micro, profit_share_bps ≤1500, status draft|review|listed|paused|delisted, description)
+- `strategies` (slug unique, name, owner_user_id, in_house bool, markets text[], timeframe, price_monthly_micro, profit_share_bps ≤1200, status draft|review|listed|paused|delisted, description)
 - `strategy_versions` (strategy_id, version int, code_hash, code_ciphertext (creator uploads), params jsonb, published_at, backtest jsonb, live_since) — a new version resets live track record
 - `subscriptions` (user_id, strategy_id, strategy_version_id, trading_address (master or sub-account), allocation_micro, max_leverage_x100, status pending|active|past_due|reduce_only|paused_user|cancelled, current_period_end, hwm_micro, cum_pnl_micro, created_at) — UNIQUE active per trading_address
 - `signals` (strategy_id, version_id, as_of_date, target_weight_x100 (0,100,200 for CREST), raw jsonb, signature, received_at) UNIQUE(strategy_id, as_of_date)

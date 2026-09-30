@@ -30,15 +30,15 @@ class Economics:
     builder_split_creator_bps: int = 5000           # of the collected builder fee -> 0.05% notional
     builder_split_platform_bps: int = 3000          # -> 0.03% notional
     builder_split_referral_pool_bps: int = 2000     # -> 0.02% notional
-    profit_share_creator_cap_bps: int = 1500        # creators may set 0–15%
+    profit_share_creator_cap_bps: int = 1200        # creators may set 0–12% (owner 30 Sep 2026)
     platform_profit_share_bps: int = 150            # 1.5% of profit
-    platform_profit_share_mode: str = "on_top"      # [CONFIRM] "on_top" | "carved_out"
+    platform_profit_share_mode: str = "on_top"      # owner: user pays creator% + 1.5% (max 13.5%)
     subscription_platform_bps: int = 300            # 3% of creator subscription sales
     post_platform_fee_micro: int = usd(1)           # $1 per paid-post sale
     post_min_price_micro: int = usd(2)
     min_topup_micro: int = usd(10)
     past_due_grace_hours: int = 72
-    stripe_fee_absorbed: bool = True                # [CONFIRM]
+    stripe_fee_absorbed: bool = False               # owner: Stripe fee passed to user (credit net of actual fee)
     referral_tiers: tuple[ReferralTier, ...] = (
         ReferralTier("starter", 0, 0, 5000),
         ReferralTier("partner", 10, usd(1_000_000), 7500),

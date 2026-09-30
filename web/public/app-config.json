@@ -1,0 +1,22 @@
+{
+  "siteOrigin": "https://aijalon.trade",
+  "apiOrigin": "https://api.aijalon.trade",
+  "hlApiUrl": "https://api.hyperliquid.xyz",
+  "firebaseSdkVersion": "12.3.0",
+  "firebase": {
+    "apiKey": "REPLACE_ME",
+    "authDomain": "aijalon.trade",
+    "projectId": "REPLACE_ME",
+    "appId": "REPLACE_ME"
+  },
+  "fallback": {
+    "restricted_jurisdictions": ["US", "CU", "IR", "KP", "SY", "RU", "BY", "MM"],
+    "legal_versions": {
+      "terms": "draft-2026-09-30",
+      "risk": "draft-2026-09-30",
+      "privacy": "draft-2026-09-30",
+      "waiver": "draft-2026-09-30",
+      "jurisdiction": "draft-2026-09-30"
+    }
+  }
+}
