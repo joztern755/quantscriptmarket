@@ -20,7 +20,7 @@ psycopg[binary]==3.3.6
 hyperliquid-python-sdk==0.24.0  # (requires eth-account >=0.10,<0.14)
 eth-account==0.13.7  # (latest 0.13.x: the SDK caps eth-account below 0.14)
 firebase-admin==7.7.0
-google-auth==2.48.0
+google-auth==2.58.1
 google-cloud-kms==3.17.0
 google-cloud-secret-manager==2.30.0
 stripe==15.6.1
