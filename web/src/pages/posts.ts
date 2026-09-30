@@ -5,7 +5,7 @@ import { api, newIdempotencyKey } from "../core/api.js";
 import { fmtUsd, fmtDate } from "../core/format.js";
 import type { Post } from "./_shared/types.js";
 import { renderMarkdown } from "./_shared/markdown.js";
-import { ensurePageCss, listOf, isAbortError, errCode, pageHead, replaceQuery } from "./_shared/util.js";
+import { ensurePageCss, listOf, isAbortError, errCode, pageHead, replaceQuery, inlineMd } from "./_shared/util.js";
 
 export const title = "Posts";
 
@@ -83,7 +83,7 @@ function postItem(p: Post): HTMLElement {
       p.creator_name ? h("span", null, p.creator_name) : null,
       p.published_at ? h("span", null, fmtDate(p.published_at)) : null,
     ),
-    p.excerpt ? h("p", { class: "small" }, p.excerpt) : null,
+    p.excerpt ? inlineMd("p", p.excerpt, "small") : null,
   );
 }
 

@@ -58,6 +58,13 @@ spec:
             - {name: SANDBOX_URL, value: "${SANDBOX_URL}"}
             - {name: FEATURE_CREATOR_UPLOADS, value: "true"}
             - {name: IN_HOUSE_LISTED, value: silver}
+            # launch guard rails (app/api/deps.py LaunchConfig): internal phase = allow-listed users only
+            - {name: LAUNCH_PHASE, value: "${LAUNCH_PHASE}"}
+            - {name: ALLOWLIST_EMAILS, value: "${ALLOWLIST_EMAILS}"}
+            - {name: PAYOUTS_ENABLED, value: "${PAYOUTS_ENABLED}"}
+            # the api also mounts part of /v1/internal (OIDC-verified); Cloudflare blocks that path at the edge
+            - {name: SCHEDULER_SA_EMAIL, value: "${SA_SCHEDULER}"}
+            - {name: INTERNAL_AUDIENCE, value: "https://${API_DOMAIN}"}
             - name: STRIPE_SECRET_KEY
               valueFrom: {secretKeyRef: {name: STRIPE_SECRET_KEY, key: latest}}
             - name: STRIPE_WEBHOOK_SECRET

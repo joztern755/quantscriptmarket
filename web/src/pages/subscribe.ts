@@ -14,7 +14,7 @@ import { connectWallet, getConnectedWallet, proveOwnership, type Wallet } from "
 import { approveAgent, approveBuilderFee, hlInfo } from "../core/hl.js";
 import { fmtUsd, fmtBps, fmtTenthsBp, shortAddr, microToDecimal } from "../core/format.js";
 import type { StrategyDetail, Subscription, Balance } from "./_shared/types.js";
-import { ensurePageCss, isAbortError, errCode, errMessage, listOf, isAddress, hlNum, usdInput, LOSS_WARNING, isRec } from "./_shared/util.js";
+import { ensurePageCss, isAbortError, errCode, errMessage, listOf, isAddress, hlNum, usdInput, LOSS_WARNING, isRec, feesList } from "./_shared/util.js";
 
 export const title = "Subscribe";
 
@@ -310,7 +310,7 @@ class Wizard {
     const rows = feeSummary(this.cfg, { price_monthly_micro: this.s.price_monthly_micro, profit_share_bps: this.s.profit_share_bps });
     return [
       h("p", null, "Before connecting anything, review the strategy's specific risks and every fee you'll pay. You'll accept the Terms and Risk Disclosure again for this subscription."),
-      kv(rows.map((r) => [r.label, r.note ? h("span", null, r.value, h("div", { class: "small muted" }, r.note)) : r.value] as [string, Child])),
+      feesList(rows),
       h(
         "p",
         { class: "small muted" },

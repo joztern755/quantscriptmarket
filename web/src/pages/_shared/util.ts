@@ -2,6 +2,7 @@
 
 import { h, badge, loadCss, type Child } from "../../core/ui.js";
 import { parseUsdToMicro } from "../../core/format.js";
+import { renderInline } from "./markdown.js";
 import type { StrategySummary, EquityPoint } from "./types.js";
 
 /** Days of live signals required before a strategy counts as live-proven (SPEC §10). */
@@ -217,4 +218,16 @@ export function stars(rating: number): string {
 /** Classify a coin into an asset group for market filters. */
 export function assetGroup(coin: string): "crypto" | "tradfi" {
   return coin.includes(":") ? "tradfi" : "crypto";
+}
+
+/** Fee summary rows (from core gate.feeSummary) as a readable two-column list (core `.kv.fees`). */
+export function feesList(rows: { label: string; value: string; note?: string }[]): HTMLDListElement {
+  return h("dl", { class: "kv fees" }, rows.flatMap((f) => [h("dt", null, f.label), h("dd", null, h("b", null, f.value), f.note ? h("div", { class: "small muted" }, f.note) : null)]));
+}
+
+/** Short markdown (teasers) rendered inline: bold/italic/code/safe links only. */
+export function inlineMd(tag: "p" | "span" | "div", text: string, cls?: string): HTMLElement {
+  const el = h(tag, cls ? { class: cls } : null);
+  renderInline(el, text.replace(/\s+/g, " "));
+  return el;
 }

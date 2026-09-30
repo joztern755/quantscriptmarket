@@ -21,6 +21,8 @@ import {
   errCode,
   stars,
   panel,
+  feesList,
+  inlineMd,
   RISK_LINE,
   LOSS_WARNING,
   MIN_SUBSCRIBERS_FOR_STATS,
@@ -115,7 +117,7 @@ function draw(root: HTMLElement, ctx: PageContext, s: StrategyDetail): void {
     const bs = builderSplit(e, 10_000_000_000); // on $10,000 of notional traded
     mount(
       feesBox,
-      kv(rows.map((r) => [r.label, r.note ? h("span", null, r.value, h("div", { class: "small muted" }, r.note)) : r.value] as [string, Child])),
+      feesList(rows),
       h(
         "div",
         { class: "preview-box small" },
@@ -321,7 +323,7 @@ async function loadPosts(ctx: PageContext, s: StrategyDetail, box: HTMLElement):
           { class: "post-item" },
           h("a", { class: "title", href: `#/posts/${encodeURIComponent(p.id)}` }, p.title),
           h("div", { class: "small muted" }, p.price_micro > 0 ? `Paid · ${fmtUsd(p.price_micro)}` : "Free", p.published_at ? ` · ${fmtDate(p.published_at)}` : ""),
-          p.excerpt ? h("p", { class: "small" }, p.excerpt) : null,
+          p.excerpt ? inlineMd("p", p.excerpt, "small") : null,
         ),
       ),
     );

@@ -1,4 +1,4 @@
-# Cloud Run service "executor" — same image as api, SERVICE_ROLE=executor. Never public: ingress internal,
+# Cloud Run service "executor" — same image as api, entry create_executor_app, SERVICE_ROLE=executor. Never public: ingress internal,
 # invoked only by Cloud Scheduler (OIDC as aijalon-scheduler, the only principal with run.invoker).
 # Identity: aijalon-executor SA (KMS DECRYPT only on agent-keys, Cloud SQL IAM login, its own secrets).
 # Rendered by infra/gcp/render.py in deploy.yml, applied with `gcloud run services replace`.
@@ -36,6 +36,10 @@ spec:
       containers:
         - name: app
           image: ${BACKEND_IMAGE}
+          # executor entry point: /healthz + /v1/internal/* (incl. tick, which needs KMS decrypt)
+          command: ["uvicorn"]
+          args: ["app.api.main:create_executor_app", "--factory", "--host", "0.0.0.0", "--port", "8080",
+                 "--no-server-header", "--no-date-header", "--timeout-graceful-shutdown", "25"]
           ports:
             - name: http1
               containerPort: 8080
@@ -62,6 +66,9 @@ spec:
             - {name: INTERNAL_AUDIENCE, value: "${EXECUTOR_URL}"}
             - {name: SCHEDULER_SA_EMAIL, value: "${SA_SCHEDULER}"}
             - {name: IN_HOUSE_LISTED, value: silver}
+            - {name: LAUNCH_PHASE, value: "${LAUNCH_PHASE}"}
+            - {name: ALLOWLIST_EMAILS, value: "${ALLOWLIST_EMAILS}"}
+            - {name: PAYOUTS_ENABLED, value: "${PAYOUTS_ENABLED}"}
             - name: TELEGRAM_BOT_TOKEN
               valueFrom: {secretKeyRef: {name: TELEGRAM_BOT_TOKEN, key: latest}}
             - name: TELEGRAM_OPS_CHAT_ID

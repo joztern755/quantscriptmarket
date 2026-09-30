@@ -106,6 +106,9 @@
    "user": "..."
   }
  },
+ "notes": [
+  "userFunding: entries older than ~8-9 days come back as DAILY aggregates (time = UTC midnight, nSamples = hourly payments merged, szi/fundingRate averaged); recent entries are hourly with nSamples null"
+ ],
  "trimmed": [
   "perpDexs: per-dex list fields cut to 3 entries",
   "l2Book: 5 levels per side",

@@ -396,6 +396,43 @@ INSERT INTO consents (user_id, doc, doc_version, context) VALUES ('$U1', 'risk',
 SQL
 expect_err "app_executor: UPDATE ledger -> 42501" 42501 "$DB" "$EXEC_USER" <<<"UPDATE ledger_entries SET amount_micro = 1;"
 
+# ------------------------------------------------------------------------------------------------ concurrency
+echo "-- concurrency"
+U9=99999999-9999-4999-8999-999999999999
+FEE9="user:${U9}:fee_balance"
+expect_ok "race fixture: user with 10 USD" <<SQL
+INSERT INTO users (id, firebase_uid) VALUES ('$U9', 'fb-u9');
+INSERT INTO ledger_accounts (code, kind, owner_user_id, non_negative) VALUES ('$FEE9', 'liability', '$U9', true);
+SELECT created FROM ledger_post('race:dep', 'deposit', NULL, 't',
+  '[{"account":"treasury:hl_usdc","amount_micro":10000000},{"account":"$FEE9","amount_micro":-10000000}]');
+SQL
+RACE_DIR="$(mktemp -d)"
+for i in $(seq 1 8); do
+    ( for j in $(seq 1 10); do
+        printf "SELECT created FROM ledger_post('par:%s:%s', 'deposit', NULL, 't', '[{\"account\":\"stripe:clearing\",\"amount_micro\":1},{\"account\":\"treasury:hl_usdc\",\"amount_micro\":-1}]');\n" "$i" "$j"
+        printf "INSERT INTO audit_log (actor, action, target, payload) VALUES ('w%s', 'par', '', '{\"j\": %s}');\n" "$i" "$j"
+      done | psql -X -q -v ON_ERROR_STOP=1 -d "$DB" >/dev/null 2>"$RACE_DIR/par.$i.err"; echo $? > "$RACE_DIR/par.$i.rc" ) &
+done
+# 6 concurrent spenders of 6 USD against a 10 USD balance: exactly one may win.
+for i in $(seq 1 6); do
+    ( printf "SELECT created FROM ledger_post('spend:%s', 'post_purchase', NULL, 't', '[{\"account\":\"%s\",\"amount_micro\":6000000},{\"account\":\"platform:revenue:posts\",\"amount_micro\":-6000000}]');\n" "$i" "$FEE9" \
+        | psql -X -q -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -d "$DB" >/dev/null 2>"$RACE_DIR/spend.$i.err"; echo $? > "$RACE_DIR/spend.$i.rc" ) &
+done
+wait
+par_fail=$(cat "$RACE_DIR"/par.*.rc | grep -vc '^0$')
+spend_ok=$(cat "$RACE_DIR"/spend.*.rc | grep -c '^0$')
+spend_402=$(cat "$RACE_DIR"/spend.*.err | grep -c 'AJ402')
+if [[ $par_fail -eq 0 ]]; then ok "8 parallel writers x 10 ledger+audit rows, no errors"
+else bad "8 parallel writers x 10 ledger+audit rows, no errors" "$(cat "$RACE_DIR"/par.*.err)"; fi
+if [[ $spend_ok -eq 1 && $spend_402 -eq 5 ]]; then ok "double-spend race: 1 of 6 wins, 5 get AJ402"
+else bad "double-spend race: 1 of 6 wins, 5 get AJ402" "ok=$spend_ok aj402=$spend_402 $(cat "$RACE_DIR"/spend.*.err)"; fi
+rm -rf "$RACE_DIR"
+expect_eq "chains intact after concurrent writers" "0|80|4000000" <<SQL
+SELECT (SELECT count(*) FROM verify_chain()),
+       (SELECT count(*) FROM ledger_transactions WHERE idempotency_key LIKE 'par:%'),
+       (SELECT normal_balance_micro FROM ledger_balances WHERE code = '$FEE9');
+SQL
+
 # ------------------------------------------------------------------------------------------------ python
 echo "-- python ledger service against this database"
 if out=$(cd "$BACKEND" && AIJALON_TEST_DATABASE_URL="$URL" "$PY" -m unittest tests.test_ledger 2>&1) \
