@@ -80,6 +80,61 @@ class RiskLimits:
 
 
 @dataclass(frozen=True)
+class HlLimits:
+    """Hyperliquid ``/info`` request weights and OUR shared per-egress-IP budget (SPEC §6; app/hl/budget.py).
+
+    Hyperliquid's documented limit (recalled — UNVERIFIED from this environment, check the "Rate limits and user
+    limits" docs page before go-live): 1200 weight / minute / IP across ``/info`` (and ``/exchange``); ``/info``
+    requests weigh 20, except a light set (l2Book, allMids, clearinghouseState, orderStatus,
+    spotClearinghouseState, exchangeStatus) at 2 and ``userRole`` at 60; list endpoints add 1 per 20 items returned
+    (candleSnapshot: 1 per 60). Every weight below is configuration, never trusted as fact.
+
+    We budget ``budget_weight_per_minute`` (default 800, i.e. ~2/3 of the recalled limit, leaving headroom for the
+    API service and retries) per egress IP (``egress_key``: every service that shares one NAT IP must share one
+    key). The executor tick has priority: ``tick_reserve_per_minute`` of each minute is kept for it — data jobs may
+    only use ``budget − max(tick used, reserve)``, and back off to the next minute when that is spent; the tick
+    itself is charged but never blocked."""
+    budget_weight_per_minute: int = 800
+    tick_reserve_per_minute: int = 300
+    egress_key: str = "default"
+    shared_budget: bool = True
+    default_weight: int = 20
+    light_weight: int = 2
+    light_types: tuple[str, ...] = ("l2Book", "allMids", "clearinghouseState", "orderStatus",
+                                    "spotClearinghouseState", "exchangeStatus")
+    type_weights: tuple[tuple[str, int], ...] = (("userRole", 60),)
+    # extra weight: +1 per N items returned
+    items_per_extra_weight: tuple[tuple[str, int], ...] = (
+        ("candleSnapshot", 60), ("userFills", 20), ("userFillsByTime", 20), ("userFunding", 20),
+        ("userNonFundingLedgerUpdates", 20), ("historicalOrders", 20), ("fundingHistory", 20),
+        ("userTwapSliceFills", 20), ("recentTrades", 20))
+    max_wait_seconds: float = 90.0        # longest a non-tick caller waits for budget before giving up
+
+    def __post_init__(self) -> None:
+        if self.budget_weight_per_minute <= 0 or not 0 <= self.tick_reserve_per_minute < self.budget_weight_per_minute:
+            raise ValueError("HlLimits: need 0 <= tick_reserve_per_minute < budget_weight_per_minute")
+
+    @property
+    def jobs_ceiling(self) -> int:
+        return self.budget_weight_per_minute - self.tick_reserve_per_minute
+
+    def weight(self, request_type: str | None) -> int:
+        """Base weight of one ``/info`` request of this type."""
+        t = str(request_type or "")
+        for name, w in self.type_weights:
+            if name == t:
+                return int(w)
+        return int(self.light_weight if t in self.light_types else self.default_weight)
+
+    def extra_weight(self, request_type: str | None, n_items: int) -> int:
+        """Extra weight charged once the response size is known."""
+        for name, per in self.items_per_extra_weight:
+            if name == str(request_type or "") and per > 0:
+                return -(-max(0, int(n_items)) // int(per))
+        return 0
+
+
+@dataclass(frozen=True)
 class Settings:
     env: str                                        # "dev" | "test" | "prod"
     hl_api_url: str
@@ -138,6 +193,7 @@ class Settings:
     kyc_api_base: str
     economics: Economics = field(default_factory=Economics)
     risk: RiskLimits = field(default_factory=RiskLimits)
+    hl_limits: HlLimits = field(default_factory=HlLimits)
 
     @property
     def is_prod(self) -> bool:
@@ -245,6 +301,12 @@ def get_settings() -> Settings:
         kyc_webhook_secret=os.environ.get("KYC_WEBHOOK_SECRET", ""),
         kyc_level_name=os.environ.get("KYC_LEVEL_NAME", ""),
         kyc_api_base=os.environ.get("KYC_API_BASE", "https://api.sumsub.com"),
+        hl_limits=HlLimits(
+            budget_weight_per_minute=int(os.environ.get("HL_BUDGET_WEIGHT_PER_MINUTE", "800")),
+            tick_reserve_per_minute=int(os.environ.get("HL_TICK_RESERVE_PER_MINUTE", "300")),
+            egress_key=os.environ.get("HL_EGRESS_KEY", "default").strip().lower() or "default",
+            shared_budget=_b("HL_SHARED_BUDGET", "true"),
+        ),
     )
     if s.is_prod:
         required = ["builder_address", "treasury_address", "kms_key_name", "firebase_project_id", "signals_pubkey_b64",

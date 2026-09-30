@@ -99,7 +99,7 @@ These keys exist in `backend/app/config.py` and are set per deploy (full table: 
 - [ ] Reconciliation job runs daily. The mismatch alert (> $1) has been tested.
 - [ ] Incident response tabletop exercise done (one market-manipulation scenario and one key-compromise scenario).
 - [ ] On-call rota and contacts sheet exist. At least 2 admins are available for maker-checker.
-- [ ] **Scheduler:** all 13 jobs exist (DEPLOY §14.1) and are paused until `make go-live`; `fills-ingest` / `fills-ingest-presettle` / `funding-scan` run before `settle-daily` (00:30). The on-call knows the `fill_after_settlement` procedure (RUNBOOK §13.4).
+- [ ] **Scheduler:** all 14 jobs exist (DEPLOY §14.1) and are paused until `make go-live`; `fills-ingest` / `fills-ingest-presettle` / `funding-scan` run before `settle-daily` (00:30). The on-call knows the `fill_after_settlement` procedure (RUNBOOK §13.4).
 - [ ] **Agent expiry reminders:** a test agent approved with a short validity produces `agent_expiring` / `agent_expired` on Telegram + e-mail; the executor stops trading that subscription (RUNBOOK §13.1).
 - [ ] **Telegram unreachable drill:** block the bot from a test account → the link shows lapsed, the `telegram_unreachable` e-mail arrives, new entries pause after 24 h, re-linking lifts it (RUNBOOK §13.2). Ops alerts reach the ops group and `OPS_EMAILS`.
 - [ ] **Held USDC deposit:** a transfer from an unverified wallet lands in `suspense:usdc_unattributed` with a `topup_held` ops event and is not credited. The release procedure (RUNBOOK §13.3, maker-checker) is agreed — **[GAP] no admin-console action exists yet**; until it does, held funds stay in suspense.

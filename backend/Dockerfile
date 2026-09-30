@@ -4,7 +4,9 @@
 #   migrate   command: python scripts/migrate.py              (infra/gcp/run/migrate.job.yaml)
 # The sandbox has its own image (sandbox/Dockerfile).
 #
-# Build (context = backend/):   docker build -f backend/Dockerfile backend
+# Build (from the repo root; context = backend/, plus the named context `legal` = repo-root legal/):
+#   DOCKER_BUILDKIT=1 docker build -f backend/Dockerfile --build-context legal=legal -t aijalon-backend:local backend
+# (same as `make docker`, CI and infra/gcp/deploy.sh; without --build-context the COPY --from=legal step fails)
 # Supply chain:
 #   * base image pinned by digest (`make pin` resolves it; the PIN_ME placeholder makes the build fail);
 #   * Python deps installed ONLY from requirements.lock with --require-hashes (`make lock`), unless

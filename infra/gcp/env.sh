@@ -160,6 +160,9 @@ SECRETS_SPEC=(
 #   funding-scan runs at :07 (the 00:00 funding payment is stored at 00:07, before settlement).
 #   daily-pnl-summary (00:15) reads the previous day's fills after the 00:00/00:10 fills-ingest runs.
 #   referral-tiers (01:15) runs after settlement on purpose: the NEXT settlement uses the new tier.
+#   settle-daily DEFERS any subscription whose trading address fills-ingest / funding-scan have not synced past the
+#   cut-off (ops event `settlement_deferred`); settle-daily-retry (02:30 and 06:30, same route, body {} = yesterday)
+#   settles those once the data jobs have caught up. Re-running settle-daily is always a no-op for settled days.
 # candles-sync runs at :05/:15/…/:55 (not :00/:10) so it never starts together with fills-ingest: both pace
 # themselves to 600 weight/min of Hyperliquid's ~1200/min per-IP /info budget, which they share with the tick.
 # name|cron|path (under INTERNAL_PREFIX)|attempt deadline|max retries
@@ -175,6 +178,7 @@ SCHEDULER_SPEC=(
   "reconcile|0 * * * *|reconcile|900s|1"
   "daily-pnl-summary|15 0 * * *|daily-pnl-summary|600s|2"
   "settle-daily|30 0 * * *|settle-daily|1800s|3"
+  "settle-daily-retry|30 2,6 * * *|settle-daily|1800s|3"
   "referral-tiers|15 1 * * *|referral-tiers|900s|3"
   "agent-expiry-scan|13 */6 * * *|agent-expiry-scan|300s|1"
 )
