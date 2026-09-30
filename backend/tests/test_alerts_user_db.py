@@ -547,6 +547,39 @@ class UserAlertsDbTest(unittest.TestCase):
         self.assertEqual(len(self.su.fetchall("SELECT 1 AS x FROM alerts WHERE user_id = CAST(:u AS uuid) AND kind = 'market_paused'",
                                               {"u": uid})), 1)
 
+    def test_fanout_signals_stale_from_outbox(self) -> None:
+        uid, chat, addr = self.ready_user()
+        other, other_chat, _ = self.ready_user()
+        coin = f"xyz:S{self.tag[:6].upper()}"
+        self.strategy_sub(uid, [coin])
+        self.strategy_sub(other, ["SOL"])
+        # exactly what app/jobs_data/signals._emit_rejection writes (ops event, critical, coin + strategy_key)
+        self.api.fetchall("""INSERT INTO events_outbox (user_id, kind, severity, payload, dedup_key)
+                             VALUES (NULL, 'signals_stale', 'critical', CAST(:p AS jsonb), :d) RETURNING id""",
+                          {"p": {"reason": "stale", "message": "feed too old", "strategy_key": "NOPE" + self.tag,
+                                 "coin": coin}, "d": f"signals_stale:{coin}:{self.tag}"})
+        tg, mail = FakeTelegram(), FakeEmail()
+        self.run_worker(tg, mail)
+        rows = self.su.fetchall("SELECT severity::text AS severity, payload FROM alerts WHERE user_id = CAST(:u AS uuid) AND kind = 'signal_stale'",
+                                {"u": uid})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["payload"]["coin"], coin)
+        self.assertEqual(self.su.fetchall("SELECT count(*) AS n FROM alerts WHERE user_id = CAST(:u AS uuid) AND kind = 'signal_stale'",
+                                          {"u": other})[0]["n"], 0)
+        self.assertTrue(any(f"Strategy signal stale ({coin})" in m for m in tg.to(chat)))
+        self.assertEqual(mail.to(addr), [])                                   # signal_stale: Telegram only
+        self.assertTrue(any("[ops]" in t and "Signals stale" in t for t in tg.to(-1001)))   # ops paged
+
+    def test_inapp_sink_rows_render_as_is(self) -> None:
+        uid, chat, _ = self.ready_user()
+        # a row written by notifier.InAppSink (executor / settlement): rendered text only
+        self.alert(uid, "subscription_past_due", "warn", {"title": "Subscription past due",
+                                                          "body": "Subscription x on SILVER could not be renewed.",
+                                                          "coin": None, "key": "k"})
+        tg = FakeTelegram()
+        self.run_worker(tg, FakeEmail())
+        self.assertTrue(any("Subscription x on SILVER could not be renewed." in m for m in tg.to(chat)))
+
     def test_send_test_alert(self) -> None:
         uid, chat, addr = self.ready_user()
         tg, mail = FakeTelegram(), FakeEmail()

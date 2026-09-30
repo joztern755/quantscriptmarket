@@ -11,6 +11,8 @@ You are finishing and deploying **aijalon.trade**, a Hyperliquid strategy market
 gh repo clone joztern755/quantscriptmarket && cd quantscriptmarket && git checkout claude/gifted-ptolemy-mvxlgx
 ```
 
+**Always `git pull` on that branch before each phase** (the cloud session may still be pushing final fixes; if `git log -1` is older than the last message from the cloud session, pull again).
+
 **Read first, in this order:** `docs/SPEC.md` (the contract; §12 = my latest decisions), `docs/DEPLOY.md` (the step-by-step deploy guide — follow it), `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/GO_LIVE_CHECKLIST.md`, `docs/API_CONTRACT.md`, `legal/README.md`.
 
 ## Hard rules (never break)
@@ -52,7 +54,7 @@ gh repo clone joztern755/quantscriptmarket && cd quantscriptmarket && git checko
 - **Stripe** (§11): I must get Stripe's approval for this business first (describe it honestly: software subscriptions and platform fees; no custody of trading funds). Then restricted key, webhook `https://api.aijalon.trade/v1/webhooks/stripe`, payment-method domain + Apple Pay file. Stripe fees are passed to users (credit = paid − actual fee). Cards, Apple Pay, Google Pay in USD; FPX/GrabPay stay off until an FX rate source is chosen (ask me).
 - **Wallets** (§12): builder + treasury addresses from my hardware wallet (read them back to me for confirmation, second person checks). I fund the builder with ≥100 USDC perps account value on Hyperliquid.
 - **SILVER signal feed:** run `integrations/terminal/install.sh` against my terminal repo (`joztern755/terminal.aijalon`) only after showing me the diff; generate the Ed25519 keypair with `node signals/keygen.js` (private key → that repo's GitHub secret, public key → `SIGNALS_PUBKEY_B64`). SILVER is a **free showcase** ($0, 0% profit share); its live state is CASH since 1980 — confirm the published feed shows that.
-- **KYC for creators:** start with the `manual` provider (admins approve with maker-checker); ask me before signing up for a KYC provider.
+- **KYC for creators:** start with the `manual` provider — ONE admin approves each creator; ask me before signing up for a KYC provider (Sumsub approvals still need one admin to confirm).
 
 ## Phase E — first deploy, internal testing with real USDC
 1. Deploy (§10) — I approve in GitHub. Smoke tests must pass.

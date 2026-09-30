@@ -11,7 +11,8 @@ deliver_outbox(db, now) — one pass, idempotent, safe to run concurrently:
   2. fan out ops alerts that affect users: kill switch / new-entries pause (kill_switch_engaged), critical
      auto-pause market alerts (mark_oracle_divergence, oi_spike, funding_spike) → `market_paused` for every
      user with a live subscription on a strategy trading that coin (global switch → every live subscriber);
-     stale_signal → `signal_stale` for that version's subscribers (idempotent via dedup_key 'fanout:<alert>:<user>'
+     stale_signal (executor) / signals_stale (signal ingest: coin + strategy_key) → `signal_stale` for the affected
+     subscribers; other critical signals_* rejections (entries paused on the coin) → `market_paused` (idempotent via dedup_key 'fanout:<alert>:<user>'
      and an alert_deliveries(channel='fanout') marker);
   3. deliver every recent USER alert (48 h window) to Telegram and email according to app.alerts.prefs.route +
      the user's mutes + contacts. Each (alert, channel) is claimed in alert_deliveries (UNIQUE(alert_id, channel))
@@ -160,25 +161,37 @@ def fanout_ops_alerts(conn: Any, now: datetime, limit: int = 50) -> int:
     ops = _db.rows(conn, """
         SELECT a.id, a.kind, a.severity::text AS severity, a.payload FROM alerts a
          WHERE a.user_id IS NULL AND a.created_at >= CAST(:since AS timestamptz)
-           AND (a.kind IN ('kill_switch_engaged', 'stale_signal')
-                OR (a.severity = 'critical' AND a.kind = ANY(CAST(:auto AS text[]))))
+           AND (a.kind IN ('kill_switch_engaged', 'stale_signal', 'signals_stale')
+                OR (a.severity = 'critical' AND a.kind = ANY(CAST(:auto AS text[])))
+                OR (a.severity = 'critical' AND a.kind LIKE 'signals%'))   -- feed rejected → entries paused on coin
            AND NOT EXISTS (SELECT 1 FROM alert_deliveries d WHERE d.alert_id = a.id AND d.channel = 'fanout')
          ORDER BY a.created_at, a.id LIMIT :lim""", since=now - LOOKBACK, auto=sorted(AUTO_PAUSE_KINDS), lim=limit)
     total = 0
     for a in ops:
         payload = _db.jload(a.get("payload"))
         aid = str(a["id"])
-        kind, sev, new_payload, coin, is_global, version = None, "critical", {}, None, False, None
+        kind, sev, new_payload, coin, is_global, version, slug = None, "critical", {}, None, False, None, None
         if a["kind"] == "kill_switch_engaged":
             coin, is_global = _flag_scope(str(payload.get("key") or ""))
             if coin or is_global:
                 kind = "market_paused"
                 new_payload = {"scope": coin or "all markets",
                                "cause": "kill switch" if "kill_switch" in str(payload.get("key")) else "entries paused"}
-        elif a["kind"] == "stale_signal":
+        elif a["kind"] == "stale_signal":                      # executor: {strategy_version_id, bar_close}
             version = payload.get("strategy_version_id")
             if isinstance(version, str) and len(version) == 36:
                 kind, sev = "signal_stale", "warn"
+        elif str(a["kind"]).startswith("signals_"):            # data jobs / signal ingest: {coin, strategy_key}
+            c, key = payload.get("coin"), payload.get("strategy_key")
+            coin = c if isinstance(c, str) and c else None
+            slug = key.lower() if isinstance(key, str) and key else None
+            if coin or slug:
+                if a["kind"] == "signals_stale":
+                    kind, sev = "signal_stale", "warn"
+                    new_payload = {"coin": coin} if coin else {}
+                else:
+                    kind = "market_paused"
+                    new_payload = {"scope": coin or "your strategy", "cause": "strategy signal feed rejected"}
         else:
             c = payload.get("coin")
             if isinstance(c, str) and c:
@@ -195,11 +208,12 @@ def fanout_ops_alerts(conn: Any, now: datetime, limit: int = 50) -> int:
                  WHERE s.status::text = ANY(CAST(:live AS text[]))
                    AND (CAST(:glob AS boolean)
                         OR (CAST(:coin AS text) IS NOT NULL AND CAST(:coin AS text) = ANY(st.markets))
-                        OR (CAST(:ver AS text) IS NOT NULL AND s.strategy_version_id::text = CAST(:ver AS text)))
+                        OR (CAST(:ver AS text) IS NOT NULL AND s.strategy_version_id::text = CAST(:ver AS text))
+                        OR (CAST(:slug AS text) IS NOT NULL AND lower(st.slug) = CAST(:slug AS text)))
                  ORDER BY s.user_id, st.name
                 ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING
                 RETURNING id""", sev=sev, kind=kind, p=_db.jdump(new_payload), aid=aid, now=now, live=LIVE_STATUSES,
-                glob=is_global, coin=coin, ver=version))
+                glob=is_global, coin=coin, ver=version, slug=slug))
         _db.rows(conn, """INSERT INTO alert_deliveries (alert_id, channel, status, attempts, sent_at, updated_at, last_error)
                           VALUES (CAST(:a AS uuid), 'fanout', 'sent', 1, CAST(:now AS timestamptz),
                                   CAST(:now AS timestamptz), :note)
