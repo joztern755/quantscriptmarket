@@ -24,7 +24,7 @@ from typing import Any, Optional
 
 from app.errors import AppError
 from app.jobs_data import _db
-from app.jobs_data.hl import WeightPacer, list_weight, make_info_client
+from app.jobs_data.hl import WeightPacer, list_weight, make_info_client, make_pacer
 
 __all__ = ["deposits_scan", "SUSPENSE_ACCOUNT", "LEDGER_PAGE"]
 
@@ -72,7 +72,7 @@ def _alert_to_event(conn: Any, alert: Any) -> None:
 
 def deposits_scan(db: Any, now: datetime, *, info: Any = None, settings: Any = None, max_pages: int = 10,
                   overlap_minutes: int = 60, initial_lookback_days: int = 14, max_seconds: float = 120.0,
-                  weight_per_minute: int = 600, pacer: Optional[WeightPacer] = None) -> dict[str, Any]:
+                  weight_per_minute: int = 600, pacer: Optional[WeightPacer] = None, rate_budget: Any = None) -> dict[str, Any]:
     from app.hl.deposits import detect_deposits
     from app.ledger import service as ledger
     from app.payments.usdc import credit_from_detection
@@ -87,8 +87,9 @@ def deposits_scan(db: Any, now: datetime, *, info: Any = None, settings: Any = N
         report.skipped_reason = "treasury address not configured"
         return report.as_dict()
     now_ms = _db.now_ms(now)
+    pacer = pacer or make_pacer(db, settings, info=info, weight_per_minute=weight_per_minute,
+                                max_seconds=max_seconds, rate_budget=rate_budget)
     info = make_info_client(settings, info=info)
-    pacer = pacer or WeightPacer(weight_per_minute, max_seconds=max_seconds)
     with _db.transaction(db) as conn:
         cur, _state = _db.get_cursor(conn, JOB, treasury)
     start = (cur - overlap_minutes * 60_000) if cur is not None else now_ms - initial_lookback_days * 86_400_000
@@ -242,8 +243,25 @@ def _book_held(conn: Any, ledger: Any, det: Any, reason: str, report: DepositsRe
     tx = ledger.post_transaction(conn, f"usdc_hl:{det.hash}", "deposit_held",
                                  f"USDC held for review {det.hash[:10]}… ({reason[:60]})",
                                  [(TREASURY_ACCOUNT, amount), (SUSPENSE_ACCOUNT, -amount)], CREATED_BY)
+    _record_held(conn, det, amount, reason, str(tx.id))
     if tx.created:
         report.held += 1
         report.held_micro += amount
     else:
         report.already_booked += 1
+
+
+def _record_held(conn: Any, det: Any, amount: int, reason: str, held_tx_id: str) -> None:
+    """``usdc_held_deposits`` (0009): the ON-CHAIN sender of a held transfer, so an admin refund (RUNBOOK §13.3,
+    admin ``held-deposits``) goes back to exactly that address. Same transaction as the ledger posting; idempotent."""
+    if _db.one(conn, "SELECT to_regclass('public.usdc_held_deposits') IS NOT NULL AS ok")["ok"] is not True:
+        return                                        # before 0009: the admin supplies + on-chain verifies the sender
+    sender = str(getattr(det, "user_address", "") or "").lower()
+    if not (len(sender) == 42 and sender.startswith("0x")):
+        return
+    _db.rows(conn, f"""
+        INSERT INTO usdc_held_deposits (tx_hash, sender_address, amount_micro, reason, transfer_time, held_tx_id)
+        VALUES (:h, :s, :a, :r, {_db.ms_to_ts('CAST(:t AS bigint)')}, CAST(:tx AS uuid))
+        ON CONFLICT (tx_hash) DO NOTHING RETURNING tx_hash""",
+             h=str(det.hash).lower(), s=sender, a=int(amount), r=(reason or "held")[:200], t=int(det.time),
+             tx=held_tx_id)

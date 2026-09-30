@@ -28,6 +28,11 @@ All jobs are idempotent (ledger idempotency keys, UNIQUE constraints, cursors); 
 a job-level advisory lock and the tick locks per subscription (and per creator version), so Scheduler retries and
 overlapping runs are safe.
 
+Hyperliquid rate budget: the default ``InfoClient`` carries an ``app.hl.budget.BudgetHook`` over the shared DB
+budget (``hl_rate_budget``; config ``HlLimits``) bound to the first job's database (``Runtime.bind_db``). Tick reads
+are charged to the priority TICK pool (never blocked); reconcile runs in the JOBS pool (waits / gives up like the
+data jobs, which pace themselves in app/jobs_data).
+
 Composition: ``Runtime`` builds every dependency from ``Settings`` (Hyperliquid info client + readers, SDK gateway
 factory with our builder code, KMS decryptors, notifier, sandbox client, jitter, planner, clock). Every piece is a
 constructor argument, so tests inject fakes (``Runtime(settings, info=FakeInfo(...), gateways=FakeGatewayFactory(...),
@@ -331,6 +336,24 @@ class Runtime:
         self._traded_coins: tuple[str, ...] = ()
         self._agent_decryptor: Any = None
         self._lock = threading.RLock()
+        self._rate_budget: Any = None
+
+    def bind_db(self, db: PgDatabase) -> None:
+        """Give the shared Hyperliquid rate budget its database (first job call; all jobs share one database)."""
+        if self._rate_budget is not None or self._info is not None and not hasattr(self._info, "rate_hook"):
+            return
+        limits = getattr(self.settings, "hl_limits", None)
+        if limits is None or not getattr(limits, "shared_budget", False):
+            return
+        with self._lock:
+            if self._rate_budget is None:
+                from app.hl.budget import HlRateBudget
+
+                self._rate_budget = HlRateBudget(db, limits)
+
+    @property
+    def rate_budget(self) -> Any:
+        return self._rate_budget
 
     # ---- Hyperliquid ------------------------------------------------------------------------------------------
     @property
@@ -338,9 +361,12 @@ class Runtime:
         if self._info is None:
             with self._lock:
                 if self._info is None:
+                    from app.hl.budget import BudgetHook
                     from app.hl.info import InfoClient
 
-                    self._info = InfoClient(self.settings.hl_api_url)
+                    limits = getattr(self.settings, "hl_limits", None)
+                    hook = BudgetHook(lambda: self._rate_budget, limits) if limits is not None else None
+                    self._info = InfoClient(self.settings.hl_api_url, rate_hook=hook)
         return self._info
 
     @property
@@ -512,6 +538,7 @@ def run_tick(*, db: Any, now: datetime, runtime: Runtime | None = None, creator_
     rt = runtime or get_runtime()
     now = _aware(now)
     pdb = _db(db)
+    rt.bind_db(pdb)
     alerts = rt.alerts(pdb)
     out: dict[str, Any] = {}
     if creator_signals:
@@ -556,10 +583,14 @@ def reconcile(*, db: Any, now: datetime, runtime: Runtime | None = None) -> dict
     now = _aware(now)
     pdb = _db(db)
     date_key = now.date().isoformat()
+    rt.bind_db(pdb)
+    from app.hl.budget import POOL_JOBS, budget_pool
+
     with PgLockProvider(pdb).try_lock("job:reconcile") as held:
         if not held:
             return {"skipped": "another reconciliation is running"}
-        report = rt.reconciler(pdb).run(date_key).as_dict()
+        with budget_pool(POOL_JOBS):
+            report = rt.reconciler(pdb).run(date_key).as_dict()
         PgReconciliationStore(pdb).save(date_key, report, now)
     return {"date_key": date_key, **report}
 

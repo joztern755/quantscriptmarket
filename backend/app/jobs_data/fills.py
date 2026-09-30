@@ -35,7 +35,7 @@ from app.errors import AppError
 from app.hl.client import is_platform_cloid
 from app.hl.fills import AttributedFill, Fill, SubscriptionWindow, attribute_fills
 from app.jobs_data import _db
-from app.jobs_data.hl import WeightPacer, list_weight, make_info_client
+from app.jobs_data.hl import WeightPacer, list_weight, make_info_client, make_pacer
 from app.money import to_micro
 
 __all__ = ["fills_ingest", "trade_events", "tracked_subscriptions", "LIVE_STATUSES", "FILLS_PAGE"]
@@ -183,11 +183,12 @@ _INSERT_FILLS = f"""
 def fills_ingest(db: Any, now: datetime, *, info: Any = None, settings: Any = None, max_addresses: int = 200,
                  max_pages_per_address: int = 5, max_seconds: float = 240.0, weight_per_minute: int = 600,
                  overlap_minutes: int = 10, recent_cancel_days: int = 7,
-                 pacer: Optional[WeightPacer] = None) -> dict[str, Any]:
+                 pacer: Optional[WeightPacer] = None, rate_budget: Any = None) -> dict[str, Any]:
     """One bounded, resumable pass over the tracked trading addresses (see module docstring)."""
     now_ms = _db.now_ms(now)
+    pacer = pacer or make_pacer(db, settings, info=info, weight_per_minute=weight_per_minute,
+                                max_seconds=max_seconds, rate_budget=rate_budget)
     info = make_info_client(settings, info=info)
-    pacer = pacer or WeightPacer(weight_per_minute, max_seconds=max_seconds)
     report = FillsReport()
     overlap_ms = overlap_minutes * 60_000
     with _db.transaction(db) as conn:

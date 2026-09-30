@@ -575,6 +575,13 @@ class JobsDataDbTest(unittest.TestCase):
                                 {"code": "suspense:usdc_unattributed", "amount_micro": -3_000_000},
                                 {"code": "treasury:hl_usdc", "amount_micro": 3_000_000},
                                 {"code": "treasury:hl_usdc", "amount_micro": 40_000_000}])
+        # 0009: the on-chain sender of each held transfer is recorded (admin refunds go back to exactly it)
+        rec = self.admin.fetchall("""SELECT h.tx_hash, h.sender_address, h.amount_micro, t.kind FROM usdc_held_deposits h
+                                       JOIN ledger_transactions t ON t.id = h.held_tx_id
+                                      WHERE h.tx_hash IN (:h2, :h3) ORDER BY h.amount_micro""",
+                                  {"h2": info.ledger[treasury][1]["hash"], "h3": info.ledger[treasury][2]["hash"]})
+        self.assertEqual([(r["sender_address"], r["amount_micro"], r["kind"]) for r in rec],
+                         [(w, 3_000_000, "deposit_held"), (stranger, 40_000_000, "deposit_held")])
         dep = self.admin.fetchall("""SELECT status::text AS s, amount_micro, withdrawable, method::text AS m
                                      FROM deposits WHERE user_id = CAST(:u AS uuid)""", {"u": uid})
         self.assertEqual(dep, [{"s": "credited", "amount_micro": 25_500_000, "withdrawable": True, "m": "usdc_hl"}])

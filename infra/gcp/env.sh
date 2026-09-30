@@ -163,8 +163,10 @@ SECRETS_SPEC=(
 #   settle-daily DEFERS any subscription whose trading address fills-ingest / funding-scan have not synced past the
 #   cut-off (ops event `settlement_deferred`); settle-daily-retry (02:30 and 06:30, same route, body {} = yesterday)
 #   settles those once the data jobs have caught up. Re-running settle-daily is always a no-op for settled days.
-# candles-sync runs at :05/:15/…/:55 (not :00/:10) so it never starts together with fills-ingest: both pace
-# themselves to 600 weight/min of Hyperliquid's ~1200/min per-IP /info budget, which they share with the tick.
+# candles-sync runs at :05/:15/…/:55 (not :00/:10) so it never starts together with fills-ingest. Every Hyperliquid
+# /info caller on the executor (tick, data jobs, reconcile) charges ONE shared per-egress-IP budget in Postgres
+# (hl_rate_budget; HL_BUDGET_WEIGHT_PER_MINUTE=800 with HL_TICK_RESERVE_PER_MINUTE=300 kept for the tick — data jobs
+# back off to the next minute when their share is spent). Hyperliquid's own limit is ~1200/min/IP (UNVERIFIED).
 # name|cron|path (under INTERNAL_PREFIX)|attempt deadline|max retries
 SCHEDULER_SPEC=(
   "tick|* * * * *|tick|180s|0"

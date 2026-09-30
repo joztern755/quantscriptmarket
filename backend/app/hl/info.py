@@ -3,6 +3,9 @@
 * Never talks to ``/exchange`` — order placement lives in ``app.hl.client`` (official SDK, agent key).
 * Timeouts on every request; retries with full-jitter exponential backoff on 429 / 5xx / connection errors
   (``Retry-After`` honoured, capped); responses are streamed and refused above ``max_response_bytes``.
+* ``rate_hook`` (optional, ``app.hl.budget.BudgetHook``): ``before(body)`` is called before EVERY HTTP attempt
+  (it charges the shared per-IP weight budget and may raise ``HlBudgetExhausted`` for non-priority callers) and
+  ``after(body, parsed)`` once a response is parsed (per-item extra weight).
 * Addresses are validated and lower-cased before they leave the process. Hyperliquid numeric strings are returned
   untouched (callers parse them with ``app.money.parse_decimal`` — never float).
 
@@ -74,6 +77,7 @@ class InfoClient:
         session: Any = None,
         sleep: Callable[[float], None] = time.sleep,
         rng: Callable[[], float] = random.random,
+        rate_hook: Any = None,
     ) -> None:
         if not base_url.startswith("https://") and not base_url.startswith("http://127.0.0.1"):
             raise ValidationFailed("Hyperliquid base_url must be https")
@@ -90,6 +94,7 @@ class InfoClient:
         self._session = session
         self._sleep = sleep
         self._rng = rng
+        self.rate_hook = rate_hook
 
     # ------------------------------------------------------------------------------------------------ transport
 
@@ -125,6 +130,8 @@ class InfoClient:
         last_err: str = ""
         for attempt in range(self.max_retries + 1):
             resp = None
+            if self.rate_hook is not None:
+                self.rate_hook.before(body)          # outside the try: a budget refusal is not retried here
             try:
                 resp = self._session.post(self.url, json=dict(body), timeout=self.timeout, stream=True,
                                           headers={"Content-Type": "application/json"})
@@ -144,9 +151,15 @@ class InfoClient:
                     raise ExternalServiceError(f"hyperliquid info http {status}", upstream_status=status,
                                                type=req_type, body=raw[:200].decode("utf-8", "replace"))
                 try:
-                    return json.loads(raw)
+                    parsed = json.loads(raw)
                 except ValueError as e:
                     raise ExternalServiceError("hyperliquid info returned invalid JSON", type=req_type) from e
+                if self.rate_hook is not None:
+                    try:
+                        self.rate_hook.after(body, parsed)
+                    except Exception:  # noqa: BLE001 - accounting never fails a successful read
+                        log.warning("hl_rate_hook_after_failed", exc_info=True)
+                return parsed
             except ExternalServiceError:
                 raise
             except Exception as e:  # noqa: BLE001 - network errors (requests.ConnectionError, Timeout, ...)

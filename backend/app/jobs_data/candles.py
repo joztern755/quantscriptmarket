@@ -26,7 +26,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from app.errors import AppError
 from app.jobs_data import _db
-from app.jobs_data.hl import WeightPacer, candle_weight, make_info_client
+from app.jobs_data.hl import WeightPacer, candle_weight, make_info_client, make_pacer
 
 __all__ = [
     "INTERVALS", "STEP_MS", "HL_MAX_CANDLES", "candles_sync", "SyncReport", "DbCandleSource", "history_days",
@@ -111,9 +111,9 @@ def _universe(db: Any, info: Any, now_ms: int, ttl_ms: int, report: SyncReport,
     cached = state.get("coins")
     if isinstance(cached, list) and cached and 0 <= now_ms - int(state.get("fetched_ms") or 0) < ttl_ms:
         return [str(c) for c in cached]
-    for _ in range(int(state.get("dex_count") or 12) + 1):   # perpDexs + one meta per dex
-        pacer.spend(20)
     try:
+        for _ in range(int(state.get("dex_count") or 12) + 1):   # perpDexs + one meta per dex
+            pacer.spend(20)                                     # may raise HlBudgetExhausted (an AppError)
         coins, skipped = live_perp_markets(info)
     except AppError as e:
         if isinstance(cached, list) and cached:            # stale universe beats no sync at all
@@ -187,14 +187,15 @@ def candles_sync(db: Any, now: datetime, *, info: Any = None, settings: Any = No
                  intervals: Sequence[str] = INTERVALS, coins: Optional[Iterable[str]] = None,
                  max_requests: int = 100, max_seconds: float = 240.0, weight_per_minute: int = 600,
                  grace_seconds: int = 60, overlap_bars: int = 2, universe_ttl_seconds: int = 3600,
-                 max_consecutive_errors: int = 3, pacer: Optional[WeightPacer] = None) -> dict[str, Any]:
+                 max_consecutive_errors: int = 3, pacer: Optional[WeightPacer] = None, rate_budget: Any = None) -> dict[str, Any]:
     """One bounded, resumable pass (see module docstring). Returns a JSON-safe summary."""
     for iv in intervals:
         if iv not in STEP_MS:
             raise ValueError(f"unsupported candle interval {iv!r}")
     now_ms = _db.now_ms(now)
+    pacer = pacer or make_pacer(db, settings, info=info, weight_per_minute=weight_per_minute,
+                                max_seconds=max_seconds, rate_budget=rate_budget)
     info = make_info_client(settings, info=info)
-    pacer = pacer or WeightPacer(weight_per_minute, max_seconds=max_seconds)
     report = SyncReport()
     grace_ms = int(grace_seconds) * 1000
 

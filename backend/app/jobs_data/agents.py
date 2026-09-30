@@ -32,7 +32,7 @@ from typing import Any, Optional
 
 from app.errors import AppError
 from app.jobs_data import _db
-from app.jobs_data.hl import WeightPacer, make_info_client
+from app.jobs_data.hl import WeightPacer, make_info_client, make_pacer
 
 __all__ = ["agent_expiry_scan", "THRESHOLD_DAYS", "threshold_for"]
 
@@ -73,14 +73,15 @@ class AgentReport:
 
 def agent_expiry_scan(db: Any, now: datetime, *, info: Any = None, settings: Any = None, max_masters: int = 300,
                       max_seconds: float = 240.0, weight_per_minute: int = 600, missing_scans_to_revoke: int = 2,
-                      pacer: Optional[WeightPacer] = None) -> dict[str, Any]:
+                      pacer: Optional[WeightPacer] = None, rate_budget: Any = None) -> dict[str, Any]:
     now_ms = _db.now_ms(now)
     if settings is None:
         from app.config import get_settings
 
         settings = get_settings()
+    pacer = pacer or make_pacer(db, settings, info=info, weight_per_minute=weight_per_minute,
+                                max_seconds=max_seconds, rate_budget=rate_budget)
     info = make_info_client(settings, info=info)
-    pacer = pacer or WeightPacer(weight_per_minute, max_seconds=max_seconds)
     report = AgentReport()
     builder = str(getattr(settings, "builder_address", "") or "").lower()
     econ = getattr(settings, "economics", None)

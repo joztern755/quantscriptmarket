@@ -37,7 +37,7 @@ from app.hl.fills import (
 )
 from app.jobs_data import _db
 from app.jobs_data.fills import _in_scope, tracked_subscriptions
-from app.jobs_data.hl import WeightPacer, list_weight, make_info_client
+from app.jobs_data.hl import WeightPacer, list_weight, make_info_client, make_pacer
 from app.money import MICRO, to_micro
 
 __all__ = ["funding_scan", "FUNDING_PAGE"]
@@ -75,12 +75,13 @@ class FundingReport:
 def funding_scan(db: Any, now: datetime, *, info: Any = None, settings: Any = None, max_addresses: int = 200,
                  max_pages_per_address: int = 10, max_seconds: float = 240.0, weight_per_minute: int = 600,
                  overlap_minutes: int = 90, recent_cancel_days: int = 7, aggregate_income: str = "drop",
-                 pacer: Optional[WeightPacer] = None) -> dict[str, Any]:
+                 pacer: Optional[WeightPacer] = None, rate_budget: Any = None) -> dict[str, Any]:
     if aggregate_income not in ("drop", "estimate"):
         raise ValidationFailed("aggregate_income must be 'drop' or 'estimate'")
     now_ms = _db.now_ms(now)
+    pacer = pacer or make_pacer(db, settings, info=info, weight_per_minute=weight_per_minute,
+                                max_seconds=max_seconds, rate_budget=rate_budget)
     info = make_info_client(settings, info=info)
-    pacer = pacer or WeightPacer(weight_per_minute, max_seconds=max_seconds)
     report = FundingReport()
     overlap_ms = overlap_minutes * 60_000
     with _db.transaction(db) as conn:
