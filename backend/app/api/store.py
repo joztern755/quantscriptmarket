@@ -22,7 +22,7 @@ from sqlalchemy.exc import IntegrityError
 
 Cursor = Optional[tuple[datetime, str]]
 
-LIVE_SUB_STATUSES = ("pending", "active", "past_due", "reduce_only", "paused_user")
+LIVE_SUB_STATUSES = ("pending", "active", "past_due", "reduce_only", "paused_user", "closing")
 PUBLIC_STRATEGY_STATUSES = ("listed", "paused")
 
 _USER_COLS = ("id, created_at, firebase_uid, email, display_name, role::text AS role, plan::text AS plan, "
@@ -80,6 +80,14 @@ class SqlStore:
             UPDATE api_idempotency SET status_code = :sc, response = CAST(:resp AS jsonb), completed_at = now()
             WHERE user_id = CAST(:uid AS uuid) AND idem_key = :key""",
                    sc=status_code, resp=_j(response), uid=user_id, key=key)
+
+    # ------------------------------------------------------------------------------------------ audit
+    def insert_audit(self, conn: Any, *, actor: str, action: str, target: str, payload: dict,
+                     ip_hash: Optional[str]) -> None:
+        """chain_seq / prev_hash / hash / created_at are set by the audit_log BEFORE INSERT trigger."""
+        self._exec(conn, """INSERT INTO audit_log (actor, action, target, payload, ip_hash)
+                            VALUES (:a, :ac, :t, CAST(:p AS jsonb), :ip)""",
+                   a=actor, ac=action, t=target or None, p=_j(payload), ip=ip_hash)
 
     # ------------------------------------------------------------------------------------------ users
     def get_user_by_firebase_uid(self, conn: Any, uid: str) -> Optional[dict]:
@@ -356,20 +364,20 @@ class SqlStore:
     # ------------------------------------------------------------------------------------------ subscriptions
     def count_live_subscriptions(self, conn: Any, user_id: str) -> int:
         row = self._one(conn, """SELECT count(*) AS n FROM subscriptions WHERE user_id = CAST(:u AS uuid)
-                                 AND status IN ('pending', 'active', 'past_due', 'reduce_only', 'paused_user')""",
+                                 AND status::text IN ('pending', 'active', 'past_due', 'reduce_only', 'paused_user', 'closing')""",
                         u=user_id)
         return int(row["n"]) if row else 0
 
     def live_subscription_prices(self, conn: Any, user_id: str) -> list[int]:
         rows = self._all(conn, """
             SELECT coalesce(st.price_monthly_micro, 0) AS p FROM subscriptions s JOIN strategies st ON st.id = s.strategy_id
-             WHERE s.user_id = CAST(:u AS uuid) AND s.status IN ('pending', 'active', 'past_due', 'reduce_only')""",
+             WHERE s.user_id = CAST(:u AS uuid) AND s.status::text IN ('pending', 'active', 'past_due', 'reduce_only')""",
                          u=user_id)
         return [int(r["p"]) for r in rows]
 
     def live_subscription_on_address(self, conn: Any, address: str) -> Optional[dict]:
         return self._one(conn, f"""SELECT {_SUB_COLS} FROM subscriptions s WHERE s.trading_address = :a
-                                   AND s.status IN ('pending', 'active', 'past_due', 'reduce_only')""", a=address)
+                                   AND s.status::text IN ('pending', 'active', 'past_due', 'reduce_only', 'closing')""", a=address)
 
     def insert_subscription(self, conn: Any, *, user_id: str, strategy_id: str, version_id: str, trading_address: str,
                             allocation_micro: int, max_leverage_x100: int, status: str,
@@ -407,9 +415,12 @@ class SqlStore:
                                          THEN now() ELSE status_changed_at END
             WHERE id = CAST(:id AS uuid)""", alloc=allocation_micro, lev=max_leverage_x100, st=status, id=sub_id)
 
-    def cancel_subscription(self, conn: Any, sub_id: str, now: datetime) -> None:
-        self._exec(conn, """UPDATE subscriptions SET status = 'cancelled', status_changed_at = :t, cancelled_at = :t
-                            WHERE id = CAST(:id AS uuid) AND status <> 'cancelled'""", t=now, id=sub_id)
+    def end_subscription(self, conn: Any, sub_id: str, *, status: str, now: datetime) -> None:
+        """status 'cancelled' (leave positions) or 'closing' (executor flattens, then cancels)."""
+        self._exec(conn, """UPDATE subscriptions SET status = CAST(:s AS subscription_status), status_changed_at = :t,
+                                   cancelled_at = CASE WHEN :s2 = 'cancelled' THEN CAST(:t AS timestamptz) ELSE cancelled_at END
+                            WHERE id = CAST(:id AS uuid) AND status::text NOT IN ('cancelled', 'closing')""",
+                   s=status, s2=status, t=now, id=sub_id)
 
     def list_subscriptions(self, conn: Any, user_id: str, limit: int, cursor: Cursor) -> list[dict]:
         return self._all(conn, f"""
@@ -422,7 +433,7 @@ class SqlStore:
     def trading_addresses(self, conn: Any, user_id: str) -> list[str]:
         rows = self._all(conn, """
             SELECT DISTINCT trading_address AS a FROM subscriptions WHERE user_id = CAST(:u AS uuid)
-               AND status IN ('pending', 'active', 'past_due', 'reduce_only', 'paused_user')
+               AND status::text IN ('pending', 'active', 'past_due', 'reduce_only', 'paused_user', 'closing')
             UNION SELECT master_address FROM wallets WHERE user_id = CAST(:u AS uuid) AND verified_at IS NOT NULL""",
                          u=user_id)
         return sorted({str(r["a"]) for r in rows})

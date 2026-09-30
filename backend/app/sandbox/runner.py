@@ -38,8 +38,23 @@ What this module adds on top of the static AST allowlist (validate.py):
    0/1/2 at ``/dev/null``. The result is written to the private fd inside a frame keyed by a random
    per-run nonce; the parent accepts exactly one well-formed frame, caps total output size, and
    re-validates every weight itself (:func:`app.sandbox.validate.validate_weights`). Nothing the script
-   prints (it has no ``print`` anyway) can spoof a result.
+   prints (it has no ``print`` anyway) can spoof a result; a script that escaped and wrote into the
+   private fd only makes the parent discard the result (fails closed, ``kind="protocol"``).
 6. Wall-clock timeout enforced by the parent with ``killpg(SIGKILL)``.
+
+RESIDUAL RISKS (accepted; covered by the Cloud Run boundary, not by this module)
+* The AST validator is the only in-process control against object-graph traversal
+  (``().__class__.__base__.__subclasses__()`` → ``os``). Tests prove that with the validator bypassed,
+  such an escape still cannot fork (RLIMIT_NPROC=0, non-root), write a byte to disk (RLIMIT_FSIZE=0),
+  read root-only files, exceed CPU/memory, or forge a result — but it CAN read world-readable files,
+  open sockets (only the VPC egress policy stops traffic), and send signals to other same-uid processes
+  in the instance (DoS of a concurrent run; results are never forged because each run has its own nonce
+  and the parent validates output). Keep ``--concurrency`` low and the container free of anything secret.
+* CPython interpreter bugs (e.g. crashes in C code reachable from allowed builtins) are contained by
+  gVisor + the empty service account.
+* A script can legitimately return any weights within the contract (|w|, Σ|w| ≤ MAX_LEVERAGE); the
+  executor's pre-trade guards (SPEC §5.4) remain the control on what actually gets traded.
+* Side channels (timing, CPU contention) between concurrent runs on one instance are not addressed.
 
 Only stdlib is used (SPEC §11).
 """
@@ -64,7 +79,7 @@ from app.sandbox.validate import (
 
 __all__ = [
     "RunLimits", "SINGLE_LIMITS", "SERIES_LIMITS", "ScriptRuntimeError", "SignalResult", "SeriesStep",
-    "SeriesResult", "run_signal", "run_series", "normalize_bars", "BadOutput",
+    "SeriesResult", "run_signal", "run_series", "normalize_bars", "with_limits", "BadOutput",
 ]
 
 MB = 1024 * 1024

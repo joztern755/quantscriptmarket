@@ -161,7 +161,8 @@ export const api = {
   get: <T>(path: string, opts?: ReqOpts) => request<T>("GET", path, undefined, opts),
   post: <T>(path: string, body?: unknown, opts?: ReqOpts) => request<T>("POST", path, body ?? {}, opts),
   patch: <T>(path: string, body?: unknown, opts?: ReqOpts) => request<T>("PATCH", path, body ?? {}, opts),
-  del: <T>(path: string, opts?: ReqOpts) => request<T>("DELETE", path, undefined, opts),
+  /** DELETE; pass `body` when the endpoint requires one (e.g. /subscriptions/{id} → {positions}). */
+  del: <T>(path: string, opts?: ReqOpts & { body?: unknown }) => request<T>("DELETE", path, opts?.body, opts),
 };
 
 // ---------------------------------------------------------------- public config

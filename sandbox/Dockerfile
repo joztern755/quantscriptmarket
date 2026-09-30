@@ -1,6 +1,7 @@
 # Cloud Run service "sandbox": executes creator strategy scripts (SPEC §2, §5.9, §10).
 #
-# Build from the repo root:   docker build -f sandbox/Dockerfile -t sandbox .
+# Build from the repo root (BuildKit, for COPY --chmod):
+#   DOCKER_BUILDKIT=1 docker build -f sandbox/Dockerfile -t sandbox .
 #
 # The container holds ONLY the sandbox package + the stdlib-only helpers it imports
 # (app/errors.py, app/logging.py). No app.config, no DB drivers, no SDKs, no secrets baked in.

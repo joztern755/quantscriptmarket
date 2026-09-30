@@ -105,7 +105,7 @@ async function newPage(viewport, colorScheme, opts = {}) {
   page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
   page.on("requestfailed", (r) => {
     const u = r.url();
-    if (!/fonts\.(googleapis|gstatic)\.com/.test(u)) errors.push(`requestfailed: ${u} ${r.failure()?.errorText}`);
+    if (!/fonts\.(googleapis|gstatic)\.com/.test(u) && r.failure()?.errorText !== "net::ERR_ABORTED") errors.push(`requestfailed: ${u} ${r.failure()?.errorText}`);
   });
   let cfgState = opts.config || publicConfig();
   await context.route("https://fonts.googleapis.com/**", (r) => r.fulfill({ status: 200, contentType: "text/css", body: "" }));

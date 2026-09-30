@@ -2,15 +2,13 @@
 -- 0003_seed.sql — platform ledger accounts, system flag defaults, in-house strategies (SPEC §4, §7).
 -- Idempotent (ON CONFLICT DO NOTHING) so it is also safe to re-apply by hand on a fresh environment.
 --
--- DECISION (in-house pricing): SPEC §7 launches SILVER, but its monthly price and profit share are an open
--- owner decision [CONFIRM]. The DB refuses status 'listed' without price_monthly_micro and
--- profit_share_bps (CHECK strategies_listed_requires_terms), so nothing can be sold or executed at an
--- implicit $0. SILVER is therefore seeded in 'review' with NULL prices; an admin sets the price and
--- profit share (Admin → "prices for in-house strategies", audit-logged) and then flips it to 'listed'.
--- config.in_house_listed = ("silver",) says WHICH in-house strategies may be listed, not that they are.
--- BTC, SOL, HYPE, GOLD, OIL, RUNNERS stay 'draft' (not visible) until their scripts pass walk-forward.
--- OIL maps to xyz:CL (WTI) pending [CONFIRM WTI vs Brent]. RUNNERS' member coins are not known here:
--- markets left empty (allowed for drafts only).
+-- DECISION (owner, SPEC §12, 30 Sep 2026): SILVER is LISTED FREE as a transparent showcase of the engine:
+-- price_monthly_micro = 0, profit_share_bps = 0 (the builder fee still applies to its orders). The DB refuses
+-- status 'listed' without an explicit price and profit share (CHECK strategies_listed_requires_terms), so
+-- $0 here is a deliberate value, never an implicit default.
+-- BTC, SOL, HYPE, GOLD, OIL, RUNNERS stay 'draft' (not visible, NULL prices) until their scripts pass
+-- walk-forward; an admin sets prices before listing them. OIL maps to xyz:CL (WTI) pending
+-- [CONFIRM WTI vs Brent]. RUNNERS' member coins are not known here: markets left empty (drafts only).
 -- No strategy_versions are seeded: the registry creates version 1 from the terminal feed's engine_hash.
 -- =====================================================================================================
 
@@ -39,8 +37,8 @@ ON CONFLICT (key) DO NOTHING;
 -- ---------------------------------------------------------------- in-house strategies (CREST, §7)
 INSERT INTO strategies (slug, name, owner_user_id, in_house, markets, timeframe, price_monthly_micro,
                         profit_share_bps, status, description) VALUES
-    ('silver',  'CREST Silver',  NULL, true, ARRAY['xyz:SILVER'], '1d', NULL, NULL, 'review',
-     'In-house CREST long-or-cash strategy on xyz:SILVER (daily bars, weight 0/1/2). Launch strategy; price pending owner confirmation.'),
+    ('silver',  'CREST Silver',  NULL, true, ARRAY['xyz:SILVER'], '1d', 0, 0, 'listed',
+     'In-house CREST long-or-cash strategy on xyz:SILVER (daily bars, weight 0/1/2). Free showcase of the engine: $0/month, 0% profit share (builder fee applies to orders). The live signal has been CASH since 1980-01-15 under the current setting (M2 filter blocking entries), so subscribers may see no trades for a long time.'),
     ('btc',     'CREST BTC',     NULL, true, ARRAY['BTC'],        '1d', NULL, NULL, 'draft',
      'In-house CREST strategy on BTC. Unlisted until its script passes walk-forward.'),
     ('sol',     'CREST SOL',     NULL, true, ARRAY['SOL'],        '1d', NULL, NULL, 'draft',

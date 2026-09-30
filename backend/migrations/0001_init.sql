@@ -65,7 +65,8 @@ CREATE TYPE consent_doc          AS ENUM ('terms', 'risk', 'privacy', 'jurisdict
 CREATE TYPE consent_context      AS ENUM ('site_entry', 'subscribe', 'creator');
 CREATE TYPE agent_key_status     AS ENUM ('pending_approval', 'active', 'revoked', 'rotated');
 CREATE TYPE strategy_status      AS ENUM ('draft', 'review', 'listed', 'paused', 'delisted');
-CREATE TYPE subscription_status  AS ENUM ('pending', 'active', 'past_due', 'reduce_only', 'paused_user', 'cancelled');
+CREATE TYPE subscription_status  AS ENUM ('pending', 'active', 'past_due', 'reduce_only', 'paused_user', 'closing', 'cancelled');
+CREATE TYPE cancel_positions_mode AS ENUM ('close', 'leave');   -- SPEC §12 cancel flow
 CREATE TYPE signal_source        AS ENUM ('sandbox', 'terminal');
 CREATE TYPE order_side           AS ENUM ('buy', 'sell');       -- Hyperliquid fills: 'B' -> buy, 'A' -> sell
 -- = app.execution.ports ORDER_* constants (+ 'cancelled')
@@ -313,11 +314,14 @@ CREATE TABLE subscriptions (
     cum_pnl_micro           bigint NOT NULL DEFAULT 0,
     pnl_cursor              timestamptz,                       -- attributed PnL settled up to (exclusive)
     consecutive_rejections  integer NOT NULL DEFAULT 0 CHECK (consecutive_rejections >= 0), -- circuit breaker §5.4
-    cancelled_at            timestamptz
+    cancel_positions        cancel_positions_mode,             -- SPEC §12: chosen on cancel (NULL until then)
+    cancelled_at            timestamptz,
+    CONSTRAINT subscriptions_closing_means_close CHECK (status <> 'closing' OR cancel_positions IS NOT DISTINCT FROM 'close')
 );
 -- ONE live subscription per trading address (positions would otherwise collide on the same account).
+-- 'closing' still occupies the address until its positions are flat (SPEC §12).
 CREATE UNIQUE INDEX subscriptions_one_live_per_address ON subscriptions (trading_address)
-    WHERE status IN ('pending', 'active', 'past_due', 'reduce_only');
+    WHERE status IN ('pending', 'active', 'past_due', 'reduce_only', 'closing');
 CREATE INDEX subscriptions_user_idx ON subscriptions (user_id);
 CREATE INDEX subscriptions_strategy_status_idx ON subscriptions (strategy_id, status);
 CREATE INDEX subscriptions_version_status_idx ON subscriptions (strategy_version_id, status);

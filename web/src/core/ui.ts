@@ -394,6 +394,7 @@ export function statusBadge(state: string | null | undefined): HTMLElement {
     case "trades": return badge("Trades", "good");
     case "holds": return badge("Holds — no active signals", "muted");
     case "not_live_proven": return badge("Not live-proven", "warn");
+    case "free_showcase": return badge("Free showcase", "info");
     default: return badge(state ? String(state) : "Unknown", "muted");
   }
 }
@@ -404,6 +405,7 @@ export function subStatusBadge(status: string): HTMLElement {
     active: ["Active", "good"],
     past_due: ["Past due", "warn"],
     reduce_only: ["Exits only", "bad"],
+    closing: ["Closing positions…", "warn"],
     paused_user: ["Paused", "muted"],
     cancelled: ["Cancelled", "muted"],
   };

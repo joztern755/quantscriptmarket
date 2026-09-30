@@ -195,6 +195,10 @@ class ForbiddenConstructTests(unittest.TestCase):
         "statistics_random": "import statistics\nx = statistics.NormalDist(0, 1).samples(3)",
         "statistics_sys": "import statistics\nx = statistics.sys.modules",
         "except_as_dunder": "try:\n    pass\nexcept Exception as __e:\n    pass",
+        # identifiers are NFKC-normalised by the parser, so look-alikes are caught (or don't parse)
+        "unicode_open": "x = \uff4f\uff50\uff45\uff4e('/etc/passwd')",
+        "unicode_dunder_attr": "x = bars.\uff3f\uff3fclass\uff3f\uff3f",
+        "unicode_getattr": "x = \U0001d420etattr(bars, 'x')",
     }
 
     def test_each_case_rejected_with_line(self):

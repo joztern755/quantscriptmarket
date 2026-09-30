@@ -74,17 +74,17 @@
 .stars { color: var(--accent); letter-spacing: .1em; font-family: var(--mono); }
 .post-item { display: flex; flex-direction: column; gap: 4px; padding: 12px 0; border-top: 1px solid var(--line); min-width: 0; }
 .post-item a.title { font-weight: 600; text-decoration: none; overflow-wrap: anywhere; }
-.prose { max-width: 72ch; overflow-wrap: anywhere; }
+.prose { overflow-wrap: anywhere; }
 .prose h2 { font-size: 1.35rem; margin: 1.4em 0 .5em; }
 .prose h3 { font-size: 1.12rem; margin: 1.2em 0 .4em; }
 .prose h4 { font-size: 1rem; margin: 1em 0 .3em; }
 .prose p, .prose ul, .prose ol, .prose blockquote { margin: 0 0 .9em; }
 .prose ul, .prose ol { padding-left: 1.3em; }
-.prose blockquote { border-left: 3px solid var(--line-strong); padding-left: 12px; color: var(--muted); }
 .prose code { font-family: var(--mono); background: var(--sunk); padding: 1px 4px; border-radius: 4px; font-size: .9em; }
 .prose hr { border: 0; border-top: 1px solid var(--line); margin: 1.4em 0; }
 
 /* forms */
+.fl { font-size: .8rem; font-weight: 600; color: var(--muted); }
 .page textarea { width: 100%; min-width: 0; }
 textarea.code { font: 12.5px/1.5 var(--mono); min-height: 280px; tab-size: 4; white-space: pre; overflow: auto; }
 .form-grid { display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr); }

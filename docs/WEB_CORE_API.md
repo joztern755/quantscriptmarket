@@ -239,7 +239,7 @@ subscribeGate(opts: {
 }): Promise<boolean>
   // Modal: strategy-specific risk acknowledgement + fee summary (builder fee 0.1% of notional, monthly
   // price, profit share = creator% + platform 1.5% (on_top) or carved out) + Terms/Risk again. Each box
-  // required. On accept POSTs consents {doc: "subscription_ack"|"terms"|"risk", context: "subscribe",
+  // required. On accept POSTs consents {doc: "subscription_ack"|"terms"|"risk"|"waiver", context: "subscribe",
   // strategy_id} to /v1/consents and resolves true; resolves false if dismissed.
 feeSummary(cfg: PublicConfig, s: {price_monthly_micro, profit_share_bps}): { label: string; value: string; note?: string }[]
 ```
@@ -312,6 +312,12 @@ fmtDate(iso | ms): string  // "30 Sep 2026" (UTC) ; fmtDateTime(): "30 Sep 2026,
 - `core/stripe.ts`: `loadStripe(): Promise<StripeLike>` (loads https://js.stripe.com/v3/ once with `publicConfig().stripe_publishable_key`);
   `estimateStripeCredit(cfg, amountMicro) → { feeMicro, creditMicro, estimated }` (fee rounded UP; null when config has no estimate);
   `stripeFeeNotice(cfg, amountMicro?) → string` — REQUIRED wording on every Stripe deposit UI: credit = amount paid − actual processor fee (estimate shown as an estimate).
+- `core/subscriptions.ts` (SPEC §12 cancel flow): `cancelButtons(sub: {id, strategy_name, markets}, onDone?(mode)) → HTMLElement`
+  renders the two required buttons "Close positions and cancel" / "Leave positions open and cancel"; each runs
+  `cancelSubscription(sub, mode)`: confirm → second confirm restating the consequence → `stepUp()` →
+  `DELETE /v1/subscriptions/{id}` body `{"positions": "close"|"leave"}` → toast → `showRevokeAgentGuidance()`.
+  `subStatusBadge("closing")` → "Closing positions…". `statusBadge("free_showcase")` → "Free showcase".
+  `api.del(path, { body })` sends a JSON body.
 - `core/keccak.ts`: `keccak256(bytes|string)`, `toChecksumAddress(addr)`, `isAddress(x)`.
 - `core/qr.ts`: `qrSvg(text: string, opts?: { ecc?: "L"|"M"|"Q"|"H"; size?: number }): SVGSVGElement`.
 - `core/router.ts`: `navigate(to, {replace?})`, `currentPath()`, `ROUTES`, types `PageContext`, `PageName`, `PageModule`.
@@ -324,3 +330,28 @@ fmtDate(iso | ms): string  // "30 Sep 2026" (UTC) ; fmtDateTime(): "30 Sep 2026,
 - `POST /v1/wallets/nonce` → `{"nonce": "<≥16 chars alnum>"}` (NOT in SPEC §8 yet); `POST /v1/wallets/verify` `{address, message, signature}`; server must rebuild/parse the SIWE message and check domain `aijalon.trade`, nonce, issued-at freshness.
 - Referral: `?ref=CODE` captured first-touch for 30 days, sent once after sign-in via `PATCH /v1/me {"referral_code_used": "CODE"}`.
 - `GET /v1/me` returns `Me` (above). `401 mfa_required` when the token has no second factor.
+
+## 12. Build, tests, deployment notes
+- `node web/build.mjs` — fails on any tsc error, and on any `innerHTML`/`outerHTML`/`insertAdjacentHTML`/
+  `document.write`/`eval`/`new Function` in emitted JS (pages included). Emits `dist/csp.txt` and
+  `dist/headers.json` (CSP incl. `frame-ancestors 'none'`, HSTS preload, nosniff, Referrer-Policy
+  strict-origin, COOP same-origin-allow-popups) for `infra/firebase.json`; the same CSP (minus
+  header-only directives) is in a `<meta>` in index.html. No inline scripts (theme bootstrap is
+  `theme-init.js`). Entry JS/CSS get `?v=<hash>`; inner modules should be served `Cache-Control: no-cache`.
+- Firebase SRI: put `web/sri.json` = `{"version":"12.3.0","firebase-app.js":"sha384-…","firebase-auth.js":"sha384-…"}`
+  → build emits an import map with `integrity` (and its CSP hash). Without it the build warns.
+- `node web/tests/core.test.mjs` — format, keccak/EIP-55, QR (vs independent encoder), HL builders/validation.
+- `node web/tests/smoke.mjs [--shots dir]` — Playwright, 1920×1080 + 390×844, light + dark (see file header).
+
+## 13. Unverified / to check before go-live
+- Firebase JS SDK version `12.3.0` (app-config.json `firebaseSdkVersion`) — no network here to confirm it
+  exists on gstatic; set the real latest version + SRI hashes.
+- Firebase: ID token after TOTP enrolment is assumed to carry `sign_in_second_factor`; if not, core signs
+  the user out and asks for a fresh sign-in (handled, but confirm). `authDomain` should be `aijalon.trade`
+  (Hosting serves `/__/auth/*`) so redirect sign-in works in Safari/ITP.
+- Hyperliquid: action JSON key order copied from memory of the Python SDK (fields first, then
+  `type` for builder-fee/usdSend, then appended `signatureChainId`, `hyperliquidChain`); EIP-712 types per
+  SPEC §6. No live signature was tested. `maxFeeRate` format `"0.1%"`.
+- "Revoke agent" guidance links to https://app.hyperliquid.xyz/API (page location unverified).
+- CSP allowances for Stripe wallets (Apple Pay / Google Pay may need extra hosts) and Firebase popups
+  (`apis.google.com`) should be confirmed on staging with the browser console open.

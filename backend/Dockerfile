@@ -33,8 +33,8 @@ RUN python -m venv /opt/venv \
       echo "ERROR: backend/requirements.lock missing — run 'make lock' and commit it" >&2; exit 1; \
     fi \
  && /opt/venv/bin/pip check \
- # pip/setuptools are not needed at runtime: remove them from the venv (smaller attack surface)
- && /opt/venv/bin/pip uninstall -y pip setuptools wheel >/dev/null 2>&1 || true
+ && (/opt/venv/bin/pip uninstall -y pip setuptools wheel >/dev/null 2>&1 || true)
+# ^ pip/setuptools are not needed at runtime: removed from the venv (smaller attack surface)
 
 # ---------------------------------------------------------------------------------------------- runtime
 FROM ${PYTHON_IMAGE} AS runtime
@@ -44,7 +44,6 @@ ENV PATH=/opt/venv/bin:$PATH \
     PYTHONPATH=/srv \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONHASHSEED=random \
     SERVICE_ROLE=api \
     PORT=8080
 # Non-root runtime user; no home, no shell. Remove the system pip too (nothing installs at runtime).
