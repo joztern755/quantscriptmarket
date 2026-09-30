@@ -289,7 +289,7 @@ jobs:
           gh api "repos/${GITHUB_REPOSITORY}/dependency-graph/sbom" > sbom.spdx.json \
             || { echo "::warning::dependency graph SBOM unavailable (enable the dependency graph in repo settings)"; exit 0; }
           python3 -c "import json;d=json.load(open('sbom.spdx.json'));print(len(d['sbom'].get('packages',[])),'packages')"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: hashFiles('sbom.spdx.json') != ''
         with:
           name: sbom-spdx
