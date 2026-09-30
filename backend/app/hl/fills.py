@@ -121,8 +121,10 @@ def parse_fill(raw: Mapping[str, Any]) -> Fill:
 
 @dataclass(frozen=True)
 class SubscriptionWindow:
-    """Fallback attribution when a platform-prefixed fill's cloid is missing from the orders table (crash between
-    placing and recording). SPEC §4 allows one active subscription per trading address."""
+    """A subscription's (address, coins, time) window. REVIEW_MONEY H2: NEVER used to attribute PnL or builder fees any
+    more (a user can put our cloid prefix on their own orders); only as an ALERT hint for a platform-prefixed fill
+    whose cloid is missing from the orders table, and to find the subscription whose book a foreign fill affects.
+    SPEC §4 allows one active subscription per trading address."""
     subscription_id: str
     trading_address: str
     coins: frozenset[str]
@@ -139,7 +141,8 @@ class AttributedFill:
     subscription_id: str
     trading_address: str
     fill: Fill
-    via: str                      # "cloid" | "window"
+    via: str                      # "cloid" (the only attribution: cloid of an order WE recorded)
+    oid_verified: bool = False    # the fill's oid equals the oid recorded for that cloid (or none was recorded yet)
 
     @property
     def net_pnl_micro(self) -> int:
@@ -149,9 +152,15 @@ class AttributedFill:
 @dataclass
 class FillAttribution:
     attributed: list[AttributedFill] = field(default_factory=list)
-    ours_unmatched: list[Fill] = field(default_factory=list)   # our prefix, no subscription found → ALERT
-    foreign: list[Fill] = field(default_factory=list)          # user's own trades / other apps: ignored
+    ours_unmatched: list[Fill] = field(default_factory=list)   # our prefix, no recorded order → ALERT; NOT ours
+    oid_mismatch: list[Fill] = field(default_factory=list)     # recorded cloid but another oid → forged → ALERT
+    foreign: list[Fill] = field(default_factory=list)          # user's own trades / other apps
     rejected: list[tuple[Mapping[str, Any], str]] = field(default_factory=list)  # unparseable / non-USDC / spot
+    window_hints: dict[int, str] = field(default_factory=dict)  # tid of an unmatched prefixed fill → covering sub
+
+    def not_ours(self) -> list[Fill]:
+        """Every parsed perp fill that is not one of our recorded orders (foreign + forged/unmatched prefixed)."""
+        return sorted(self.foreign + self.ours_unmatched + self.oid_mismatch, key=lambda f: (f.time_ms, f.tid))
 
     def by_subscription(self) -> dict[str, list[AttributedFill]]:
         out: dict[str, list[AttributedFill]] = {}
@@ -162,13 +171,18 @@ class FillAttribution:
 
 def attribute_fills(raw_fills: Iterable[Mapping[str, Any]], *, trading_address: str,
                     cloid_to_subscription: Mapping[str, str],
-                    windows: Sequence[SubscriptionWindow] = ()) -> FillAttribution:
-    """Attribute one trading address's fills. Only perp fills in USDC carrying OUR cloid prefix count; the
-    orders table (cloid → subscription) is authoritative, ``windows`` is the crash fallback. Duplicate tids
-    (overlapping pages) are dropped."""
+                    windows: Sequence[SubscriptionWindow] = (),
+                    cloid_to_oid: Mapping[str, int | None] | None = None) -> FillAttribution:
+    """Attribute one trading address's fills (REVIEW_MONEY H2). A fill is ours ONLY when its cloid is the cloid of an
+    order WE recorded (orders table: cloid → subscription) and, when that order's exchange-assigned oid is known
+    (``cloid_to_oid``), the fill's oid equals it; an order without a recorded oid (crash window) is accepted on its
+    secret-keyed cloid and the caller records the fill's oid on it (``oid_verified``). A platform-prefixed cloid that
+    is not in the orders table is NOT attributed (``ours_unmatched``, alert; ``windows`` only give a hint in
+    ``window_hints``). Only perp fills with a USDC fee count. Duplicate tids (overlapping pages) are dropped."""
     out = FillAttribution()
     seen: set[int] = set()
     cmap = {k.lower(): v for k, v in cloid_to_subscription.items()}
+    omap = {k.lower(): v for k, v in (cloid_to_oid or {}).items()}
     addr = trading_address.lower()
     for raw in raw_fills:
         try:
@@ -189,15 +203,20 @@ def attribute_fills(raw_fills: Iterable[Mapping[str, Any]], *, trading_address: 
             out.rejected.append((raw, f"fee token {f.fee_token!r} not USDC"))
             continue
         sub = cmap.get(f.cloid or "")
-        via = "cloid"
         if sub is None:
             hits = [w for w in windows if w.covers(addr, f.coin, f.time_ms)]
             if len(hits) == 1:
-                sub, via = hits[0].subscription_id, "window"
-        if sub is None:
+                out.window_hints[f.tid] = hits[0].subscription_id
             out.ours_unmatched.append(f)
             continue
-        out.attributed.append(AttributedFill(sub, addr, f, via))
+        verified = False
+        if cloid_to_oid is not None:
+            recorded = omap.get(f.cloid or "")
+            if recorded is not None and int(recorded) != f.oid:
+                out.oid_mismatch.append(f)
+                continue
+            verified = True
+        out.attributed.append(AttributedFill(sub, addr, f, "cloid", verified))
     out.attributed.sort(key=lambda a: (a.fill.time_ms, a.fill.tid))
     return out
 

@@ -279,6 +279,9 @@ def credit_from_detection(
         return out
     if verified_at_for_address is not None and not det.user_id:
         va = verified_at_for_address(det.from_address)
+        if isinstance(va, str):
+            from datetime import datetime
+            va = datetime.fromisoformat(va.replace("Z", "+00:00"))
         va_ms = int(va.timestamp() * 1000) if hasattr(va, "timestamp") else (int(va) if va is not None else None)
         if va_ms is None or int(det.time_ms or 0) < va_ms - int(verification_skew_ms):
             out.held = "transfer predates the wallet's verification"
