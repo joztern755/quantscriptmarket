@@ -1,0 +1,25 @@
+# gitleaks configuration for CI (.github/workflows/ci.yml sets GITLEAKS_CONFIG to this file).
+# Default rules stay on; the allowlists below are deliberately NARROW: fake values in unit tests and
+# browser-storage key names. A real-looking secret anywhere else — including a real key pasted into a test —
+# still fails CI. Review every change to this file like a change to production credentials.
+title = "aijalon.trade gitleaks config"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Obviously fake Stripe keys in backend unit tests"
+condition = "AND"
+paths = ['''^backend/tests/''']
+regexes = ['''^(sk|rk|pk|whsec)_(test|live)_(abcdefgh[a-z0-9]*|abcdefghijk)$''']
+
+[[allowlists]]
+description = "Fixed test tokens in backend unit tests (generic-api-key only)"
+targetRules = ["generic-api-key"]
+paths = ['''^backend/tests/test_[a-z_]+\.py$''']
+
+[[allowlists]]
+description = "localStorage / sessionStorage key names in the SPA are not secrets"
+condition = "AND"
+paths = ['''^web/(src|dist)/''']
+regexes = ['''^aij\.[a-z_.]+\.v[0-9]+$''']

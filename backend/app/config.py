@@ -120,6 +120,10 @@ class Settings:
     stripe_fee_estimate_fixed_micro: int
     ops_emails: tuple[str, ...]
     email_from: str
+    telegram_webhook_secret: str                    # X-Telegram-Bot-Api-Secret-Token for /v1/webhooks/telegram
+    telegram_bot_username: str                      # for t.me/<bot>?start=<token> link
+    sandbox_url: str                                # Cloud Run sandbox service URL
+    sandbox_shared_secret: str                      # X-Sandbox-Secret (plus Cloud Run IAM)
     economics: Economics = field(default_factory=Economics)
     risk: RiskLimits = field(default_factory=RiskLimits)
 
@@ -182,10 +186,19 @@ def get_settings() -> Settings:
         stripe_fee_estimate_fixed_micro=usd(os.environ.get("STRIPE_FEE_ESTIMATE_FIXED_USD", "0")),
         ops_emails=tuple(e.strip() for e in os.environ.get("OPS_EMAILS", "").split(",") if e.strip()),
         email_from=os.environ.get("EMAIL_FROM", "alerts@aijalon.trade"),
+        telegram_webhook_secret=os.environ.get("TELEGRAM_WEBHOOK_SECRET", ""),
+        telegram_bot_username=os.environ.get("TELEGRAM_BOT_USERNAME", ""),
+        sandbox_url=os.environ.get("SANDBOX_URL", ""),
+        sandbox_shared_secret=os.environ.get("SANDBOX_SHARED_SECRET", ""),
     )
     if s.is_prod:
-        missing = [k for k in ("builder_address", "treasury_address", "kms_key_name", "firebase_project_id", "signals_pubkey_b64",
-                                "audit_pepper_b64", "edge_auth_secret", "service_role") if not getattr(s, k)]
+        required = ["builder_address", "treasury_address", "kms_key_name", "firebase_project_id", "signals_pubkey_b64",
+                    "audit_pepper_b64", "service_role"]
+        if s.service_role == "api":
+            required += ["edge_auth_secret", "telegram_webhook_secret", "sandbox_url", "sandbox_shared_secret"]
+        if s.service_role == "executor":
+            required += ["sandbox_url", "sandbox_shared_secret"]
+        missing = [k for k in required if not getattr(s, k)]
         if missing:
             raise RuntimeError(f"prod config missing: {missing}")
         if s.local_dev_kek_b64:

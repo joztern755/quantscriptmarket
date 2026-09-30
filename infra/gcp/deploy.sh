@@ -29,6 +29,7 @@ export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 : "${LAUNCH_PHASE:=internal}"
 : "${ALLOWLIST_EMAILS:=${OWNER_EMAIL}}"
 : "${PAYOUTS_ENABLED:=false}"
+: "${OPS_EMAILS:=${ALERT_EMAIL}}"
 : "${SANDBOX_DOCKERFILE:=sandbox/Dockerfile}"
 : "${SANDBOX_CONTEXT:=.}"               # build context for the sandbox image, relative to the repo root
 GIT_SHA_SHORT="${GIT_SHA:0:12}"
@@ -43,7 +44,7 @@ export_render_env() {
   export PROJECT_ID REGION GIT_SHA_SHORT VPC RUN_SUBNET RUN_NET_TAG SANDBOX_VPC SANDBOX_SUBNET SANDBOX_NET_TAG \
     SANDBOX_EXEC_ENV SANDBOX_CONNECTOR SA_API SA_EXECUTOR SA_SANDBOX SA_SCHEDULER SA_MIGRATOR KMS_KEY_NAME DB_NAME \
     WEB_DOMAIN API_DOMAIN SQL_CONNECTION_NAME CLOUDSQL_PROXY_IMAGE DB_MIGRATOR_USER MIGRATE_CMD \
-    LAUNCH_PHASE ALLOWLIST_EMAILS PAYOUTS_ENABLED STRIPE_PUBLISHABLE_KEY
+    LAUNCH_PHASE ALLOWLIST_EMAILS PAYOUTS_ENABLED STRIPE_PUBLISHABLE_KEY OPS_EMAILS
   DB_IAM_USER_API_URLENC="$(urlenc_at "${DB_IAM_USER_API}")"
   DB_IAM_USER_EXECUTOR_URLENC="$(urlenc_at "${DB_IAM_USER_EXECUTOR}")"
   BACKEND_IMAGE="$(state_get BACKEND_IMAGE)"
@@ -59,8 +60,11 @@ cmd_preflight() {
   log "preflight"
   local bad=0
   [[ -f "${REPO_ROOT}/backend/requirements.lock" ]] || { warn "backend/requirements.lock missing (make lock)"; bad=1; }
-  if grep -q 'PIN_ME' "${REPO_ROOT}/backend/Dockerfile" "${HERE}/env.sh"; then
+  if grep -q 'sha256:PIN_ME' "${REPO_ROOT}/backend/Dockerfile" "${HERE}/env.sh"; then
     warn "image digests not pinned (PIN_ME) in backend/Dockerfile or infra/gcp/env.sh (make pin)"; bad=1
+  fi
+  if [[ -f "${REPO_ROOT}/${SANDBOX_DOCKERFILE}" ]] && grep -Eq '^FROM [^@ ]+( |$)' "${REPO_ROOT}/${SANDBOX_DOCKERFILE}"; then
+    warn "${SANDBOX_DOCKERFILE}: base image not pinned by digest (go-live gate G1)"
   fi
   [[ -n "${DB_PRIVATE_IP:-}" ]] || { warn "DB_PRIVATE_IP (GitHub variable) is empty"; bad=1; }
   [[ "${STRIPE_PUBLISHABLE_KEY:-}" =~ ^pk_(live|test)_ ]] || { warn "STRIPE_PUBLISHABLE_KEY (GitHub variable) missing"; bad=1; }

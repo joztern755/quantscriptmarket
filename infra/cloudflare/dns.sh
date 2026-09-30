@@ -17,6 +17,7 @@
 #                         while Cloudflare proxies the name. SSL mode Full (strict) validates it.
 #
 # Inputs (environment):
+#   EMAIL_DNS_RECORDS          optional. Lines "TYPE|NAME|VALUE" the e-mail provider (Resend) asks for.
 #   CLOUDFLARE_API_TOKEN       required. Scoped to zone aijalon.trade only (permissions in docs/DEPLOY.md §8).
 #   FIREBASE_A_RECORDS         required. Space-separated IPv4(s) Firebase shows under Hosting > Add custom domain
 #                              (or `firebase hosting:sites:get` / console) for aijalon.trade, e.g. "199.36.158.100".
@@ -102,19 +103,25 @@ set_records() {
     if [[ "${keep}" == 0 && "${EXCLUSIVE:-1}" == 1 ]]; then log "  delete ${type} ${name} ${v}"; cf DELETE "/zones/${ZONE_ID}/dns_records/${id}" >/dev/null; fi
   done < <(printf '%s' "${existing}" | python3 -c '
 import json,sys
-for r in json.load(sys.stdin): print(r["id"]+"\t"+r["content"].replace("\"",""))')
+for r in json.load(sys.stdin):
+    c=r["content"].replace("\"","")
+    if r["type"]=="MX": c=str(r.get("priority"))+" "+c
+    print(r["id"]+"\t"+c)')
   # create or update wanted
   for w in "${want[@]}"; do
     id="$(printf '%s' "${existing}" | python3 -c '
 import json,sys
 w=sys.argv[1].replace("\"","")
-print(next((r["id"] for r in json.load(sys.stdin) if r["content"].replace("\"","")==w),""))' "${w}")"
+key=lambda r: (str(r.get("priority"))+" " if r["type"]=="MX" else "")+r["content"].replace("\"","")
+print(next((r["id"] for r in json.load(sys.stdin) if key(r)==w),""))' "${w}")"
     local body
     body="$(python3 -c '
 import json,sys
 t,n,p,c=sys.argv[1:5]
 r={"type":t,"name":n,"content":c,"ttl":1 if p=="true" else 300,"proxied":p=="true"}
 if t=="TXT": r["content"]="\""+c+"\""
+if t=="MX":
+    prio,host=c.split(" ",1); r["content"]=host; r["priority"]=int(prio); r.pop("proxied")
 if t=="CAA":
     flags,tag,val=c.split(" ",2); r.pop("content"); r["data"]={"flags":int(flags),"tag":tag,"value":val.strip("\"")}
 if t in ("TXT","CAA"): r.pop("proxied")
@@ -148,8 +155,17 @@ set_records CNAME "${API_CERT_DNS_AUTH_NAME%.}" false "${API_CERT_DNS_AUTH_VALUE
 log "DNS: CAA (Let's Encrypt for Firebase, Google Trust Services for the LB cert; Cloudflare adds its own CAs)"
 set_records CAA "${ZONE_NAME}" false '0 issue "letsencrypt.org"' '0 issue "pki.goog"' '0 iodef "mailto:app.aijalon@gmail.com"'
 log "DNS: DMARC (${DMARC_POLICY})"
-set_records TXT "_dmarc.${ZONE_NAME}" false "v=DMARC1; p=${DMARC_POLICY}; adkim=s; aspf=s; rua=mailto:app.aijalon@gmail.com"
-warn "the apex SPF is 'v=spf1 -all' (no mail). When you add an e-mail provider, replace it with the provider's SPF."
+set_records TXT "_dmarc.${ZONE_NAME}" false "v=DMARC1; p=${DMARC_POLICY}; adkim=s; aspf=r; rua=mailto:app.aijalon@gmail.com"
+if [[ -n "${EMAIL_DNS_RECORDS:-}" ]]; then
+  # Provider records exactly as the provider shows them (Resend: DKIM TXT resend._domainkey, and on the
+  # send.<domain> return-path subdomain an MX + SPF TXT). One per line:  TYPE|NAME|VALUE   (MX VALUE = "10 host")
+  log "DNS: e-mail provider records"
+  while IFS='|' read -r t n v; do
+    [[ -z "${t}" || "${t}" == \#* ]] && continue
+    EXCLUSIVE=0 set_records "${t}" "${n}" false "${v}"
+  done <<<"${EMAIL_DNS_RECORDS}"
+fi
+log "apex SPF stays 'v=spf1 -all': Resend sends with DKIM d=${ZONE_NAME} (DMARC aligned) and uses send.${ZONE_NAME} for SPF."
 
 # ---- zone settings ---------------------------------------------------------------------------------------
 setting() { cf PATCH "/zones/${ZONE_ID}/settings/$1" "{\"value\":$2}" >/dev/null && log "  $1 = $2"; }
@@ -195,12 +211,14 @@ r=[
   "expression":f"({h} and starts_with(http.request.uri.path, \"/v1/internal/\"))"},
  {"description":"api: only /v1/* and /healthz exist","action":"block",
   "expression":f"({h} and not starts_with(http.request.uri.path, \"/v1/\") and http.request.uri.path ne \"/healthz\")"},
+ {"description":"api: Telegram bot webhook only from the published Telegram ranges","action":"block",
+  "expression":f"({h} and http.request.uri.path eq \"/v1/webhooks/telegram\" and not ip.src in {{149.154.160.0/20 91.108.4.0/22}})"},
  {"description":"api: allowed methods only","action":"block",
   "expression":f"({h} and not http.request.method in {{\"GET\" \"POST\" \"PATCH\" \"PUT\" \"DELETE\" \"OPTIONS\" \"HEAD\"}})"},
 ]
 if geo=="1":
   r.append({"description":"api: restricted jurisdictions (webhooks and health exempt)","action":"block",
-   "expression":f"({h} and ip.src.country in {{{countries.strip()}}} and not http.request.uri.path in {{\"/v1/webhooks/stripe\" \"/healthz\"}})"})
+   "expression":f"({h} and ip.src.country in {{{countries.strip()}}} and not http.request.uri.path in {{\"/v1/webhooks/stripe\" \"/v1/webhooks/telegram\" \"/healthz\"}})"})
 for x in r: x["enabled"]=True
 print(json.dumps(r))' "${H}" "${countries}" "${GEO_BLOCK}")"
 put_phase http_request_firewall_custom "${rules}"
@@ -211,7 +229,7 @@ import json,sys
 h,plan=sys.argv[1:3]
 free = plan=="free"
 r=[{"description":"api: per-IP ceiling","action":"block","enabled":True,
-    "expression":f"({h} and http.request.uri.path ne \"/v1/webhooks/stripe\")",
+    "expression":f"({h} and not http.request.uri.path in {{\"/v1/webhooks/stripe\" \"/v1/webhooks/telegram\"}})",
     "ratelimit":{"characteristics":["cf.colo.id","ip.src"],"period":10,"requests_per_period":50,"mitigation_timeout":10}}]
 if not free:
   r[0]["ratelimit"]={"characteristics":["cf.colo.id","ip.src"],"period":60,"requests_per_period":300,"mitigation_timeout":600}

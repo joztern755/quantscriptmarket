@@ -122,6 +122,7 @@ SECRETS_SPEC=(
   "SIGNALS_PUBKEY_B64|api executor|0"
   "AUDIT_PEPPER|api executor|1"
   "EDGE_AUTH_SECRET|api|1"
+  "TELEGRAM_WEBHOOK_SECRET|api|1"      # Telegram setWebhook secret_token; checked on /v1/webhooks/telegram
   "BUILDER_ADDRESS|api executor|0"
   "TREASURY_ADDRESS|api executor|0"
   "DB_MIGRATOR_PASSWORD|migrator|1"
@@ -140,6 +141,7 @@ SCHEDULER_SPEC=(
   "reconcile|7 * * * *|reconcile|900s|1"
   "deposits-scan|* * * * *|deposits-scan|120s|0"
   "referral-tiers|15 1 * * *|referral-tiers|900s|3"
+  "candles-sync|5 * * * *|candles-sync|900s|1"
 )
 
 # ---- Workload Identity Federation ------------------------------------------------------------------------
@@ -156,3 +158,39 @@ die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 # utc_in_days N -> RFC3339 timestamp N days from now (portable: GNU and BSD date both lack a common flag)
 utc_in_days() { python3 -c "import datetime,sys;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=int(sys.argv[1]))).strftime('%Y-%m-%dT%H:%M:%SZ'))" "$1"; }
+
+# sql_user_password INSTANCE USER  (password on STDIN) — creates the built-in user or sets its password through
+# the Cloud SQL Admin REST API, so the password never appears in argv or in gcloud's own command logs
+# (~/.config/gcloud/logs records the arguments of `gcloud sql users ... --password=`).
+sql_user_password() {
+  SQLPW_TOKEN="$(gcloud auth print-access-token)" SQLPW_PROJECT="${PROJECT_ID}" SQLPW_INSTANCE="$1" SQLPW_USER="$2" \
+  python3 -c '
+import json, os, sys, time, urllib.error, urllib.parse, urllib.request
+pw = sys.stdin.read()
+if not pw:
+    sys.exit("sql_user_password: empty password on stdin")
+p, i, u, tok = (os.environ[k] for k in ("SQLPW_PROJECT", "SQLPW_INSTANCE", "SQLPW_USER", "SQLPW_TOKEN"))
+base = f"https://sqladmin.googleapis.com/v1/projects/{p}"
+def call(method, url, body=None):
+    req = urllib.request.Request(url, method=method, data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read() or b"{}")
+body = {"name": u, "password": pw}
+try:
+    op = call("PUT", f"{base}/instances/{i}/users?name={urllib.parse.quote(u)}", body)      # users.update
+except urllib.error.HTTPError as e:
+    if e.code != 404:
+        sys.exit(f"users.update {u}: HTTP {e.code}")
+    op = call("POST", f"{base}/instances/{i}/users", body)                                   # users.insert
+opname = op.get("name", "")
+for _ in range(120):
+    st = call("GET", base + "/operations/" + opname)
+    if st.get("status") == "DONE":
+        err = st.get("error")
+        if err:
+            sys.exit("sql user " + u + ": " + json.dumps(err))
+        sys.exit(0)
+    time.sleep(2)
+sys.exit(f"sql user {u}: operation did not finish")'
+}

@@ -23,7 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = sorted((ROOT / ".github" / "workflows").glob("*.y*ml"))
-IMAGE_FILES = [ROOT / "backend" / "Dockerfile", ROOT / "infra" / "gcp" / "env.sh", *WORKFLOWS]
+IMAGE_FILES = [ROOT / "backend" / "Dockerfile", ROOT / "sandbox" / "Dockerfile", ROOT / "infra" / "gcp" / "env.sh", *WORKFLOWS]
 USES = re.compile(r"^(?P<pre>\s*-?\s*uses:\s*)(?P<repo>[\w.-]+/[\w./-]+)@(?P<ref>[^\s#]+)(?P<post>\s*#\s*(?P<tag>\S+).*)?$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 

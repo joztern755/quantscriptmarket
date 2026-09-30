@@ -322,7 +322,7 @@ sys.exit(1 if bad else 0)' || warn "fix the mismatches above (gcloud sql instanc
     --deletion-protection --insights-config-query-insights-enabled \
     --database-flags="${flags}" --labels=app=aijalon,env=prod "${cmek[@]}"
   # Nobody keeps the built-in superuser password: set a random one and discard it.
-  gcloud sql users set-password postgres --instance="${SQL_INSTANCE}" --password="$(openssl rand -hex 32)" >/dev/null
+  openssl rand -hex 32 | tr -d '\n' | sql_user_password "${SQL_INSTANCE}" postgres
 }
 
 deploy_placeholder() { # service sa ingress [extra gcloud flags...]

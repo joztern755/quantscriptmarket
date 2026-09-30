@@ -25,6 +25,12 @@ extend-exclude = ["migrations"]
 # Blocking in CI. Kept to real-error classes so CI is a signal, not noise; security linting is bandit's job.
 # Tighten over time (B, UP, SIM, PL...) with `ruff check --select X --statistics` first.
 select = ["E4", "E7", "E9", "F", "B006", "B008", "B904", "S102", "S307", "S506", "S602", "S605"]
+ignore = ["E701", "E702", "E741"]   # compact-statement style used deliberately in parts of the codebase
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI dependency markers are evaluated once by design (B008 would flag every endpoint signature)
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Security", "fastapi.Query", "fastapi.Header",
+                          "fastapi.Body", "fastapi.Path", "fastapi.Cookie", "fastapi.File", "fastapi.Form"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "B"]

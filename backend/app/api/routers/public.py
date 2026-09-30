@@ -20,10 +20,7 @@ router = APIRouter(prefix="/public", tags=["public"], dependencies=[ip_limit("pu
 
 UNPROVEN_WARNING = "Backtest of a newly uploaded script can be fitted to history; not proven live yet"
 _PUBLIC_BACKTEST_DROP = ("trades", "latest_signal", "data_notes")
-
-
-def _slug() -> Any:
-    return Path(..., pattern=v.SLUG_RE.pattern, max_length=64)
+SLUG_PATTERN = v.SLUG_RE.pattern
 
 
 def _public_backtest(bt: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -85,7 +82,7 @@ def list_strategies(
 
 
 @router.get("/strategies/{slug}", response_model=S.StrategyDetail)
-def strategy_detail(slug: str = _slug(), svc: Services = Depends(get_services)) -> S.StrategyDetail:
+def strategy_detail(slug: str = Path(..., pattern=SLUG_PATTERN, max_length=64), svc: Services = Depends(get_services)) -> S.StrategyDetail:
     with svc.db.begin() as conn:
         st = svc.store.get_public_strategy(conn, slug)
         if st is None:
@@ -110,7 +107,7 @@ def strategy_detail(slug: str = _slug(), svc: Services = Depends(get_services)) 
 
 
 @router.get("/strategies/{slug}/reviews", response_model=S.Page[S.ReviewOut])
-def strategy_reviews(slug: str = _slug(), limit: int = Query(20, ge=1, le=50),
+def strategy_reviews(slug: str = Path(..., pattern=SLUG_PATTERN, max_length=64), limit: int = Query(20, ge=1, le=50),
                      cursor: Optional[str] = Query(None, max_length=200),
                      svc: Services = Depends(get_services)) -> S.Page[S.ReviewOut]:
     cur = decode_cursor_or_422(cursor)
@@ -198,7 +195,7 @@ def public_config(svc: Services = Depends(get_services)) -> S.PublicConfigOut:
 
 
 @router.get("/showcase/{slug}", response_model=list[S.ShowcaseWalletOut])
-def showcase(slug: str = _slug(), svc: Services = Depends(get_services)) -> list[S.ShowcaseWalletOut]:
+def showcase(slug: str = Path(..., pattern=SLUG_PATTERN, max_length=64), svc: Services = Depends(get_services)) -> list[S.ShowcaseWalletOut]:
     with svc.db.begin() as conn:
         rows = svc.store.showcase(conn, slug, svc.now())
     return [S.ShowcaseWalletOut(**r) for r in rows]

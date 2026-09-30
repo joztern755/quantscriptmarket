@@ -41,7 +41,7 @@ lint:  ## ruff + bandit + mypy (mypy informational)
 	-cd backend && .venv/bin/mypy
 
 test:  ## backend tests (stdlib domain tests first, then pytest)
-	cd backend && python3 -I -m unittest discover -s tests -t . -p 'test_domain_*.py'
+	cd backend && python3 -s -E -m unittest discover -s tests -p 'test_domain_*.py'
 	cd backend && .venv/bin/python -m pytest
 
 audit:  ## pip-audit against the lock
@@ -84,13 +84,13 @@ dns:  ## Cloudflare DNS/TLS/WAF (needs CLOUDFLARE_API_TOKEN, FIREBASE_A_RECORDS,
 deploy:  ## trigger the GitHub deploy workflow (production approval required)
 	gh workflow run deploy.yml -R joztern755/quantscriptmarket --ref main
 
-go-live:  ## resume the Cloud Scheduler jobs (trading starts). Only after every gate in docs/DEPLOY.md §12
+go-live:  ## resume the Cloud Scheduler jobs (trading starts). Only after every gate in docs/DEPLOY.md §14
 	@read -r -p "Resume ALL scheduler jobs in $(PROJECT_ID)? type GO-LIVE: " a; [ "$$a" = "GO-LIVE" ]
-	for j in tick settle-daily ingest-signals reconcile deposits-scan referral-tiers; do \
-	  gcloud scheduler jobs resume $$j --location=$(REGION) --project=$(PROJECT_ID); done
+	source infra/gcp/env.sh; for spec in "$${SCHEDULER_SPEC[@]}"; do j="$${spec%%|*}"; \
+	  gcloud scheduler jobs resume "$$j" --location=$(REGION) --project=$(PROJECT_ID); done
 
 pause-all:  ## emergency: pause every scheduler job (stops ticks; the app kill switch is the finer control)
-	for j in tick settle-daily ingest-signals reconcile deposits-scan referral-tiers; do \
-	  gcloud scheduler jobs pause $$j --location=$(REGION) --project=$(PROJECT_ID); done
+	source infra/gcp/env.sh; for spec in "$${SCHEDULER_SPEC[@]}"; do j="$${spec%%|*}"; \
+	  gcloud scheduler jobs pause "$$j" --location=$(REGION) --project=$(PROJECT_ID); done
 
 .PHONY: help lock pin pin-check venv lint test audit web csp-check csp-sync docker validate bootstrap auth-config db-bootstrap dns deploy go-live pause-all

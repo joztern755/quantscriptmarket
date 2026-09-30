@@ -510,6 +510,10 @@ class SqlStore:
         row = self._one(conn, "SELECT id FROM ledger_accounts WHERE code = :c", c=code)
         return str(row["id"]) if row else None
 
+    def account_code_by_id(self, conn: Any, account_id: str) -> Optional[str]:
+        row = self._one(conn, "SELECT code FROM ledger_accounts WHERE id = CAST(:id AS uuid)", id=account_id)
+        return str(row["code"]) if row else None
+
     def ledger_history(self, conn: Any, code: str, limit: int, cursor: Cursor) -> list[dict]:
         return self._all(conn, """
             SELECT t.id, t.id AS tx_id, t.created_at, t.kind, t.memo, e.amount_micro AS raw_amount_micro
@@ -908,14 +912,14 @@ class SqlStore:
         return self._one(conn, sql, id=change_id)
 
     def decide_change(self, conn: Any, change_id: str, *, status: str, checker: str, now: datetime,
-                      decision_reason: str) -> dict:
+                      decision_reason: str) -> Optional[dict]:
+        """None when the change is no longer pending or checker == maker (four-eyes)."""
         row = self._one(conn, """
             UPDATE admin_changes SET status = :s, checker_admin = CAST(:c AS uuid), decided_at = :t,
                    decision_reason = :dr
              WHERE id = CAST(:id AS uuid) AND status = 'pending' AND maker_admin <> CAST(:c AS uuid)
             RETURNING id, created_at, kind, target, payload, reason, status, maker_admin, checker_admin, decided_at""",
                         s=status, c=checker, t=now, dr=decision_reason, id=change_id)
-        assert row is not None
         return row
 
     def admin_list_strategies(self, conn: Any, status: Optional[str], limit: int, cursor: Cursor) -> list[dict]:

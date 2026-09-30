@@ -39,7 +39,7 @@ jobs:
         run: python3 infra/pin.py check
       - name: Image digests pinned (warning until `make pin` has run; deploy enforces)
         run: |
-          if grep -rn 'PIN_ME' backend/Dockerfile infra/gcp/env.sh; then
+          if grep -rn 'sha256:PIN_ME' backend/Dockerfile infra/gcp/env.sh; then
             echo "::warning::container images not yet pinned by digest — run 'make pin' (deploy refuses PIN_ME)"
           fi
       - name: Lock files present (warning until `make lock` has run; deploy enforces)
@@ -82,6 +82,9 @@ jobs:
       - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .github/gitleaks.toml   # default rules + narrow allowlists for fake test values
+          GITLEAKS_VERSION: "8.30.1"               # pinned (validated against this repo on 2026-09-30)
+          GITLEAKS_ENABLE_COMMENTS: "false"        # read-only token; findings go to the job summary
           # GITLEAKS_LICENSE is only required for organisation-owned repos (this repo is user-owned).
 
   backend:
@@ -119,9 +122,9 @@ jobs:
         run: |
           set -e
           ls tests/test_domain_*.py >/dev/null 2>&1 || { echo "no domain tests yet"; exit 0; }
-          python -I -m unittest discover -s tests -t . -p 'test_domain_*.py' -v
+          python -s -E -m unittest discover -s tests -p 'test_domain_*.py' -v
           if ls tests/test_sandbox_runner.py >/dev/null 2>&1; then
-            python -I -m unittest discover -s tests -t . -p 'test_sandbox_runner.py' -v
+            python -s -E -m unittest discover -s tests -p 'test_sandbox_runner.py' -v
           fi
       - name: Install dependencies (hash-locked when the lock files exist)
         run: |

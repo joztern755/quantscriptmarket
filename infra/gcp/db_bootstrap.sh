@@ -65,12 +65,8 @@ step_db() {
 
 step_users() {
   log "users: ${DB_MIGRATOR_USER} (built-in), ${DB_IAM_USER_API}, ${DB_IAM_USER_EXECUTOR} (IAM)"
-  local pw; pw="$(migrator_password)" || die "DB_MIGRATOR_PASSWORD secret has no value (run bootstrap.sh secrets)"
-  if exists gcloud sql users describe "${DB_MIGRATOR_USER}" --instance="${SQL_INSTANCE}"; then
-    gcloud sql users set-password "${DB_MIGRATOR_USER}" --instance="${SQL_INSTANCE}" --password="${pw}" >/dev/null
-  else
-    gcloud sql users create "${DB_MIGRATOR_USER}" --instance="${SQL_INSTANCE}" --password="${pw}" >/dev/null
-  fi
+  migrator_password >/dev/null || die "DB_MIGRATOR_PASSWORD secret has no value (run bootstrap.sh secrets)"
+  migrator_password | sql_user_password "${SQL_INSTANCE}" "${DB_MIGRATOR_USER}"   # create or set; never in argv
   local u
   for u in "${SA_API}" "${SA_EXECUTOR}"; do
     # gcloud takes the SA e-mail without ".gserviceaccount.com" for IAM service-account users

@@ -762,6 +762,9 @@ FLAG_KEY_PATTERN = (r"^(?:kill_switch_global|new_entries_paused"
 class FlagOut(Out):
     key: str
     value: Any
+    pending_value: Any = None                   # proposed by pending_by; a DIFFERENT admin must approve
+    pending_by: Optional[str] = None
+    pending_at: Optional[datetime] = None
     updated_by: Optional[str] = None
     updated_at: Optional[datetime] = None
 
