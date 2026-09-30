@@ -43,7 +43,7 @@ Version: 2026-09-30 · Source of truth for behaviour: `docs/SPEC.md`. This docum
                    Private Service Access                  Cloud NAT (static IP)
                                   v                               v
           Cloud SQL Postgres 16 "aijalon-pg"          Internet: api.hyperliquid.xyz (Info/Exchange),
-          private IP only, HA regional, CMEK (HSM),   Stripe API, Telegram, e-mail provider,
+          private IP only, zonal→HA, CMEK (HSM),     Stripe API, Telegram, e-mail provider,
           PITR 7d, 30 backups, IAM DB auth, pgaudit   aijalon-terminal.web.app/signals.json (+ .sig)
 
  Cloud KMS keyring "aijalon" (asia-southeast1): agent-keys (HSM, ENCRYPT_DECRYPT, 90-day rotation), cloudsql (CMEK)
@@ -65,7 +65,7 @@ Everything runs in `asia-southeast1` (Singapore). Strategies are daily-bar, so l
 | `executor` | Cloud Run, same image, `create_executor_app` | internal (Scheduler only) | VPC all-traffic → SQL, sandbox, NAT | `aijalon-executor` | min 0 / max 3, 1 vCPU / 2 GiB, concurrency 4, 30 min |
 | `sandbox` | Cloud Run, `sandbox/Dockerfile`, gen1 (gVisor) | internal; invoker = api + executor SAs | isolated VPC with **no** route out | `aijalon-sandbox` (no roles) | min 0 / max 5, 2 vCPU / 2 GiB, 4 concurrent runs, 300 s |
 | `migrate` job | Cloud Run Job, backend image, `python scripts/migrate.py` | — | VPC private ranges → SQL | `aijalon-migrator` | 1 task, 15 min, no retries |
-| Cloud SQL `aijalon-pg` | Postgres 16 Enterprise, 2 vCPU / 8 GB, HA regional | private IP only (PSA) | — | IAM users for api/executor; built-in `migrator` | 200 connections, storage auto-grow |
+| Cloud SQL `aijalon-pg` | Postgres 16 Enterprise; internal phase 1 vCPU / 3.75 GB zonal (owner, cost), public 2 vCPU / 8 GB HA regional | private IP only (PSA) | — | IAM users for api/executor; built-in `migrator` | 200 connections, storage auto-grow |
 | Cloud Scheduler | 13 HTTP jobs, OIDC → executor `/v1/internal/*` (tick, deliver-alerts, deposits-scan, candles-sync, fills-ingest (+ 00:25 pre-settlement run), funding-scan, ingest-signals, reconcile, daily-pnl-summary, settle-daily, referral-tiers, agent-expiry-scan; schedules in DEPLOY §14.1) | — | executor URL | `aijalon-scheduler` | created paused; `make go-live` resumes |
 | Edge | Cloudflare (DNS, WAF, rate limit, Transform Rule) → Global HTTPS LB + Cloud Armor | public | — | — | see `infra/cloudflare/dns.sh` |
 

@@ -58,8 +58,9 @@ SANDBOX_IMAGE_REPO="${AR_HOST}/${PROJECT_ID}/${AR_REPO}/sandbox"
 # ---- Cloud SQL -------------------------------------------------------------------------------------------
 : "${SQL_INSTANCE:=aijalon-pg}"
 : "${SQL_EDITION:=enterprise}"                   # explicit: PG16 otherwise defaults to enterprise-plus
-: "${SQL_TIER:=db-custom-2-8192}"                # 2 vCPU / 8 GB; resize later without data loss
-: "${SQL_STORAGE_GB:=50}"
+: "${SQL_TIER:=db-custom-1-3840}"                # internal phase: 1 vCPU / 3.75 GB (owner 30 Sep 2026); public: db-custom-2-8192
+: "${SQL_AVAILABILITY:=ZONAL}"                   # internal phase: ZONAL (owner, cost); REGIONAL (HA) before Gate C public
+: "${SQL_STORAGE_GB:=20}"
 : "${SQL_MAX_CONNECTIONS:=200}"                  # api 20 inst x 5 + executor 3 x 5 + migrate + headroom
 : "${SQL_ENABLE_CMEK:=1}"                        # SPEC §2 "CMEK": disk encrypted with our HSM key (create-time only)
 : "${DB_NAME:=aijalon}"

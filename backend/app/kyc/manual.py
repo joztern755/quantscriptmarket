@@ -1,6 +1,6 @@
 """Manual KYC for the internal phase: no third-party provider. The creator is told an operator will contact them;
-an admin records the verdict with POST /v1/admin/users/{id}/kyc (approval is maker-checker: a second admin
-approves the ``kyc_approve`` change; rejection is immediate). There is no webhook."""
+an admin records the verdict with POST /v1/admin/users/{id}/kyc (ONE admin decides — owner decision 30 Sep 2026;
+an admin cannot approve their own KYC; rejection is immediate). There is no webhook."""
 from __future__ import annotations
 
 from typing import Mapping, Optional

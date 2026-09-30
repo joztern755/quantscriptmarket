@@ -79,6 +79,7 @@ class KycWebhookHttpTests(unittest.TestCase):
         results = [a["payload"]["result"] for a in world.audit if a["action"] == "kyc.webhook"]
         self.assertEqual(results, ["updated", "unchanged"])
         self.assertEqual([a["kind"] for a in world.alerts if a["user_id"] is None], ["kyc_awaiting_admin"])
+        self.assertEqual([a["payload"]["user_id"] for a in world.alerts if a["kind"] == "kyc_awaiting_admin"], [u["id"]])
 
     def test_api_red_final_rejects_even_if_payload_green(self):
         world, u, c = self.build(answer="RED", reject_type="FINAL")

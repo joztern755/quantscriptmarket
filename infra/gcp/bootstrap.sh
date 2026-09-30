@@ -335,16 +335,18 @@ step_secrets() {
 }
 
 step_sql() {
-  log "Cloud SQL ${SQL_INSTANCE} (Postgres 16, private IP, HA, PITR, 30 backups, IAM auth, CMEK=${SQL_ENABLE_CMEK})"
+  log "Cloud SQL ${SQL_INSTANCE} (Postgres 16, private IP, ${SQL_AVAILABILITY}, PITR, 30 backups, IAM auth, CMEK=${SQL_ENABLE_CMEK})"
   # ^:^ switches gcloud's list delimiter to ':' so pgaudit.log can contain a comma
   local flags="^:^cloudsql.iam_authentication=on:max_connections=${SQL_MAX_CONNECTIONS}:cloudsql.enable_pgaudit=on:pgaudit.log=ddl,role:log_connections=on:log_disconnections=on:log_lock_waits=on:log_min_duration_statement=1000:log_temp_files=0:log_checkpoints=on"
   if exists gcloud sql instances describe "${SQL_INSTANCE}"; then
     log "  instance exists — verifying critical settings (no patch: patching flags restarts the instance)"
-    gcloud sql instances describe "${SQL_INSTANCE}" --format=json | python3 -c '
+    gcloud sql instances describe "${SQL_INSTANCE}" --format=json | python3 - "${SQL_AVAILABILITY}" <<'PY' \
+      || warn "fix the mismatches above (gcloud sql instances patch ...) during a maintenance window"
 import json,sys
 d=json.load(sys.stdin); s=d["settings"]; bad=[]
 if not s.get("deletionProtectionEnabled"): bad.append("deletion protection OFF")
-if s.get("availabilityType")!="REGIONAL": bad.append("not HA (REGIONAL)")
+if s.get("availabilityType")!=sys.argv[1]: bad.append("availability %s != SQL_AVAILABILITY %s" % (s.get("availabilityType"), sys.argv[1]))
+if s.get("availabilityType")!="REGIONAL": print("  NOTE: not HA (ZONAL) — switch to REGIONAL before Gate C (public)")
 b=s.get("backupConfiguration",{})
 if not b.get("pointInTimeRecoveryEnabled"): bad.append("PITR OFF")
 if int(b.get("backupRetentionSettings",{}).get("retainedBackups",0))<30: bad.append("<30 retained backups")
@@ -352,14 +354,15 @@ if s.get("ipConfiguration",{}).get("ipv4Enabled"): bad.append("PUBLIC IP ENABLED
 fl={f["name"]:f["value"] for f in s.get("databaseFlags",[])}
 if fl.get("cloudsql.iam_authentication")!="on": bad.append("cloudsql.iam_authentication not on")
 print("  OK" if not bad else "  MISMATCH: "+"; ".join(bad))
-sys.exit(1 if bad else 0)' || warn "fix the mismatches above (gcloud sql instances patch ...) during a maintenance window"
+sys.exit(1 if bad else 0)
+PY
     return 0
   fi
   local cmek=()
   [[ "${SQL_ENABLE_CMEK}" == "1" ]] && cmek=(--disk-encryption-key="${KMS_SQL_KEY_NAME}")
   gcloud sql instances create "${SQL_INSTANCE}" \
     --database-version=POSTGRES_16 --edition="${SQL_EDITION}" --tier="${SQL_TIER}" --region="${REGION}" \
-    --availability-type=REGIONAL \
+    --availability-type="${SQL_AVAILABILITY}" \
     --storage-type=SSD --storage-size="${SQL_STORAGE_GB}GB" --storage-auto-increase \
     --network="projects/${PROJECT_ID}/global/networks/${VPC}" --no-assign-ip --ssl-mode=ENCRYPTED_ONLY \
     --backup-start-time=18:00 --retained-backups-count=30 \
