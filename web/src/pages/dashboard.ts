@@ -1,7 +1,7 @@
 // #/dashboard[/:tab] — subscriptions (pause/resume/cancel/edit, step-up), positions, PnL per subscription,
 // fee balance + ledger + deposits (USDC UsdSend / Stripe Payment Element) + withdraw (step-up), alerts inbox.
 import type { PageContext } from "../core/router.js";
-import { h, mount, skeleton, errorState, emptyState, note, stat, kv, table, tabs, button, toast, confirmDialog, modal, field, badge, subStatusBadge, type Column, type Child } from "../core/ui.js";
+import { h, mount, skeleton, errorState, emptyState, note, stat, kv, table, tabs, button, toast, confirmDialog, modal, field, badge, subStatusBadge, type Column } from "../core/ui.js";
 import { api, publicConfig, newIdempotencyKey, type PublicConfig } from "../core/api.js";
 import { appConfig } from "../core/config.js";
 import { loadStripe } from "../core/stripe.js";
@@ -251,7 +251,14 @@ async function positionsTab(body: HTMLElement, ctx: PageContext): Promise<void> 
   await load();
 }
 
-/** HL decimal string → "$1,234.56" for display (converted to micro by string math, no float drift). */
+/** Return URL for redirect-based Stripe methods: the site's own origin (never taken from data). */
+function returnUrl(): string {
+  const origin = appConfig().siteOrigin;
+  const base = origin && origin === location.origin ? origin : location.origin;
+  return `${base}${location.pathname}#/dashboard/balance`;
+}
+
+/** HL decimal string → "$1,234.56" — DISPLAY ONLY (float), never used for money math. */
 function dispUsd(v: unknown, sign = false): string {
   const n = hlNum(v);
   if (!Number.isFinite(n)) return "—";
@@ -444,8 +451,7 @@ function depositPanel(ctx: PageContext, cfg: PublicConfig, onDone: () => void): 
           onClick: async () => {
             msg.className = "status";
             msg.textContent = "Processing…";
-            const origin = appConfig().siteOrigin || location.origin;
-            const res = await stripe.confirmPayment({ elements, confirmParams: { return_url: `${location.origin === origin ? origin : location.origin}/#/dashboard/balance` }, redirect: "if_required" });
+            const res = await stripe.confirmPayment({ elements, confirmParams: { return_url: returnUrl() }, redirect: "if_required" });
             if (res.error) {
               msg.className = "status err";
               msg.textContent = res.error.message ?? "Payment failed.";
@@ -587,4 +593,3 @@ function alertItem(ctx: PageContext, a: Alert, reload: () => void): HTMLElement 
   ) as HTMLElement;
 }
 
-export type { Child };
