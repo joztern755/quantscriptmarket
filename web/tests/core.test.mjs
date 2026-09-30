@@ -69,9 +69,14 @@ for (const a of ["0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "0xfB6916095ca1df
 
 // ---- QR vs an independent reference encoder (npm's bundled qrcode-terminal vendor QRCode)
 const require = createRequire(import.meta.url);
-const REF = "/opt/node22/lib/node_modules/npm/node_modules/qrcode-terminal/vendor/QRCode";
+// npm ships next to the running node binary (<prefix>/bin/node → <prefix>/lib/node_modules/npm), e.g. setup-node's
+// toolcache or Homebrew; /opt/node22 is the authoring environment.
+const REF = [
+  join(dirname(process.execPath), "..", "lib", "node_modules", "npm", "node_modules", "qrcode-terminal", "vendor", "QRCode"),
+  "/opt/node22/lib/node_modules/npm/node_modules/qrcode-terminal/vendor/QRCode",
+].find((p) => existsSync(join(p, "index.js"))) ?? "";
 const q = await imp("qr.js");
-if (existsSync(REF)) {
+if (REF) {
   const QRCode = require(`${REF}/index.js`);
   const L = require(`${REF}/QRErrorCorrectLevel.js`);
   const texts = ["otpauth://totp/aijalon.trade:user%40example.com?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=aijalon.trade&algorithm=SHA1&digits=6&period=30"];

@@ -94,7 +94,7 @@ jobs:
     services:
       postgres:
         # pin-image: postgres:16
-        image: postgres:16
+        image: postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres   # throwaway CI container, not a secret
@@ -177,6 +177,19 @@ jobs:
             psql -X -v ON_ERROR_STOP=1 -d aijalon_ci -v db=aijalon_ci \
               -v api_user=ci-api@ci.iam -v executor_user=ci-exec@ci.iam -f ../infra/gcp/sql/$f
           done
+      - name: DB-backed pytest (ledger, store, jobs, alerts, HL budget, executor) on the non-superuser-migrated DB
+        # These tests skip without AIJALON_TEST_* URLs; here they must RUN — any skip fails the step.
+        # Runs after the non-superuser step on purpose: test_integration_exec_db may leave app roles on the cluster.
+        env:
+          AIJALON_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/aijalon_ci
+          AIJALON_TEST_PG_ADMIN_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: |
+          set -o pipefail
+          python -m pytest -rs -p no:cacheprovider tests/test_ledger.py tests/test_api_store_db.py \
+            tests/test_jobs_data_db.py tests/test_alerts_user_db.py tests/test_hl_budget.py \
+            tests/test_integration_exec_db.py | tee "$RUNNER_TEMP/dbpytest.txt"
+          if grep -Eq '[0-9]+ skipped' "$RUNNER_TEMP/dbpytest.txt"; then
+            echo "::error::DB-backed tests were skipped — they must run in CI"; exit 1; fi
       - name: bandit (medium+ severity, medium+ confidence)
         run: bandit -c pyproject.toml -r app -ll -ii
       - name: pip-audit (known vulnerabilities in pinned runtime deps)

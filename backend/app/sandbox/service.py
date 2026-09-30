@@ -235,7 +235,9 @@ def main() -> None:  # pragma: no cover - container entrypoint
     dumpable_off = harden_parent()
     conc = int(os.environ.get("SANDBOX_MAX_CONCURRENT", "1"))
     try:
-        srv = make_server("0.0.0.0", port, secret, max_concurrent=conc)
+        # Cloud Run delivers requests to the container on $PORT via its own network interface, so the server
+        # must listen on all interfaces; access control is ingress=internal + IAM invoker + shared secret.
+        srv = make_server("0.0.0.0", port, secret, max_concurrent=conc)  # nosec B104 - container entrypoint
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
         sys.exit(2)

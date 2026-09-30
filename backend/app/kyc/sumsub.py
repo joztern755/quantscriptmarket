@@ -34,6 +34,7 @@ import urllib.request
 from typing import Any, Callable, Mapping, Optional
 
 from app.errors import ExternalServiceError, ValidationFailed
+from app.https_only import https_open
 from app.kyc.base import (
     APPROVED,
     PENDING,
@@ -62,7 +63,7 @@ def _urllib_transport(method: str, url: str, headers: dict, body: Optional[bytes
                       ) -> tuple[int, bytes]:
     req = urllib.request.Request(url, data=body, headers=headers, method=method)  # noqa: S310 (https base only)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        with https_open(req, timeout=timeout) as resp:  # https only (api_base is checked in __init__ too)
             return resp.status, resp.read(MAX_BODY)
     except urllib.error.HTTPError as e:
         return e.code, e.read(MAX_BODY) if e.fp else b""

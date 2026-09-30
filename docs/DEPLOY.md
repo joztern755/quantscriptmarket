@@ -84,7 +84,7 @@ git diff       # review: new lock files; Dockerfile/env.sh/ci.yml now carry @sha
 
 - The versions in `backend/requirements.txt` were confirmed as upstream release tags on 2026-09-30 but PyPI was not reachable from the authoring environment (lines marked `# verify`). If `make lock` cannot resolve one, pick the nearest release, re-run, and delete the `# verify` marks once the lock exists. If pip-tools breaks with the image's pip, use `uv pip compile --generate-hashes` with the same inputs.
 - The deploy workflow **refuses** to run without `backend/requirements.lock` or with any `sha256:PIN_ME` placeholder left. CI only warns, so development is not blocked.
-- The sandbox image (`sandbox/Dockerfile`, owned by the sandbox module) still uses `FROM python:3.12-slim` without a digest: add a `# pin-image: python:3.12-slim` line above it and a `@sha256:PIN_ME` suffix, then `make pin`.
+- Done 2026-09-30: `backend/Dockerfile`, `sandbox/Dockerfile`, the Cloud SQL proxy image (`infra/gcp/env.sh`) and the CI `postgres:16` service are pinned by digest (`make pin-check` clean). Re-run `make pin` when bumping a base image.
 
 Commit (`chore: lock dependencies and pin images`) and push to a branch; open a PR; CI must be green.
 

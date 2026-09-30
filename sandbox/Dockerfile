@@ -4,7 +4,7 @@
 #   DOCKER_BUILDKIT=1 docker build -f sandbox/Dockerfile -t sandbox .
 #
 # The container holds ONLY the sandbox package + the stdlib-only helpers it imports
-# (app/errors.py, app/logging.py). No app.config, no DB drivers, no SDKs, no secrets baked in.
+# (app/errors.py, app/logging.py, app/https_only.py). No app.config, no DB drivers, no SDKs, no secrets baked in.
 #
 # ISOLATION — the in-process restrictions in app/sandbox/runner.py are defense in depth only.
 # The boundary is this service's deployment:
@@ -28,7 +28,7 @@
 # a writable path. Where a read-only root FS is available (GKE / docker run --read-only
 # --tmpfs /tmp:rw,noexec,nosuid,size=64m), use it.
 # pin-image: python:3.12-slim
-ARG PYTHON_IMAGE=python:3.12-slim@sha256:PIN_ME
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
 FROM ${PYTHON_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -50,7 +50,8 @@ RUN groupadd --system --gid 10001 sandbox \
 
 WORKDIR /srv
 # Root-owned, world-readable, not writable by the runtime user.
-COPY --chown=root:root --chmod=0444 backend/app/__init__.py backend/app/errors.py backend/app/logging.py /srv/app/
+COPY --chown=root:root --chmod=0444 backend/app/__init__.py backend/app/errors.py backend/app/logging.py \
+     backend/app/https_only.py /srv/app/
 COPY --chown=root:root --chmod=0444 backend/app/sandbox/*.py /srv/app/sandbox/
 RUN chmod 0555 /srv /srv/app /srv/app/sandbox \
  && python3 -m compileall -q /srv/app

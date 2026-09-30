@@ -67,6 +67,7 @@ from app.errors import (
     Unauthorized,
     ValidationFailed,
 )
+from app.https_only import https_open
 from app.logging import get_logger
 from app.money import to_micro
 
@@ -606,7 +607,7 @@ class SandboxAdapter:
             headers["X-Sandbox-Secret"] = secret   # defence in depth (app/sandbox/service.py layer 2)
         req = urllib.request.Request(url + "/backtest", data=body, method="POST", headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=300) as r:  # noqa: S310 - URL from config
+            with https_open(req, timeout=300) as r:  # SANDBOX_URL must be https (Cloud Run)
                 raw = r.read(16 * 1024 * 1024)
         except urllib.error.HTTPError as e:
             if e.code in (400, 422):
@@ -617,7 +618,7 @@ class SandboxAdapter:
                 raise ValidationFailed(str(detail.get("message") or "backtest rejected the strategy")[:300],
                                        sandbox_error=str(detail.get("error") or "")[:64]) from None
             raise ExternalServiceError("sandbox backtest failed", status=e.code) from None
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:  # ValueError: non-https URL
             raise ExternalServiceError("sandbox unavailable", error=type(e).__name__) from None
         try:
             report = json.loads(raw)

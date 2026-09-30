@@ -361,8 +361,8 @@ fmtDate(iso | ms): string  // "30 Sep 2026" (UTC) ; fmtDateTime(): "30 Sep 2026,
 - `node web/tests/smoke.mjs [--shots dir]` — Playwright, 1920×1080 + 390×844, light + dark (see file header).
 
 ## 13. Unverified / to check before go-live
-- Firebase JS SDK version `12.3.0` (app-config.json `firebaseSdkVersion`) — no network here to confirm it
-  exists on gstatic; set the real latest version + SRI hashes.
+- Firebase JS SDK version `12.3.0` (app-config.json `firebaseSdkVersion`) — confirmed on gstatic 2026-09-30; `web/sri.json`
+  holds its sha384 hashes (byte-identical to the `firebase@12.3.0` npm tarball). Upgrading = new version + new hashes + `make csp-sync`.
 - Firebase: ID token after TOTP enrolment is assumed to carry `sign_in_second_factor`; if not, core signs
   the user out and asks for a fresh sign-in (handled, but confirm). `authDomain` should be `aijalon.trade`
   (Hosting serves `/__/auth/*`) so redirect sign-in works in Safari/ITP.

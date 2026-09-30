@@ -36,6 +36,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 
 from app.errors import ExternalServiceError, Forbidden, StepUpRequired, Unauthorized
+from app.https_only import https_open
 from app.logging import get_logger
 
 try:  # prod only
@@ -161,7 +162,7 @@ def _urllib_fetch(url: str, timeout_s: float) -> FetchResult:
     if not url.startswith("https://"):
         raise ValueError("cert URL must be https")
     req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "aijalon-api"})  # noqa: S310
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310 - https enforced above; TLS verified
+    with https_open(req, timeout=timeout_s) as resp:  # https only, TLS verified
         return resp.status, resp.read(1 << 20), resp.headers.get("Cache-Control", "") or ""
 
 

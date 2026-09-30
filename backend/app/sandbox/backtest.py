@@ -44,6 +44,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from app.errors import ExternalServiceError, ValidationFailed
+from app.https_only import https_open
 from app.sandbox.runner import (
     SERIES_LIMITS, RunLimits, SeriesResult, normalize_bars, run_series_checked, with_limits,
 )
@@ -174,7 +175,7 @@ class HyperliquidInfoFetcher:
 
     @staticmethod
     def _default_open(req: urllib.request.Request, timeout: float) -> bytes:
-        with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 (fixed https URL)
+        with https_open(req, timeout=timeout) as r:  # https only (ValueError otherwise -> retried, then raised)
             return r.read(64 * 1024 * 1024)
 
     def _post(self, body: dict[str, Any]) -> Any:

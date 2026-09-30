@@ -25,11 +25,21 @@ PASS=0
 FAIL=0
 FAILED=()
 
+# app_migrator / app_api / app_executor are CLUSTER-global. Roles this run creates (0002_roles.sql, as the
+# superuser) are dropped again on exit: left behind, they are owned by the superuser, and a later non-superuser
+# bootstrap on the same cluster (CI's Cloud-SQL-style `migrator` step, infra/gcp/sql/00_pre_migrate.sql) can
+# no longer GRANT app_migrator to itself ("Only roles with the ADMIN option on role app_migrator ...").
+APP_ROLES_PREEXISTING="$(psql -X -A -t -d postgres -c "SELECT string_agg(rolname, ' ') FROM pg_roles
+                         WHERE rolname IN ('app_migrator', 'app_api', 'app_executor')" 2>/dev/null)"
+
 cleanup() {
     if [[ "${KEEP_DB:-0}" != "1" ]]; then
         for c in "${CLONES[@]}"; do dropdb --if-exists "$c" >/dev/null 2>&1; done
         dropdb --if-exists "$DB" >/dev/null 2>&1
         psql -X -q -d postgres -c "DROP ROLE IF EXISTS ${API_USER}; DROP ROLE IF EXISTS ${EXEC_USER};" >/dev/null 2>&1
+        for r in app_api app_executor app_migrator; do   # only roles this run created; fails harmlessly if still in use
+            [[ " $APP_ROLES_PREEXISTING " == *" $r "* ]] || psql -X -q -d postgres -c "DROP ROLE IF EXISTS $r;" >/dev/null 2>&1
+        done
     fi
 }
 trap cleanup EXIT
@@ -113,8 +123,10 @@ SQL
 
 # ------------------------------------------------------------------------------------------------ seed
 echo "-- seed"
-expect_eq "platform ledger accounts seeded" "8" <<SQL
-SELECT count(*) FROM ledger_accounts WHERE owner_user_id IS NULL;
+# 0003 seeds the 8 SPEC §4 platform accounts; 0006 adds suspense:usdc_unattributed, 0009 refunds:usdc_pending.
+expect_eq "platform ledger accounts seeded (exact set)" "builder:hl_receivable:asset:false,platform:revenue:builder:revenue:false,platform:revenue:plans:revenue:false,platform:revenue:posts:revenue:false,platform:revenue:profit_share:revenue:false,platform:revenue:subscription:revenue:false,refunds:usdc_pending:liability:false,stripe:clearing:asset:false,suspense:usdc_unattributed:liability:false,treasury:hl_usdc:asset:false" <<SQL
+SELECT string_agg(code || ':' || kind || ':' || non_negative::text, ',' ORDER BY code)
+  FROM ledger_accounts WHERE owner_user_id IS NULL;
 SQL
 expect_eq "kill switches seeded off" "kill_switch_global=false,new_entries_paused=false" <<SQL
 SELECT string_agg(key || '=' || value::text, ',' ORDER BY key) FROM system_flags;
@@ -140,8 +152,11 @@ INSERT INTO users (id, firebase_uid, role) VALUES
   ('$U1', 'fb-u1', 'user'), ('$U2', 'fb-u2', 'creator'), ('$A1', 'fb-a1', 'admin'), ('$A2', 'fb-a2', 'admin');
 INSERT INTO ledger_accounts (code, kind, owner_user_id, non_negative) VALUES
   ('$FEE1', 'liability', '$U1', true), ('$PAY2', 'liability', '$U2', true);
-INSERT INTO strategy_versions (strategy_id, version, code_hash)
-  SELECT id, 1, 'engine:test' FROM strategies WHERE slug = 'silver';
+SQL
+# SILVER v1 is seeded by 0005 (the only version; the constraint tests below join on it)
+expect_eq "silver v1 seeded (CREST script hash, terminal source)" "1|1|e60119a7222c352085cf6753be7231e05a201ba2ecb495812d4671fc44a942ed|terminal" <<SQL
+SELECT count(*), min(v.version), min(v.code_hash), min(v.params->>'source')
+  FROM strategy_versions v JOIN strategies s ON s.id = v.strategy_id WHERE s.slug = 'silver';
 SQL
 
 # ------------------------------------------------------------------------------------------------ ledger

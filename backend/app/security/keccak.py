@@ -2,8 +2,8 @@
 
 `hashlib.sha3_256` is a DIFFERENT function and must never be used for Ethereum addresses.
 
-`keccak256()` uses a fast native implementation when one is installed (pycryptodome's `Crypto.Hash.keccak`,
-or `eth_hash`, both pulled in by eth-account in prod), and falls back to the pure-Python `keccak256_pure()`.
+`keccak256()` uses a fast native implementation when one is installed (`eth_hash.auto`, pulled in by eth-account in
+prod, whose backend is pycryptodome), and falls back to the pure-Python `keccak256_pure()`.
 The pure version is slow (~ms per block) but has no dependencies; it is used in tests and dev.
 """
 from __future__ import annotations
@@ -90,16 +90,8 @@ def keccak256_pure(data: bytes | bytearray | memoryview) -> bytes:
 
 
 def _select_backend() -> Callable[[bytes], bytes]:
-    try:  # pycryptodome (eth-hash[pycryptodome], installed with eth-account)
-        from Crypto.Hash import keccak as _ck  # type: ignore
-
-        def _pycryptodome(data: bytes) -> bytes:
-            return _ck.new(digest_bits=256, data=bytes(data)).digest()
-
-        if _pycryptodome(b"") == keccak256_pure(b""):
-            return _pycryptodome
-    except Exception:  # noqa: BLE001 - optional accelerator
-        pass
+    # eth_hash (installed with eth-account) wraps pycryptodome's native Keccak. It is used instead of importing the
+    # `Crypto` namespace directly: that namespace is shared with the abandoned PyCrypto package (bandit B413).
     try:
         from eth_hash.auto import keccak as _ek  # type: ignore
 
