@@ -8,9 +8,9 @@ External contract each adapter expects (the lead reconciles names):
               require_step_up(ctx, max_age=)
   audit       INSERT INTO audit_log(actor, action, target, payload, ip_hash) — the DB trigger builds the hash
               chain (0001_init.sql); payload validated with app.security.audit.canonical_json (no floats)
-  ledger      app.ledger.post_transaction(conn, idempotency_key=, kind=, memo=, entries=[(code, micro)],
-              created_by=) -> tx id | obj.tx_id; app.ledger.ensure_account(conn, code) (optional);
-              fallback: SQL ledger_post() function
+  ledger      app.ledger.service.{post_transaction(conn, key, kind, memo, entries, created_by) -> PostedTx,
+              ensure_account(conn, code, kind, owner, non_negative=), get_balance(conn, code)} (no fallback)
+  database    app.db.engine.{create_db_engine(settings, application_name=, statement_timeout_ms=), sqlstate_of}
   agent keys  app.security.kms.make_encryptor(settings) (encrypt-only);
               app.security.agent_keys.generate_sealed_agent_key(encryptor, user_id=) -> SealedKey
   typed data  app.hl.typed_data.approve_agent_typed_data(agent_address=, agent_name=, nonce=,
@@ -110,46 +110,41 @@ _SQLSTATE_MAP: dict[str, Callable[[], AppError]] = {
 
 
 def map_db_error(exc: BaseException) -> BaseException:
-    state = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    """SQLSTATE → AppError for the states a client can act on; everything else stays a 500."""
+    if isinstance(exc, AppError):
+        return exc
+    sqlstate_of = _fn("app.db.engine", "sqlstate_of")
+    state = sqlstate_of(exc) if sqlstate_of else getattr(getattr(exc, "orig", None), "sqlstate", None)
     factory = _SQLSTATE_MAP.get(state or "")
     return factory() if factory else exc
 
 
 class SqlDatabase:
-    """Engine from app.db if it exposes get_engine(); else our own psycopg 3 engine."""
+    """Engine from app.db.engine.create_db_engine (UTC sessions, statement timeout, pool pre-ping)."""
 
-    def __init__(self, settings: Settings, *, statement_timeout_ms: int = 15_000) -> None:
+    def __init__(self, settings: Settings, *, application_name: str = "aijalon-api") -> None:
         self._settings = settings
         self._engine: Any = None
         self._lock = threading.Lock()
-        self._timeout = int(statement_timeout_ms)
+        self._app_name = application_name
 
     def engine(self) -> Any:
         if self._engine is None:
             with self._lock:
                 if self._engine is None:
-                    get_engine = _fn("app.db", "get_engine")
-                    if get_engine is not None:
-                        self._engine = get_engine()
-                    else:
-                        from sqlalchemy import create_engine
-                        url = self._settings.database_url
-                        if url.startswith("postgresql://"):
-                            url = "postgresql+psycopg://" + url[len("postgresql://"):]
-                        self._engine = create_engine(url, pool_pre_ping=True, pool_size=10, max_overflow=5,
-                                                     pool_recycle=1800, future=True)
+                    create = _fn("app.db.engine", "create_db_engine")
+                    if create is None:
+                        raise ServiceUnavailable("database layer not available")
+                    self._engine = create(self._settings, application_name=self._app_name,
+                                          statement_timeout_ms=15_000)
         return self._engine
 
     @contextmanager
     def begin(self) -> Iterator[Any]:
-        from sqlalchemy import text
-        from sqlalchemy.exc import DBAPIError
         try:
             with self.engine().begin() as conn:
-                # Constant, not user input. Bounds every API transaction (fail fast instead of piling up).
-                conn.execute(text("SET LOCAL statement_timeout = " + str(self._timeout)))
                 yield conn
-        except DBAPIError as e:
+        except Exception as e:  # noqa: BLE001 - re-raised (mapped when the SQLSTATE is actionable)
             mapped = map_db_error(e)
             if mapped is e:
                 raise
@@ -204,29 +199,21 @@ class SqlAuditAdapter:
 
 
 class LedgerAdapter:
-    def __init__(self, store: Any) -> None:
-        self._store = store
+    """All ledger writes go through app.ledger.service (validation, idempotency, hash chain via ledger_post)."""
+
+    def _svc(self) -> Any:
+        return _require("app.ledger.service")
 
     def ensure_account(self, conn: Any, code: str) -> None:
-        fn = _fn("app.ledger", "ensure_account")
-        if fn is not None:
-            fn(conn, code)
-            return
         kind, non_negative, owner = ledger_ops.account_spec(code)
-        self._store.ensure_account(conn, code=code, kind=kind, owner_user_id=owner, non_negative=non_negative)
+        self._svc().ensure_account(conn, code, kind, owner, non_negative=non_negative)
 
     def post(self, conn: Any, *, idempotency_key: str, kind: str, memo: str, entries: list[tuple[str, int]],
              created_by: str) -> str:
-        fn = _fn("app.ledger", "post_transaction")
-        if fn is not None:
-            res = fn(conn, idempotency_key=idempotency_key, kind=kind, memo=memo, entries=entries,
-                     created_by=created_by)
-            return str(getattr(res, "tx_id", None) or (res.get("tx_id") if isinstance(res, dict) else res))
-        return self._store.ledger_post(conn, idempotency_key=idempotency_key, kind=kind, memo=memo,
-                                       created_by=created_by, entries=entries)
+        return str(self._svc().post_transaction(conn, idempotency_key, kind, memo, entries, created_by).id)
 
     def balance(self, conn: Any, account_code: str) -> int:
-        return self._store.raw_balance(conn, account_code)
+        return int(self._svc().get_balance(conn, account_code))
 
 
 # =============================================================================================================
@@ -821,7 +808,7 @@ def build_services(settings: Optional[Settings] = None) -> Services:
         store=store,
         auth=FirebaseAuthAdapter(s),
         audit=SqlAuditAdapter(store),
-        ledger=LedgerAdapter(store),
+        ledger=LedgerAdapter(),
         agent_keys=AgentKeyAdapter(enc),
         typed_data=TypedDataAdapter(s),
         hl=hl,

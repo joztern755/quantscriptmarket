@@ -1,0 +1,160 @@
+# Deploy aijalon.trade to production (Google Cloud project in vars.GCP_PROJECT_ID, region asia-southeast1).
+#
+# Gates, in order:
+#   1. the full CI (reusable ci.yml) must pass in this same run;
+#   2. the job runs in the GitHub environment "production" — configure it with Required reviewers (the owner, and
+#      a second person when there is one), "Prevent self-review" when two reviewers exist, and Deployment
+#      branches = main only (docs/DEPLOY.md §6). Nothing below runs until a reviewer approves;
+#   3. Google auth is Workload Identity Federation: GitHub's OIDC token is exchanged for a short-lived token of
+#      the deployer SA. The WIF provider only accepts tokens whose claims say repo joztern755/quantscriptmarket,
+#      ref refs/heads/main, environment production AND workflow .github/workflows/deploy.yml — so no other
+#      branch, workflow, fork or environment can obtain credentials. No JSON keys exist anywhere.
+# Order: images (by digest) -> migrations (Cloud Run Job) -> sandbox -> executor -> api -> api smoke
+#        -> web build with production app-config -> CSP check -> Firebase Hosting -> web smoke.
+# A failed api smoke test routes traffic back to the previous api/executor revisions automatically.
+name: Deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      pull-requests: read
+
+  deploy:
+    needs: ci
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment:
+      name: production
+      url: https://aijalon.trade
+    permissions:
+      contents: read
+      id-token: write          # GitHub OIDC token for Workload Identity Federation (nothing else)
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION }}
+      DB_PRIVATE_IP: ${{ vars.DB_PRIVATE_IP }}
+      LAUNCH_PHASE: ${{ vars.LAUNCH_PHASE || 'internal' }}
+      ALLOWLIST_EMAILS: ${{ vars.ALLOWLIST_EMAILS || 'app.aijalon@gmail.com' }}
+      PAYOUTS_ENABLED: ${{ vars.PAYOUTS_ENABLED || 'false' }}
+      GIT_SHA: ${{ github.sha }}
+      DEPLOY_STATE: ${{ runner.temp }}/aijalon-deploy.state
+      TYPESCRIPT_VERSION: "6.0.2"
+      FIREBASE_TOOLS_VERSION: "15.32.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Required GitHub environment variables
+        run: |
+          set -e
+          for v in GCP_PROJECT_ID GCP_REGION WIF_PROVIDER DEPLOYER_SA DB_PRIVATE_IP FIREBASE_WEB_API_KEY FIREBASE_APP_ID; do
+            eval "val=\${VARS_$v:-}"
+            [ -n "$val" ] || { echo "::error::GitHub environment variable $v is not set (docs/DEPLOY.md §6)"; exit 1; }
+          done
+        env:
+          VARS_GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          VARS_GCP_REGION: ${{ vars.GCP_REGION }}
+          VARS_WIF_PROVIDER: ${{ vars.WIF_PROVIDER }}
+          VARS_DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}
+          VARS_DB_PRIVATE_IP: ${{ vars.DB_PRIVATE_IP }}
+          VARS_FIREBASE_WEB_API_KEY: ${{ vars.FIREBASE_WEB_API_KEY }}
+          VARS_FIREBASE_APP_ID: ${{ vars.FIREBASE_APP_ID }}
+
+      - name: Preflight (lock files, image digests, CSP)
+        run: ./infra/gcp/deploy.sh preflight
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation, no keys)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOYER_SA }}
+          create_credentials_file: true      # ADC for firebase-tools (external_account credentials)
+          export_environment_variables: true
+          access_token_lifetime: 3600s
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Build and push images (deployed by digest)
+        run: ./infra/gcp/deploy.sh images
+
+      - name: Run database migrations (Cloud Run Job, before any traffic shift)
+        run: ./infra/gcp/deploy.sh migrate
+
+      - name: Deploy Cloud Run services (sandbox -> executor -> api)
+        id: services
+        run: ./infra/gcp/deploy.sh services
+
+      - name: API smoke test (health, edge enforcement, origins not public)
+        id: smoke_api
+        if: vars.SMOKE_SKIP_PUBLIC != 'true'
+        run: ./infra/gcp/deploy.sh smoke-api
+
+      - name: Roll back api/executor on failed smoke test
+        if: failure() && steps.services.outcome == 'success'
+        run: ./infra/gcp/deploy.sh rollback
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Build web with the production app-config
+        env:
+          FIREBASE_WEB_API_KEY: ${{ vars.FIREBASE_WEB_API_KEY }}
+          FIREBASE_APP_ID: ${{ vars.FIREBASE_APP_ID }}
+        run: |
+          set -e
+          npm install --global --no-fund --no-audit "typescript@${TYPESCRIPT_VERSION}"
+          cfg="${RUNNER_TEMP}/app-config.prod.json"
+          python3 - "$cfg" <<'PY'
+          import json, os, sys
+          c = json.load(open("web/public/app-config.json"))
+          c["firebase"].update({"apiKey": os.environ["FIREBASE_WEB_API_KEY"], "appId": os.environ["FIREBASE_APP_ID"],
+                                "projectId": os.environ["PROJECT_ID"], "authDomain": "aijalon.trade"})
+          c["apiOrigin"], c["siteOrigin"] = "https://api.aijalon.trade", "https://aijalon.trade"
+          bad = [k for k, v in c["firebase"].items() if "REPLACE_ME" in str(v)]
+          if bad: sys.exit(f"app-config still has placeholders: {bad}")
+          json.dump(c, open(sys.argv[1], "w"), indent=2)
+          PY
+          APP_CONFIG="$cfg" node web/build.mjs
+          # files that must be served from /.well-known (Apple Pay domain association, security.txt)
+          mkdir -p web/dist/.well-known
+          find infra/hosting/well-known -maxdepth 1 -type f ! -name README.md -exec cp {} web/dist/.well-known/ \;
+          ls -la web/dist/.well-known
+
+      - name: CSP of the production build == infra/csp.txt == firebase.json
+        run: python3 infra/csp_sync.py check --require-dist
+
+      - name: Deploy Firebase Hosting
+        run: |
+          npx --yes "firebase-tools@${FIREBASE_TOOLS_VERSION}" deploy --only hosting \
+            --project "${PROJECT_ID}" --non-interactive --message "deploy ${GITHUB_SHA::12} run ${GITHUB_RUN_ID}"
+
+      - name: Web smoke test (served CSP/HSTS, new build live, app-config, .well-known)
+        if: vars.SMOKE_SKIP_PUBLIC != 'true'
+        run: ./infra/gcp/deploy.sh smoke-web
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy ${GITHUB_SHA::12}"
+            echo '```'
+            cat "${DEPLOY_STATE}" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
