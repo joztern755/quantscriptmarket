@@ -26,6 +26,7 @@ import threading
 import time
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
@@ -57,6 +58,7 @@ __all__ = [
     "Notifier",
     "TEMPLATES",
     "render",
+    "coerce_alert",
     "mask_address",
     "mask_email",
     "sanitize_text",
@@ -77,7 +79,8 @@ class Alert:
     """An alert to deliver. ``user_id=None`` = ops/admin alert (stored with user_id NULL -> admin console).
 
     ``data`` holds template parameters. Keys ending in ``_micro`` must be ints and are rendered as USD.
-    ``coin`` marks a market alert; a critical market alert triggers the auto-pause hook.
+    ``coin`` marks a market alert; a critical market alert triggers the auto-pause hook unless
+    ``auto_pause=False`` (e.g. app.domain.alerts_rules marks which critical alerts pause the market).
     ``key`` is the dedupe key; default ``kind:user_id:coin``.
     """
 
@@ -87,10 +90,15 @@ class Alert:
     coin: str | None = None
     data: Mapping[str, Any] = field(default_factory=dict)
     key: str | None = None
+    auto_pause: bool | None = None  # None = default (critical + coin); False = never; True = when critical + coin
 
     @property
     def dedupe_key(self) -> str:
         return self.key or f"{self.kind}:{self.user_id or '-'}:{self.coin or '-'}"
+
+    @property
+    def wants_pause(self) -> bool:
+        return Severity(self.severity) is Severity.CRITICAL and bool(self.coin) and self.auto_pause is not False
 
 
 @dataclass(frozen=True)
@@ -231,25 +239,56 @@ def sanitize_text(text: str) -> str:
     return t
 
 
+def _num(value: Any) -> Decimal | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, (str, Decimal)):
+        try:
+            d = Decimal(str(value))
+        except InvalidOperation:
+            return None
+        return d if d.is_finite() else None
+    return None
+
+
 def _format_value(key: str, value: Any) -> str:
+    """Render one template value. ``*_micro`` ints -> USD; ``*_bps`` numbers -> percent; lists joined;
+    everything else sanitized (secrets redacted, addresses shortened, emails masked)."""
     if key.endswith("_micro") and isinstance(value, int) and not isinstance(value, bool):
         return fmt_usd(value)
-    if key.endswith("_bps") and isinstance(value, int) and not isinstance(value, bool):
-        return f"{value / 100:.2f}%"
+    if key.endswith("_bps"):
+        d = _num(value)
+        if d is not None:
+            return f"{(d / 100).quantize(Decimal('0.01'))}%"
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return sanitize_text(", ".join(str(v) for v in value))
+    if value is None:
+        return "n/a"
     return sanitize_text(value)
 
 
-class _SafeParams(dict):
+class _MissingParam(KeyError):
+    pass
+
+
+class _StrictParams(dict):
     def __missing__(self, key: str) -> str:
-        return "?"
+        raise _MissingParam(key)
 
 
 # kind -> (title, body). Plain text; only simple {name} fields. Keep user-facing wording neutral and secret-free.
+# Keys match the payloads built in app/domain/alerts_rules.py, app/execution/* and app/payments/*. When a
+# template field is missing from the payload the generic rendering is used instead (never a half-filled text).
 TEMPLATES: dict[str, tuple[str, str]] = {
     # balance / billing (SPEC §1)
     "balance_low": ("Fee balance running low", "Your fee balance is {balance_micro} (about {pct}% of the estimated monthly need). Top up to keep strategies opening new positions."),
     "balance_empty": ("Fee balance empty", "Your fee balance is {balance_micro}. Subscriptions will switch to reduce-only (exits only) after the grace period."),
+    "subscription_past_due": ("Subscription past due", "Subscription {subscription} on {strategy} could not be renewed from your fee balance. Top up within the grace period to avoid reduce-only mode."),
     "subscription_reduce_only": ("Subscription set to reduce-only", "Subscription {subscription} on {strategy} can no longer open new positions. Top up your fee balance to resume."),
+    "plan_past_due": ("Plan renewal failed", "Your {plan} plan renewal of {due_micro} could not be paid (available {available_micro}). Top up your fee balance."),
+    "plan_downgraded": ("Plan downgraded", "Your plan changed from {from} to {to} because the renewal could not be paid."),
     # payments
     "topup_credited": ("Top-up received", "{amount_micro} was added to your fee balance ({method})."),
     "topup_failed": ("Top-up failed", "Your {method} top-up did not complete. No money was added. You can try again."),
@@ -260,35 +299,68 @@ TEMPLATES: dict[str, tuple[str, str]] = {
     "stripe_dispute_ops": ("Stripe dispute opened", "Dispute {dispute} ({reason}) on {charge} for user {user}: debit {amount_micro}. Respond in the Stripe Dashboard before the deadline."),
     "stripe_dispute_closed_ops": ("Stripe dispute closed", "Dispute {dispute} closed with status {status} for user {user}; amount {amount_micro}."),
     "payment_manual_review": ("Payment needs manual review", "Event {event} ({event_type}): {reason}."),
-    # trading / risk (SPEC §5.4, §5.5)
-    "mark_oracle_divergence": ("Mark/oracle divergence on {coin}", "Mark deviates {deviation_bps} from oracle on {coin}. New entries on this market are paused."),
-    "oi_spike": ("Open-interest spike on {coin}", "Open interest on {coin} rose {change_bps} in 1h."),
-    "funding_spike": ("Funding spike on {coin}", "Funding on {coin} is {funding_bps} per hour."),
-    "user_drawdown": ("Drawdown alert", "Subscription {subscription} is down {drawdown_bps} of its allocation in 24h."),
-    "order_rejections_burst": ("Order rejections", "{count} orders were rejected for {subscription} on {coin}; the circuit breaker may pause it."),
-    "agent_approval_changed": ("Agent approval changed", "The trading agent approval for wallet {address} changed on-chain ({detail}). Trading is paused until it is reconnected."),
-    "login_new_country": ("New sign-in location", "Your account was signed into from a new country ({country}). If this was not you, reset your sign-in now."),
-    "mfa_reset": ("Two-factor authentication reset", "Two-factor authentication on your account was reset."),
-    "withdrawal_requested": ("Withdrawal requested", "A withdrawal of {amount_micro} to {address} was requested and awaits approval."),
-    "reconciliation_mismatch": ("Reconciliation mismatch", "{scope}: ledger {ledger_micro} vs on-chain {onchain_micro} (diff {diff_micro})."),
+    # trading / risk (SPEC §5.4, §5.5; app/domain/alerts_rules.py)
+    "mark_oracle_divergence": ("Mark/oracle divergence on {coin}", "Mark {mark_px} deviates {deviation_bps} from oracle {oracle_px} on {coin}."),
+    "oi_spike": ("Open-interest spike on {coin}", "Open interest on {coin} grew {growth_bps} in 1h ({oi_1h_ago_micro} -> {oi_now_micro})."),
+    "funding_spike": ("Funding spike on {coin}", "Funding on {coin} is {funding_rate_per_hour} per hour (threshold {threshold})."),
+    "user_drawdown": ("Drawdown alert", "Subscription {subscription_id} is at {pnl_24h_micro} over 24h on an allocation of {allocation_micro}."),
+    "reject_burst": ("Order rejections", "{rejects} orders were rejected for subscription {subscription_id}; the circuit breaker may pause it."),
+    "order_rejections_burst": ("Order rejections", "{count} orders were rejected for subscription {subscription}; the circuit breaker may pause it."),
+    "agent_revoked": ("Agent approval changed", "The trading agent approval for wallet {master_address} is no longer active on-chain. Trading for this wallet stops until it is reconnected."),
+    "new_country_login": ("New sign-in location", "Your account was signed into from a new country ({country}). If this was not you, secure your Google/Apple account and contact support."),
+    "mfa_reset": ("Two-factor authentication reset", "Two-factor authentication on your account was reset. If this was not you, contact support immediately."),
+    "withdrawal_request": ("Withdrawal requested", "A withdrawal of {amount_micro} was requested (request {request_id}) and awaits approval."),
+    "payout_request": ("Payout requested", "A payout of {amount_micro} was requested (request {request_id}) and awaits two approvals."),
+    "reconciliation_mismatch": ("Reconciliation mismatch: {scope}", "{scope}: difference {diff_micro} between ledger and on-chain."),
+    "stale_signal": ("Stale strategy signal", "Signals are stale; new entries are not being placed."),
     "kill_switch": ("Kill switch engaged", "{scope} paused: {reason}."),
 }
-_GENERIC = ("{kind}", "{detail}")
+
+
+def _humanize(kind: str) -> str:
+    return sanitize_text(kind.replace("_", " ").strip().capitalize() or "Alert")
+
+
+def _generic(alert: Alert, params: Mapping[str, str]) -> tuple[str, str]:
+    title = _humanize(alert.kind) + (f" ({sanitize_text(alert.coin)})" if alert.coin else "")
+    items = [f"{sanitize_text(k)}: {v}" for k, v in params.items() if k not in ("kind",)]
+    return title, "; ".join(items) if items else _humanize(alert.kind)
 
 
 def render(alert: Alert) -> RenderedAlert:
-    title_t, body_t = TEMPLATES.get(alert.kind, _GENERIC)
-    params = _SafeParams({k: _format_value(k, v) for k, v in dict(alert.data).items()})
-    params.setdefault("kind", sanitize_text(alert.kind))
+    params = {str(k): _format_value(str(k), v) for k, v in dict(alert.data).items()}
     if alert.coin:
         params.setdefault("coin", sanitize_text(alert.coin))
-    if "detail" not in params:
-        params["detail"] = ""
-    title = sanitize_text(title_t.format_map(params))
-    body = body_t.format_map(params)
-    # Body parts were sanitized individually; sanitize once more (length cap applies per value, not body).
+    tmpl = TEMPLATES.get(alert.kind)
+    title = body = None
+    if tmpl is not None:
+        try:
+            strict = _StrictParams(params)
+            title, body = tmpl[0].format_map(strict), tmpl[1].format_map(strict)
+        except (_MissingParam, ValueError, IndexError, AttributeError):
+            title = body = None
+    if title is None or body is None:
+        title, body = _generic(alert, params)
+    # Values were sanitized individually; sanitize the whole once more (the length cap applies per value).
     body = _CTRL_RE.sub("", mask_email(_ADDR_RE.sub(lambda m: mask_address(m.group(0)), redact(body))))
-    return RenderedAlert(alert.kind, alert.severity, alert.user_id, alert.coin, title, body)
+    return RenderedAlert(alert.kind, alert.severity, alert.user_id, alert.coin, sanitize_text(title), body[:3000])
+
+
+def coerce_alert(obj: Any) -> Alert:
+    """Accept our ``Alert``, ``app.domain.alerts_rules.Alert`` (payload/market/auto_pause_market) or
+    ``app.execution.ports.AlertEvent`` (payload/coin/dedup_key)."""
+    if isinstance(obj, Alert):
+        return obj
+    kind = getattr(obj, "kind", None)
+    sev = getattr(obj, "severity", None)
+    if not kind or sev is None:
+        raise TypeError("not an alert")
+    payload = getattr(obj, "payload", None) or getattr(obj, "data", None) or {}
+    coin = getattr(obj, "market", None) or getattr(obj, "coin", None)
+    auto = getattr(obj, "auto_pause_market", None)
+    key = getattr(obj, "key", None) or getattr(obj, "dedup_key", None)
+    return Alert(kind=str(kind), severity=Severity(sev), user_id=getattr(obj, "user_id", None), coin=coin,
+                 data=dict(payload), key=key, auto_pause=auto)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -475,19 +547,29 @@ class Notifier:
         self.clock, self.sleep = clock, sleep
 
     # ---- public ------------------------------------------------------------------------------------------
-    def notify(self, alert: Alert) -> NotifyResult:
-        """Deliver an alert. Never raises."""
+    def notify(self, alert: Any) -> NotifyResult:
+        """Deliver an alert (ours, a domain Alert or an execution AlertEvent). Never raises."""
         result = NotifyResult()
         try:
-            self._notify(alert, result)
+            self._notify(coerce_alert(alert), result)
         except Exception as e:  # last-resort guard: a bug here must not break the caller (e.g. a webhook)
             result.errors.append(f"notifier: {type(e).__name__}")
             self._metric("alerts.notifier_error", kind=alert.kind if isinstance(alert, Alert) else "?")
             log.exception("notifier failure")
         return result
 
-    def notify_many(self, alerts: Iterable[Alert]) -> list[NotifyResult]:
+    def notify_many(self, alerts: Iterable[Any]) -> list[NotifyResult]:
         return [self.notify(a) for a in alerts]
+
+    def send(self, *, severity: str, kind: str, payload: Mapping[str, Any] | None = None, user_id: str | None = None,
+             coin: str | None = None, key: str | None = None) -> NotifyResult:
+        """Keyword form for the API's NotifierPort adapter. Never raises."""
+        try:
+            alert = Alert(kind=kind, severity=Severity(severity), user_id=user_id, coin=coin, data=dict(payload or {}), key=key)
+        except Exception as e:
+            self._metric("alerts.notifier_error", kind=str(kind)[:40])
+            return NotifyResult(errors=[f"notifier: {type(e).__name__}"])
+        return self.notify(alert)
 
     # ---- internals ---------------------------------------------------------------------------------------
     def _notify(self, alert: Alert, result: NotifyResult) -> None:
@@ -496,7 +578,7 @@ class Notifier:
         self._metric("alerts.received", kind=alert.kind, severity=sev.value)
 
         # Safety first: the auto-pause runs regardless of dedupe/delivery.
-        if sev is Severity.CRITICAL and alert.coin:
+        if alert.wants_pause:
             result.paused = self._auto_pause(alert, result)
 
         if self.dedupe.seen_recently(alert.dedupe_key, now, self.dedupe_window_s):

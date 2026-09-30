@@ -8,6 +8,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import ipaddress
 import json
 import re
 import uuid
@@ -115,11 +116,22 @@ def decode_cursor(cursor: str | None) -> tuple[datetime, str] | None:
 
 
 # ------------------------------------------------------------------------------------------------ hashing
-def hash_identifier(value: str | None, salt: str) -> str | None:
-    """HMAC-SHA256(salt, value) hex. Used for ip_hash / user_agent_hash so raw PII never hits the DB."""
-    if not value:
+def hash_identifier(value: str | None, pepper: bytes | str, *, domain: str = "ip") -> str | None:
+    """HMAC-SHA256(pepper, domain || 0x00 || value) hex — identical to app.security.audit.pepper_hash, so
+    ip_hash values in consents and audit_log correlate. IPs are normalised first (IPv4-mapped IPv6 → IPv4)."""
+    if not value or not str(value).strip():
         return None
-    return hmac.new(salt.encode(), value.encode(), hashlib.sha256).hexdigest()
+    raw = str(value).strip()
+    if domain == "ip":
+        try:
+            addr = ipaddress.ip_address(raw)
+            if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+                addr = addr.ipv4_mapped
+            raw = addr.compressed
+        except ValueError:
+            raw = "invalid:" + raw[:64]
+    key = pepper.encode() if isinstance(pepper, str) else pepper
+    return hmac.new(key, domain.encode() + b"\x00" + raw.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def request_fingerprint(method: str, path: str, body: bytes) -> str:

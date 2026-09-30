@@ -92,7 +92,7 @@ def builder_fee_key(tid: str) -> str:
 def _lines(*pairs: tuple[str, int]) -> list[LedgerLine]:
     """Drop zero lines; assert the transaction balances (never post an unbalanced transaction)."""
     out = [LedgerLine(code, int(amt)) for code, amt in pairs if amt]
-    if sum(l.amount_micro for l in out) != 0:
+    if sum(ln.amount_micro for ln in out) != 0:
         raise AssertionError("unbalanced ledger transaction")
     return out
 

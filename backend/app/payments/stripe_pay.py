@@ -8,22 +8,24 @@ Flow
   2. The browser confirms the payment with Stripe.js. **Client-side "success" is never trusted** — nothing is
      credited by the API on the client's word.
   3. Stripe calls POST /v1/webhooks/stripe. ``verify_webhook`` checks the signature on the RAW body;
-     ``handle_event`` turns ``payment_intent.succeeded`` into a ``CreditInstruction`` (idempotency key
-     ``stripe:{pi_id}``) which the API layer posts as one ledger tx: debit ``stripe:clearing``, credit
-     ``user:{id}:fee_balance``. Refunds and disputes produce ``DebitInstruction``s + critical ops alerts.
+     ``handle_event`` re-fetches the PaymentIntent (with ``latest_charge.balance_transaction``) and turns it into
+     a ``CreditInstruction`` (idempotency key ``stripe:{pi_id}``) for gross − actual Stripe fee (SPEC §1,
+     owner 30 Sep 2026: fee passed to the user). The API layer posts it as one ledger tx: debit
+     ``stripe:clearing``, credit ``user:{id}:fee_balance`` (both NET — the fee never reaches our books; Stripe
+     keeps it). Refunds and disputes produce ``DebitInstruction``s + critical ops alerts.
 
 Currency decision (fee balance is USD; ledger is single-currency micro-USD)
-  * DEFAULT: charge **USD**. The credited amount is exactly the amount received (cents × 10_000 micro), no FX
-    risk, no rate to store. Cards, Apple Pay and Google Pay all work in USD. A Malaysian Stripe account settles
-    in MYR, so Stripe converts USD→MYR at payout and charges its currency-conversion fee (platform cost, like the
-    processing fee, which SPEC §1 says we absorb [CONFIRM]). Malaysian cardholders may see a foreign-currency /
-    DCC fee from their bank — disclose this on the top-up screen.
+  * DEFAULT: charge **USD**. Gross credit = amount received (cents × 10_000 micro), no FX risk, no rate to
+    store. Cards, Apple Pay and Google Pay all work in USD. A Malaysian Stripe account settles in MYR, so the
+    balance transaction is in MYR; the fee is applied as a SHARE of the gross (``bt.fee / bt.amount``), which
+    needs no FX rate. Any currency-conversion fee Stripe itemizes on the charge is therefore passed through
+    too. Malaysian cardholders may also see a foreign-currency fee from their bank — disclose on the top-up screen.
   * FPX and GrabPay are **MYR-only**, so they never appear for a USD PaymentIntent. To offer them, the MYR path
     (behind ``StripeTopupConfig.myr_enabled``, default OFF) charges MYR for a USD credit using a rate that WE
     quote and lock at intent creation: ``charge_myr = credit_usd × mid_rate × (1 + spread_bps)`` rounded up to
-    the sen; mid rate, spread, source, quote id and the exact ``credit_micro`` are stored in the PaymentIntent
-    metadata, so the webhook credits exactly ``credit_micro`` (pro-rata if less was received) and refunds /
-    disputes reverse pro-rata of that same locked amount. PaymentIntents do not return an FX quote themselves;
+    the sen; mid rate, spread, source, quote id and the exact gross ``credit_micro`` are stored in the
+    PaymentIntent metadata, so the webhook credits exactly ``credit_micro`` − fee (pro-rata if less was
+    received) and refunds / disputes reverse pro-rata of that same locked amount. PaymentIntents do not return an FX quote themselves;
     rate sources (inject via ``FxRateProvider``): Stripe's FX Quotes API (``/v1/fx_quotes``, preview when last
     checked — verify availability for a MY account), Bank Negara Malaysia's public exchange-rate API
     (api.bnm.gov.my, business-day reference rates — needs a staleness rule), or a commercial feed. The spread
@@ -53,7 +55,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 from app.alerts.notifier import Alert, Severity
 from app.errors import AppError, Conflict, ExternalServiceError, Forbidden, ValidationFailed
 from app.logging import get_logger
-from app.money import MICRO, fmt_usd, usd
+from app.money import MICRO, apply_bps_floor, fmt_usd, usd
 from app.payments.instructions import (
     STRIPE_CLEARING,
     CreditInstruction,
@@ -74,6 +76,9 @@ __all__ = [
     "default_gateway",
     "TopupIntent",
     "create_topup_intent",
+    "stripe_fee_micro",
+    "StripeFeeNotReady",
+    "FEE_EXPAND",
     "WebhookVerificationError",
     "verify_webhook",
     "compute_signature",
@@ -114,7 +119,11 @@ class StripeTopupConfig:
     fx_sanity_bounds: Mapping[str, tuple[Decimal, Decimal]] = field(
         default_factory=lambda: {"myr": (Decimal("2.5"), Decimal("8"))}  # MYR per USD; outside -> refuse (broken feed)
     )
-    stripe_fee_absorbed: bool = True
+    stripe_fee_absorbed: bool = False      # SPEC §1 (owner 30 Sep 2026): pass-through, credit net of actual fee
+    # Pre-payment fee ESTIMATE shown to the user (Terms 10.3). [CONFIRM] from the account's Stripe pricing page;
+    # None = no estimate (UI must then say "processor fee deducted; exact amount shown after payment").
+    fee_estimate_bps: int | None = None
+    fee_estimate_fixed_micro: int = 0
     env: str = "dev"
     livemode_required: bool | None = None  # prod: True (reject test-mode events); None = don't check
     api_version: str | None = None         # pin to the webhook endpoint's API version in prod
@@ -128,6 +137,8 @@ class StripeTopupConfig:
             myr_enabled=bool(getattr(settings, "feature_stripe_myr", False)),
             myr_fx_spread_bps=int(getattr(settings, "stripe_myr_fx_spread_bps", 150)),
             stripe_fee_absorbed=econ.stripe_fee_absorbed,
+            fee_estimate_bps=getattr(settings, "stripe_fee_estimate_bps", None),
+            fee_estimate_fixed_micro=int(getattr(settings, "stripe_fee_estimate_fixed_micro", 0) or 0),
             env=settings.env,
             livemode_required=True if settings.is_prod else None,
             api_version=getattr(settings, "stripe_api_version", None) or None,
@@ -156,7 +167,40 @@ class FxRateProvider(Protocol):
 class StripeGateway(Protocol):
     def create_payment_intent(self, params: dict, idempotency_key: str) -> dict: ...
 
-    def retrieve_payment_intent(self, pi_id: str) -> dict: ...
+    def retrieve_payment_intent(self, pi_id: str, expand: Sequence[str] = ()) -> dict: ...
+
+
+FEE_EXPAND = ("latest_charge.balance_transaction",)
+
+
+class StripeFeeNotReady(ExternalServiceError):
+    """The charge's balance_transaction is not available yet. The webhook must answer non-2xx so Stripe retries
+    (it retries with backoff for up to 3 days); nothing is credited until the actual fee is known."""
+
+    code = "stripe_fee_not_ready"
+
+
+def stripe_fee_micro(pi: Mapping[str, Any], gross_micro: int) -> int:
+    """Actual Stripe fee for a PaymentIntent, in micro-USD, from ``latest_charge.balance_transaction`` (SPEC §1:
+    credit = amount received − actual Stripe fee).
+
+    The balance transaction is in the account's SETTLEMENT currency (MYR for a Malaysian account) while the credit
+    is USD, so the fee is applied as a share of the gross: ``fee = gross_micro × bt.fee / bt.amount`` (floored —
+    fees charged to users round down, SPEC §1). This is currency-agnostic and needs no FX rate. ``bt.fee``
+    includes every Stripe fee line on the charge (processing, and any currency-conversion fee Stripe itemizes).
+    """
+    charge = pi.get("latest_charge")
+    if not isinstance(charge, Mapping):
+        raise StripeFeeNotReady("latest_charge not expanded/available")
+    bt = charge.get("balance_transaction")
+    if not isinstance(bt, Mapping):
+        raise StripeFeeNotReady("balance_transaction not available yet")
+    amount, fee = bt.get("amount"), bt.get("fee")
+    if isinstance(amount, bool) or isinstance(fee, bool) or not isinstance(amount, int) or not isinstance(fee, int):
+        raise ValidationFailed("balance_transaction amount/fee not integers")
+    if amount <= 0 or fee < 0 or fee >= amount:
+        raise ValidationFailed("balance_transaction amount/fee out of range")
+    return gross_micro * fee // amount
 
 
 def _form_encode(params: Mapping[str, Any], prefix: str = "") -> list[tuple[str, str]]:
@@ -237,12 +281,13 @@ class StripeHttpGateway:
             raise ExternalServiceError("stripe unreachable", error=type(e).__name__) from None
         return self._handle(resp, "create_payment_intent")
 
-    def retrieve_payment_intent(self, pi_id: str) -> dict:
+    def retrieve_payment_intent(self, pi_id: str, expand: Sequence[str] = ()) -> dict:
         if not re.fullmatch(r"pi_[A-Za-z0-9]+", pi_id or ""):
             raise ValidationFailed("bad payment intent id")
+        params = [("expand[]", e) for e in expand]
         try:
-            resp = self._session_().get(f"{self.api_base}/v1/payment_intents/{pi_id}", headers=self._headers(),
-                                        timeout=self.timeout)
+            resp = self._session_().get(f"{self.api_base}/v1/payment_intents/{pi_id}", params=params,
+                                        headers=self._headers(), timeout=self.timeout)
         except Exception as e:
             raise ExternalServiceError("stripe unreachable", error=type(e).__name__) from None
         return self._handle(resp, "retrieve_payment_intent")
@@ -294,9 +339,12 @@ class StripeLibGateway:
             raise ExternalServiceError("stripe create_payment_intent failed", error=type(e).__name__) from None
         return _plain(pi)
 
-    def retrieve_payment_intent(self, pi_id: str) -> dict:
+    def retrieve_payment_intent(self, pi_id: str, expand: Sequence[str] = ()) -> dict:
         try:
-            return _plain(self._lib.PaymentIntent.retrieve(pi_id, **self._opts()))
+            kw = dict(self._opts())
+            if expand:
+                kw["expand"] = list(expand)
+            return _plain(self._lib.PaymentIntent.retrieve(pi_id, **kw))
         except Exception as e:
             raise ExternalServiceError("stripe retrieve_payment_intent failed", error=type(e).__name__) from None
 
@@ -315,12 +363,14 @@ def default_gateway(settings: Any) -> StripeGateway:
 class TopupIntent:
     payment_intent_id: str
     client_secret: str          # to the browser only; never log
-    credit_micro: int           # USD credit the user will receive on success
+    credit_micro: int           # GROSS USD value of the payment; the credit is this minus the actual Stripe fee
     currency: str               # presentment currency charged ("usd" | "myr")
     amount_minor: int           # amount charged in ``currency`` minor units (cents / sen)
     idempotency_key: str
     fx_rate_applied: str | None = None   # MYR per USD incl. spread (MYR path)
     fx_quote: FxQuote | None = None
+    fee_passthrough: bool = True
+    estimated_fee_micro: int | None = None
 
     def public_view(self) -> dict:
         """What the API returns to the browser."""
@@ -331,7 +381,13 @@ class TopupIntent:
             "credit_display": fmt_usd(self.credit_micro),
             "currency": self.currency,
             "amount_minor": self.amount_minor,
+            "fee_passthrough": self.fee_passthrough,
         }
+        if self.fee_passthrough:
+            d["fee_note"] = "The payment processor's fee is deducted from the amount credited."
+            if self.estimated_fee_micro is not None:
+                d["estimated_fee_micro"] = self.estimated_fee_micro
+                d["estimated_credit_micro"] = self.credit_micro - self.estimated_fee_micro
         if self.fx_rate_applied:
             d["fx_rate_applied"] = self.fx_rate_applied
         return d
@@ -456,7 +512,11 @@ def create_topup_intent(
         raise Conflict("PaymentIntent does not match the request")
     log.info("stripe topup intent created", extra={"fields": {
         "user_id": user_id, "pi": pi_id, "currency": currency, "amount_minor": amount_minor, "credit_micro": amount_micro}})
-    return TopupIntent(pi_id, secret, amount_micro, currency, amount_minor, idem_key, applied_str, quote)
+    est = None
+    if not cfg.stripe_fee_absorbed and cfg.fee_estimate_bps is not None:
+        est = min(amount_micro, apply_bps_floor(amount_micro, cfg.fee_estimate_bps) + cfg.fee_estimate_fixed_micro)
+    return TopupIntent(pi_id, secret, amount_micro, currency, amount_minor, idem_key, applied_str, quote,
+                       fee_passthrough=not cfg.stripe_fee_absorbed, estimated_fee_micro=est)
 
 
 # ==============================================================================================================
@@ -674,10 +734,20 @@ def handle_event(
 ) -> WebhookOutcome:
     """Map a VERIFIED Stripe event to ledger instructions + alerts. Pure apart from optional ports:
 
-    * ``gateway`` — if given, ``payment_intent.succeeded`` re-fetches the PaymentIntent from Stripe and uses that
-      (defence in depth against a leaked webhook secret) and disputes can resolve the original top-up.
+    * ``gateway`` — ``payment_intent.succeeded`` re-fetches the PaymentIntent from Stripe (expanded with
+      ``latest_charge.balance_transaction``) and uses that: the actual fee for the pass-through credit, and
+      defence in depth against a leaked webhook secret. REQUIRED when fees are passed through (the default):
+      without it (or ``fee_lookup``) the event raises and Stripe retries. Also resolves disputes.
     * ``lookup`` — our ``deposits`` table by PaymentIntent id (preferred source for refunds/disputes).
-    * ``fee_lookup`` — only when Stripe fees are NOT absorbed: returns the Stripe fee in micro-USD for a PI.
+    * ``fee_lookup`` — override: returns the Stripe fee in micro-USD for a (re-fetched) PaymentIntent.
+
+    Raises ``StripeFeeNotReady`` / ``ExternalServiceError`` for conditions that should be retried: the API must
+    answer non-2xx so Stripe redelivers (nothing is credited in the meantime).
+
+    Credit = gross − actual fee (SPEC §1). Reversals (refunds, disputes) debit the GROSS value of the refunded or
+    disputed amount: that is the money that went back to the user, and Stripe does not return its fee. A
+    refund issued per Terms 10.9 (net of the processor fee) therefore reverses exactly the credit; a chargeback
+    of the full gross leaves the balance negative by the fee (→ reduce-only until topped up).
 
     Idempotency keys: credit ``stripe:{pi}``; refund ``stripe:refund:{charge}:{cumulative_refunded_minor}``;
     dispute ``stripe:dispute:{dispute}``; dispute reinstated ``stripe:dispute_reinstated:{dispute}``.
@@ -726,8 +796,10 @@ def _on_pi_succeeded(out: WebhookOutcome, pi: dict, cfg: StripeTopupConfig, gate
     if not _env_ok(meta, cfg):
         out.ignored = "top-up belongs to another environment"
         return out
+    if not cfg.stripe_fee_absorbed and gateway is None and fee_lookup is None:
+        raise ExternalServiceError("stripe fee pass-through needs a gateway to read the balance transaction")
     if gateway is not None:
-        fetched = gateway.retrieve_payment_intent(pi_id)
+        fetched = gateway.retrieve_payment_intent(pi_id, expand=FEE_EXPAND if not cfg.stripe_fee_absorbed else ())
         if fetched.get("id") != pi_id:
             return _manual(out, "re-fetched PaymentIntent id mismatch")
         pi, meta = fetched, fetched.get("metadata") or {}
@@ -755,14 +827,18 @@ def _on_pi_succeeded(out: WebhookOutcome, pi: dict, cfg: StripeTopupConfig, gate
     if received != amount:
         out.alerts.append(_ops_alert("payment_manual_review", Severity.WARN, f"stripe_partial:{pi_id}", event=out.event_id,
                                      event_type=out.event_type, reason=f"received {received} of {amount} {currency} minor units; credited pro-rata"))
+    gross = credit
     fee_micro = 0
     if not cfg.stripe_fee_absorbed:
-        if fee_lookup is None:
-            return _manual(out, "Stripe fee pass-through enabled but no fee lookup configured")
-        fee_micro = int(fee_lookup(pi))
-        if fee_micro < 0 or fee_micro >= credit:
-            return _manual(out, "Stripe fee lookup returned an invalid fee")
-        credit -= fee_micro
+        try:
+            fee_micro = int(fee_lookup(pi)) if fee_lookup is not None else stripe_fee_micro(pi, gross)
+        except StripeFeeNotReady:
+            raise
+        except (ValidationFailed, TypeError, ValueError) as e:
+            return _manual(out, f"Stripe fee unreadable: {getattr(e, 'message', type(e).__name__)}")
+        if fee_micro < 0 or fee_micro >= gross:
+            return _manual(out, "Stripe fee out of range")
+        credit = gross - fee_micro
     out.credits.append(CreditInstruction(
         user_id=user_id,
         amount_micro=credit,
@@ -772,9 +848,9 @@ def _on_pi_succeeded(out: WebhookOutcome, pi: dict, cfg: StripeTopupConfig, gate
         debit_account=STRIPE_CLEARING,
         credit_account=user_fee_balance_account(user_id),
         kind="deposit",
-        memo=f"Stripe top-up {pi_id} ({received} {currency} minor)",
+        memo=f"Stripe top-up {pi_id} ({received} {currency} minor; gross {fmt_usd(gross)}, processor fee {fmt_usd(fee_micro)})",
         withdrawable=False,
-        meta={"currency": currency, "amount_minor": received, "fee_micro": fee_micro,
+        meta={"currency": currency, "amount_minor": received, "gross_micro": gross, "fee_micro": fee_micro,
               "fx_rate_applied": meta.get("fx_rate_applied"), "event_id": out.event_id},
     ))
     out.alerts.append(Alert(kind="topup_credited", severity=Severity.INFO, user_id=user_id,

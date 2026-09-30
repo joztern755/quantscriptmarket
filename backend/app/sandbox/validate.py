@@ -213,9 +213,12 @@ def _pos(node: ast.AST) -> tuple[int | None, int | None]:
 class _Checker:
     def __init__(self) -> None:
         self.errors: list[Issue] = []
+        self.parent_pos: dict[int, tuple[int | None, int | None]] = {}
 
     def err(self, code: str, message: str, node: ast.AST | None = None) -> None:
         line, col = _pos(node) if node is not None else (None, None)
+        if line is None and node is not None:
+            line, col = self.parent_pos.get(id(node), (None, None))
         if len(self.errors) < 200:
             self.errors.append(Issue(code, message, line, col))
 
@@ -225,8 +228,22 @@ class _Checker:
         elif name in FORBIDDEN_NAMES:
             self.err("forbidden_name", f"{what} {name!r} is not allowed", node)
 
+    def _nodes(self, tree: ast.AST) -> Iterable[ast.AST]:
+        """Iterative walk (no recursion) that remembers the nearest positioned ancestor, so operator and
+        context nodes (which carry no line numbers) can still be reported with one."""
+        stack: list[tuple[ast.AST, tuple[int | None, int | None]]] = [(tree, (None, None))]
+        while stack:
+            node, inherited = stack.pop()
+            pos = _pos(node)
+            if pos[0] is None:
+                pos = inherited
+                self.parent_pos[id(node)] = pos
+            yield node
+            for child in ast.iter_child_nodes(node):
+                stack.append((child, pos))
+
     def walk(self, tree: ast.Module) -> None:
-        for node in ast.walk(tree):
+        for node in self._nodes(tree):
             t = type(node)
             if t not in ALLOWED_NODES:
                 name = t.__name__
@@ -425,8 +442,7 @@ def validate_source(source: str | bytes, *, known_markets: Iterable[str] | None 
         try:
             compile(tree, "<strategy>", "exec", dont_inherit=True)
         except SyntaxError as e:
-            chk.err("syntax_error", f"syntax error: {e.msg}")
-            chk.errors[-1] = Issue("syntax_error", f"syntax error: {e.msg}", e.lineno, e.offset)
+            chk.errors.append(Issue("syntax_error", f"syntax error: {e.msg}", e.lineno, e.offset))
         except (ValueError, MemoryError, RecursionError) as e:
             chk.err("too_complex", f"could not compile: {type(e).__name__}")
     chk.errors.sort(key=lambda i: (i.line or 0, i.col or 0))

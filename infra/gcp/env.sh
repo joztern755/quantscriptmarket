@@ -49,7 +49,7 @@ SANDBOX_IMAGE_REPO="${AR_HOST}/${PROJECT_ID}/${AR_REPO}/sandbox"
 
 # ---- Cloud SQL -------------------------------------------------------------------------------------------
 : "${SQL_INSTANCE:=aijalon-pg}"
-: "${SQL_EDITION:=ENTERPRISE}"                   # explicit: PG16 otherwise defaults to ENTERPRISE_PLUS
+: "${SQL_EDITION:=enterprise}"                   # explicit: PG16 otherwise defaults to enterprise-plus
 : "${SQL_TIER:=db-custom-2-8192}"                # 2 vCPU / 8 GB; resize later without data loss
 : "${SQL_STORAGE_GB:=50}"
 : "${SQL_MAX_CONNECTIONS:=200}"                  # api 20 inst x 5 + executor 3 x 5 + migrate + headroom

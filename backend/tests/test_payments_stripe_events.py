@@ -9,9 +9,17 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from app.alerts.notifier import Severity  # noqa: E402
 from app.payments.instructions import CreditInstruction, DebitInstruction  # noqa: E402
-from app.payments.stripe_pay import DepositRecord, StripeTopupConfig, handle_event  # noqa: E402
+from app.errors import ExternalServiceError  # noqa: E402
+from app.payments.stripe_pay import (  # noqa: E402
+    DepositRecord,
+    StripeFeeNotReady,
+    StripeTopupConfig,
+    handle_event,
+    stripe_fee_micro,
+)
 
-CFG = StripeTopupConfig(env="test")
+CFG = StripeTopupConfig(env="test")                                   # prod default: fee passed through
+CFG_ABSORB = StripeTopupConfig(env="test", stripe_fee_absorbed=True)
 USER = "8c1f6a1e-0000-4000-8000-000000000001"
 
 
@@ -36,22 +44,39 @@ MYR_META = {"user_id": USER, "purpose": "fee_balance_topup", "idempotency": "tok
             "credit_micro": "50000000", "amount_minor": "23665", "fx_rate_applied": "4.733"}
 
 
+def expanded(p, bt_amount=None, bt_fee=0, bt=True):
+    """PI as returned by retrieve(expand=[latest_charge.balance_transaction]); bt in MYR (settlement currency)."""
+    p = dict(p)
+    p["latest_charge"] = {"id": "ch_1", "object": "charge",
+                          "balance_transaction": ({"id": "txn_1", "amount": bt_amount or p["amount"] * 4,
+                                                   "currency": "myr", "fee": bt_fee} if bt else None)}
+    return p
+
+
 class FakeGateway:
     def __init__(self, pis):
         self.pis = pis
         self.calls = []
 
-    def retrieve_payment_intent(self, pi_id):
-        self.calls.append(pi_id)
+    def retrieve_payment_intent(self, pi_id, expand=()):
+        self.calls.append((pi_id, tuple(expand)))
         return self.pis[pi_id]
+
+
+def gw(p, **kw):
+    return FakeGateway({p["id"]: expanded(p, **kw)})
 
     def create_payment_intent(self, params, key):  # pragma: no cover
         raise AssertionError
 
 
 class SucceededTests(unittest.TestCase):
-    def test_usd_credit(self):
-        out = handle_event(event("payment_intent.succeeded", pi()), config=CFG)
+    def ev(self, p, cfg=CFG, gateway="auto", **kw):
+        g = gw(p) if gateway == "auto" else gateway
+        return handle_event(event("payment_intent.succeeded", p), config=cfg, gateway=g, **kw)
+
+    def test_usd_credit_zero_fee(self):
+        out = self.ev(pi())
         self.assertEqual(len(out.credits), 1)
         c = out.credits[0]
         self.assertIsInstance(c, CreditInstruction)
@@ -62,22 +87,59 @@ class SucceededTests(unittest.TestCase):
         self.assertFalse(c.withdrawable)
         self.assertEqual([a.kind for a in out.alerts], ["topup_credited"])
 
+    def test_fee_pass_through_uses_actual_fee_share(self):
+        # $50 charged; settled 235.00 MYR with 11.75 MYR fee (5%) -> fee $2.50, credit $47.50
+        g = gw(pi(), bt_amount=23500, bt_fee=1175)
+        out = self.ev(pi(), gateway=g)
+        c = out.credits[0]
+        self.assertEqual(c.amount_micro, 47_500_000)
+        self.assertEqual((c.meta["gross_micro"], c.meta["fee_micro"]), (50_000_000, 2_500_000))
+        self.assertEqual(g.calls, [("pi_123", ("latest_charge.balance_transaction",))])
+        self.assertEqual(out.alerts[0].data["amount_micro"], 47_500_000)
+
+    def test_fee_rounds_down(self):
+        self.assertEqual(stripe_fee_micro(expanded(pi(amount=1001), bt_amount=3, bt_fee=1), 10_010_000), 3_336_666)
+
+    def test_fee_not_ready_raises_for_retry(self):
+        with self.assertRaises(StripeFeeNotReady):
+            self.ev(pi(), gateway=gw(pi(), bt=False))
+        g = FakeGateway({"pi_123": pi()})  # latest_charge not expanded
+        with self.assertRaises(StripeFeeNotReady):
+            self.ev(pi(), gateway=g)
+
+    def test_pass_through_without_gateway_raises(self):
+        with self.assertRaises(ExternalServiceError):
+            self.ev(pi(), gateway=None)
+
+    def test_bad_fee_goes_to_manual_review(self):
+        out = self.ev(pi(), gateway=gw(pi(), bt_amount=100, bt_fee=100))
+        self.assertEqual(out.instructions, [])
+        self.assertIsNotNone(out.manual_review)
+
+    def test_fee_lookup_override(self):
+        out = self.ev(pi(), gateway=None, fee_lookup=lambda p: 1_750_000)
+        self.assertEqual(out.credits[0].amount_micro, 48_250_000)
+
+    def test_absorbed_mode_credits_gross_without_gateway(self):
+        out = self.ev(pi(), cfg=CFG_ABSORB, gateway=None)
+        self.assertEqual(out.credits[0].amount_micro, 50_000_000)
+
     def test_idempotent_redelivery(self):
-        a = handle_event(event("payment_intent.succeeded", pi(), evt_id="evt_1"), config=CFG)
-        b = handle_event(event("payment_intent.succeeded", pi(), evt_id="evt_1"), config=CFG)
-        c = handle_event(event("payment_intent.succeeded", pi(), evt_id="evt_resend"), config=CFG)
+        a = handle_event(event("payment_intent.succeeded", pi(), evt_id="evt_1"), config=CFG, gateway=gw(pi()))
+        b = handle_event(event("payment_intent.succeeded", pi(), evt_id="evt_1"), config=CFG, gateway=gw(pi()))
+        c = handle_event(event("payment_intent.succeeded", pi(), evt_id="evt_resend"), config=CFG, gateway=gw(pi()))
         self.assertEqual(a.credits[0].idempotency_key, b.credits[0].idempotency_key)
         self.assertEqual(a.credits[0].idempotency_key, c.credits[0].idempotency_key)
         self.assertEqual(a.credits[0].amount_micro, c.credits[0].amount_micro)
 
     def test_foreign_purpose_ignored(self):
-        out = handle_event(event("payment_intent.succeeded", pi(meta={"purpose": "other"})), config=CFG)
+        out = self.ev(pi(meta={"purpose": "other"}), gateway=None)
         self.assertEqual(out.instructions, [])
         self.assertEqual(out.ignored, "not a fee-balance top-up")
 
     def test_other_env_ignored(self):
         meta = dict(pi()["metadata"], env="prod")
-        out = handle_event(event("payment_intent.succeeded", pi(meta=meta)), config=CFG)
+        out = self.ev(pi(meta=meta), gateway=None)
         self.assertEqual(out.instructions, [])
 
     def test_unknown_event_ignored(self):
@@ -87,57 +149,52 @@ class SucceededTests(unittest.TestCase):
 
     def test_livemode_mismatch(self):
         cfg = StripeTopupConfig(env="prod", livemode_required=True)
-        out = handle_event(event("payment_intent.succeeded", pi(), livemode=False), config=cfg)
+        out = handle_event(event("payment_intent.succeeded", pi(), livemode=False), config=cfg, gateway=gw(pi()))
         self.assertEqual(out.instructions, [])
         self.assertEqual(out.alerts[0].severity, Severity.CRITICAL)
 
     def test_status_not_succeeded_goes_to_manual_review(self):
-        out = handle_event(event("payment_intent.succeeded", pi(status="processing")), config=CFG)
+        p = pi(status="processing")
+        out = self.ev(p, gateway=gw(p))
         self.assertEqual(out.instructions, [])
         self.assertIsNotNone(out.manual_review)
         self.assertEqual(out.alerts[0].kind, "payment_manual_review")
 
     def test_missing_user(self):
-        meta = {"purpose": "fee_balance_topup"}
-        out = handle_event(event("payment_intent.succeeded", pi(meta=meta)), config=CFG)
+        p = pi(meta={"purpose": "fee_balance_topup"})
+        out = self.ev(p, gateway=gw(p))
         self.assertEqual(out.instructions, [])
         self.assertIsNotNone(out.manual_review)
 
     def test_partial_received_credits_received_and_warns(self):
-        out = handle_event(event("payment_intent.succeeded", pi(amount=5000, received=4000)), config=CFG)
+        p = pi(amount=5000, received=4000)
+        out = self.ev(p, gateway=gw(p))
         self.assertEqual(out.credits[0].amount_micro, 40_000_000)
         self.assertIn(Severity.WARN, [a.severity for a in out.alerts])
 
-    def test_myr_credits_locked_amount(self):
+    def test_myr_credits_locked_amount_minus_fee(self):
         p = pi(amount=23665, currency="myr", meta=MYR_META)
-        out = handle_event(event("payment_intent.succeeded", p), config=CFG)
+        out = self.ev(p, gateway=gw(p, bt_amount=23665, bt_fee=0))
         self.assertEqual(out.credits[0].amount_micro, 50_000_000)
+        out = self.ev(p, gateway=gw(p, bt_amount=23665, bt_fee=710))  # 3% fee in sen
+        self.assertEqual(out.credits[0].amount_micro, 50_000_000 - 50_000_000 * 710 // 23665)
 
     def test_myr_without_fx_lock_manual(self):
         meta = {k: v for k, v in MYR_META.items() if k != "amount_minor"}
-        out = handle_event(event("payment_intent.succeeded", pi(amount=23665, currency="myr", meta=meta)), config=CFG)
+        p = pi(amount=23665, currency="myr", meta=meta)
+        out = self.ev(p, gateway=gw(p))
         self.assertEqual(out.instructions, [])
         self.assertIsNotNone(out.manual_review)
 
     def test_refetch_via_gateway_is_authoritative(self):
         # Event claims 5000 but Stripe (source of truth) says 1000 received.
-        gw = FakeGateway({"pi_123": pi(amount=1000)})
-        out = handle_event(event("payment_intent.succeeded", pi(amount=5000)), config=CFG, gateway=gw)
-        self.assertEqual(gw.calls, ["pi_123"])
+        g = gw(pi(amount=1000))
+        out = self.ev(pi(amount=5000), gateway=g)
         self.assertEqual(out.credits[0].amount_micro, 10_000_000)
 
     def test_refetch_not_succeeded(self):
-        gw = FakeGateway({"pi_123": pi(status="requires_payment_method")})
-        out = handle_event(event("payment_intent.succeeded", pi()), config=CFG, gateway=gw)
+        out = self.ev(pi(), gateway=gw(pi(status="requires_payment_method")))
         self.assertEqual(out.instructions, [])
-
-    def test_fee_pass_through(self):
-        cfg = StripeTopupConfig(env="test", stripe_fee_absorbed=False)
-        out = handle_event(event("payment_intent.succeeded", pi()), config=cfg, fee_lookup=lambda p: 1_750_000)
-        self.assertEqual(out.credits[0].amount_micro, 48_250_000)
-        out = handle_event(event("payment_intent.succeeded", pi()), config=cfg)
-        self.assertEqual(out.instructions, [])
-        self.assertIsNotNone(out.manual_review)
 
     def test_payment_failed_info_alert(self):
         out = handle_event(event("payment_intent.payment_failed", pi(status="requires_payment_method")), config=CFG)

@@ -1,4 +1,5 @@
 -- =====================================================================================================
+-- migrate:session-user
 -- 0001_init.sql — aijalon.trade core schema (docs/SPEC.md §4 is the contract).
 -- Applied by backend/scripts/migrate.py inside ONE transaction. Do not add BEGIN/COMMIT here.
 -- Never edit this file after it has been applied anywhere: migrate.py refuses changed checksums.

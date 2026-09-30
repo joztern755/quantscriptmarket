@@ -32,6 +32,10 @@ from app.execution.ports import (  # noqa: E402
 )
 from app.money import MICRO  # noqa: E402
 
+import logging  # noqa: E402
+
+logging.getLogger("app.execution").setLevel(logging.CRITICAL)  # keep test output readable (assertLogs overrides)
+
 UTC = timezone.utc
 BAR = datetime(2026, 10, 1, 0, 0, tzinfo=UTC)
 SILVER = "xyz:SILVER"
@@ -347,7 +351,7 @@ class FakeLedger:
     def post_transaction(self, *, idempotency_key: str, kind: str, memo: str, lines: Sequence[LedgerLine],
                          created_by: str) -> tuple[str, bool]:
         self.posts += 1
-        if sum(l.amount_micro for l in lines) != 0:
+        if sum(ln.amount_micro for ln in lines) != 0:
             raise AssertionError("unbalanced")
         if idempotency_key in self.txs:
             tx_id, _, old = self.txs[idempotency_key]
@@ -356,8 +360,8 @@ class FakeLedger:
             return tx_id, False
         tx_id = f"tx{len(self.txs) + 1}"
         self.txs[idempotency_key] = (tx_id, kind, tuple(lines))
-        for l in lines:
-            self.balances[l.account_code] = self.balances.get(l.account_code, 0) + l.amount_micro
+        for ln in lines:
+            self.balances[ln.account_code] = self.balances.get(ln.account_code, 0) + ln.amount_micro
         return tx_id, True
 
     def has_transaction(self, idempotency_key: str) -> bool:

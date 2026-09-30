@@ -1,0 +1,61 @@
+diff --git a/.github/workflows/build-deploy.yml b/.github/workflows/build-deploy.yml
+index a4538c8..b262aaf 100644
+--- a/.github/workflows/build-deploy.yml
++++ b/.github/workflows/build-deploy.yml
+@@ -72,6 +72,32 @@ jobs:
+           curl -fsS https://aijalon-terminal.web.app/health.json -o data/health_prev.json || rm -f data/health_prev.json
+           node tests/health.js || echo "::warning::tests/health.js did not finish; the page keeps the last health.json"
+           python3 web/build_crest.py
++      - name: Marketplace signals (aijalon.trade; signed state of the listed scripts at the last completed bar)
++        # market_signals/emit.js runs the vendored, hash-pinned crest_silver.js on the rows this build just downloaded and
++        # checked (through crest/gen_multi.js, the same loader as the page), reads the state at the last completed daily
++        # bar (0 cash, 1 long, 2 long with 2x), self-tests that truncating the rows never changes a past state (no
++        # look-ahead), and writes public/signals.json (canonical JSON) + public/signals.sig (Ed25519, base64) atomically.
++        # The private key lives only in the secret below and only this step sees it. If the emit fails (or the secret is
++        # not set yet), the pair published last time is re-published unchanged: it still verifies, and aijalon.trade
++        # flags it stale after 36 h. The page never waits for the marketplace.
++        timeout-minutes: 5
++        env:
++          SIGNALS_ED25519_PRIVATE_KEY_PEM: ${{ secrets.SIGNALS_ED25519_PRIVATE_KEY_PEM }}
++          SIGNALS_ED25519_PUBLIC_KEY_B64: ${{ vars.SIGNALS_ED25519_PUBLIC_KEY_B64 }}
++        run: |
++          if node market_signals/emit.js --terminal . --out-dir public; then
++            echo "public/signals.json: $(cat public/signals.json)"
++          else
++            echo "::warning::marketplace signals not emitted; re-publishing the previous signed pair (if any)"
++            rm -f public/signals.json public/signals.sig
++            if curl -fsS https://aijalon-terminal.web.app/signals.json -o public/signals.json \
++               && curl -fsS https://aijalon-terminal.web.app/signals.sig -o public/signals.sig; then
++              echo "previous pair kept: $(cat public/signals.json)"
++            else
++              rm -f public/signals.json public/signals.sig
++              echo "::warning::no previous signals pair to keep"
++            fi
++          fi
+       - uses: FirebaseExtended/action-hosting-deploy@v0
+         with:
+           repoToken: ${{ secrets.GITHUB_TOKEN }}
+diff --git a/firebase.json b/firebase.json
+index fbe3dde..bcb219c 100644
+--- a/firebase.json
++++ b/firebase.json
+@@ -15,6 +15,19 @@
+             "value": "no-cache"
+           }
+         ]
++      },
++      {
++        "source": "/signals.@(json|sig)",
++        "headers": [
++          {
++            "key": "Cache-Control",
++            "value": "no-cache, max-age=0"
++          },
++          {
++            "key": "X-Content-Type-Options",
++            "value": "nosniff"
++          }
++        ]
+       }
+     ]
+   },

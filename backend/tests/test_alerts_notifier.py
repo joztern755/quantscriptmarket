@@ -227,13 +227,60 @@ class RedactionTests(unittest.TestCase):
         self.assertIn("$1,234.56", prov.sent[0][2])
         self.assertIn("0x1234…abcd", prov.sent[0][2])
 
-    def test_missing_template_param(self):
-        r = render(Alert("balance_low", Severity.WARN, "u1"))
-        self.assertIn("?", r.body)
+    def test_missing_template_param_falls_back_to_generic(self):
+        r = render(Alert("balance_low", Severity.WARN, "u1", data={"other_micro": 5_000_000}))
+        self.assertNotIn("{", r.body)
+        self.assertEqual(r.title, "Balance low")
+        self.assertIn("other_micro: $5.00", r.body)
+
+    def test_generic_render_of_unknown_kind(self):
+        r = render(Alert("position_drift", Severity.WARN, None, coin="BTC",
+                         data={"expected_micro": 1_000_000, "tags": ["a", "b"], "deviation_bps": "350.5", "x": None}))
+        self.assertEqual(r.title, "Position drift (BTC)")
+        self.assertIn("expected_micro: $1.00", r.body)
+        self.assertIn("deviation_bps: 3.50%", r.body)
+        self.assertIn("tags: a, b", r.body)
+
+    def test_domain_payload_keys(self):
+        r = render(Alert("mark_oracle_divergence", Severity.CRITICAL, None, coin="xyz:SILVER",
+                         data={"coin": "xyz:SILVER", "mark_px": "31.2", "oracle_px": "30.5", "deviation_bps": "229.51"}))
+        self.assertEqual(r.body, "Mark 31.2 deviates 2.30% from oracle 30.5 on xyz:SILVER.")
 
     def test_format_injection_not_evaluated(self):
         r = render(Alert("kill_switch", Severity.WARN, None, data={"scope": "{reason.__class__}", "reason": "x"}))
         self.assertIn("{reason.__class__}", r.body)
+
+
+class DuckTypedAlertTests(unittest.TestCase):
+    def test_domain_alert_auto_pause_flag(self):
+        from app.domain.alerts_rules import Alert as DomainAlert
+        flags = Flags()
+        n, repo, *_ = make(flags=flags)
+        n.notify(DomainAlert("critical", "reconciliation_mismatch", "rm:1", {"scope": "builder", "diff_micro": 2_000_000},
+                             auto_pause_market=False, market="BTC"))
+        self.assertEqual(flags.paused, [])
+        n.notify(DomainAlert("critical", "oi_spike", "oi:1", {"coin": "HYPE", "growth_bps": 6000},
+                             auto_pause_market=True, market="HYPE"))
+        self.assertEqual([c for c, _ in flags.paused], ["HYPE"])
+        self.assertEqual(len(repo.rows), 2)
+        self.assertEqual(repo.rows[0][3]["key"], "rm:1")
+
+    def test_execution_alert_event(self):
+        from app.execution.ports import AlertEvent
+        flags = Flags()
+        n, repo, *_ = make(flags=flags)
+        n.notify(AlertEvent(severity="critical", kind="stale_signal", payload={"strategy": "silver"}, dedup_key="s:1",
+                            coin="xyz:SILVER"))
+        self.assertEqual([c for c, _ in flags.paused], ["xyz:SILVER"])
+        self.assertEqual(repo.rows[0][3]["key"], "s:1")
+
+    def test_send_keyword_form(self):
+        n, repo, prov, *_ = make()
+        r = n.send(severity="warn", kind="new_country_login", payload={"country": "SG"}, user_id="u1")
+        self.assertTrue(r.delivered["in_app"])
+        self.assertIn("(SG)", prov.sent[0][2])
+        r = n.send(severity="bogus", kind="x")
+        self.assertTrue(r.errors)
 
 
 class ResilienceTests(unittest.TestCase):

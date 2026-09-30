@@ -399,7 +399,10 @@ def compute_metrics(curve: Sequence[tuple[int, float]], exposure: Sequence[float
     years = (curve[-1][0] - curve[0][0]) / YEAR_MS
     cagr = None
     if years >= 30 / 365.25 and e0 > 0:
-        cagr = (e1 / e0) ** (1.0 / years) - 1.0 if e1 > 0 else -1.0
+        try:
+            cagr = (e1 / e0) ** (1.0 / years) - 1.0 if e1 > 0 else -1.0
+        except OverflowError:
+            cagr = None
     peak, mdd = curve[0][1], 0.0
     for _, e in curve:
         peak = max(peak, e)

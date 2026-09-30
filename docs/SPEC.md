@@ -72,7 +72,7 @@ The **treasury / builder wallet private key is never on any server.** Builder fe
 
 ```
 docs/            SPEC.md (this), ARCHITECTURE.md, SECURITY.md, RUNBOOK.md, GO_LIVE_CHECKLIST.md, DEPLOY.md
-legal/           terms.md, risk-disclosure.md, privacy.md (PDPA 2010), creator-agreement.md, acceptable-use.md, restricted-jurisdictions.md  — DRAFTS for Malaysian counsel
+legal/           terms.md, risk-disclosure.md, privacy.md (PDPA 2010), creator-agreement.md, acceptable-use.md, jurisdiction.md  — DRAFTS for Malaysian counsel
 backend/
   pyproject.toml, requirements.txt (pinned, hashes in CI), requirements-dev.txt
   app/

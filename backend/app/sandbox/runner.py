@@ -12,7 +12,10 @@ interpreter bug. The *real* security boundary is the ``sandbox`` Cloud Run servi
 * a dedicated service account with **no IAM roles** (no DB, KMS, Secret Manager, metadata-token value);
 * nothing secret in the container: no env secrets besides the service's own inbound shared secret,
   no credentials files, no data other than what a request carries;
-* per-request process isolation (this module) + ``--concurrency`` kept low + max instances capped.
+* per-request process isolation (this module) + ``--concurrency`` kept low + max instances capped;
+* the container runs as an unprivileged uid (10001); if this module ever runs as root (dev/CI) the child
+  is dropped to ``nobody``. The child also sets ``PR_SET_NO_NEW_PRIVS`` and ``PR_SET_DUMPABLE=0`` so a
+  concurrently running script (same uid) cannot ptrace it or read its memory.
 
 What this module adds on top of the static AST allowlist (validate.py):
 
@@ -139,6 +142,16 @@ def _main():
 
     lim = req["limits"]
     applied = {}
+    # Not ptrace-able / not /proc/<pid>/mem-readable by other same-uid processes (concurrent scripts),
+    # and no privilege gain through setuid binaries even after an escape.
+    try:
+        import ctypes
+        _libc = ctypes.CDLL(None, use_errno=True)
+        applied["no_new_privs"] = _libc.prctl(38, 1, 0, 0, 0) == 0   # PR_SET_NO_NEW_PRIVS
+        applied["non_dumpable"] = _libc.prctl(4, 0, 0, 0, 0) == 0    # PR_SET_DUMPABLE = 0
+        del _libc, ctypes
+    except Exception:
+        applied["no_new_privs"] = applied["non_dumpable"] = False
     def setl(name, value):
         r = getattr(resource, name, None)
         if r is None:
@@ -304,6 +317,15 @@ def _python_argv() -> list[str]:
 
 
 _CHILD_ENV = {"PYTHONHASHSEED": "0", "LC_ALL": "C.UTF-8"}
+# If the parent runs as root (it must not in prod — the image runs as uid 10001 — but dev/CI often do),
+# drop the child to nobody so RLIMIT_NPROC=0 is enforced and root-only files stay out of reach.
+_NOBODY = 65534
+
+
+def _privilege_kwargs() -> dict[str, Any]:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return {"user": _NOBODY, "group": _NOBODY, "extra_groups": []}
+    return {}
 _SIG_NAMES = {getattr(signal, n): n for n in ("SIGXCPU", "SIGKILL", "SIGSEGV", "SIGXFSZ", "SIGABRT", "SIGBUS") if hasattr(signal, n)}
 
 
@@ -322,7 +344,7 @@ def _spawn(request: dict[str, Any], limits: RunLimits) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="sbx-") as cwd:
         proc = subprocess.Popen(
             _python_argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            cwd=cwd, env=dict(_CHILD_ENV), close_fds=True, start_new_session=True,
+            cwd=cwd, env=dict(_CHILD_ENV), close_fds=True, start_new_session=True, **_privilege_kwargs(),
         )
 
         def kill() -> None:

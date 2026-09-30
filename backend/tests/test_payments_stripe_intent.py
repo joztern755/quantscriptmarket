@@ -89,6 +89,15 @@ class CreateIntentTests(unittest.TestCase):
             create_topup_intent(User(USER, "suspended"), 10_000_000, gateway=self.gw, idempotency=TOKEN, config=self.cfg)
         self.assertEqual(self.gw.calls, [])
 
+    def test_fee_estimate_in_public_view(self):
+        cfg = StripeTopupConfig(env="test", fee_estimate_bps=300, fee_estimate_fixed_micro=250_000)
+        v = create_topup_intent(USER, 100_000_000, gateway=self.gw, idempotency=TOKEN, config=cfg).public_view()
+        self.assertTrue(v["fee_passthrough"])
+        self.assertEqual((v["estimated_fee_micro"], v["estimated_credit_micro"]), (3_250_000, 96_750_000))
+        v = create_topup_intent(USER, 100_000_000, gateway=self.gw, idempotency=TOKEN, config=self.cfg).public_view()
+        self.assertNotIn("estimated_fee_micro", v)
+        self.assertIn("fee_note", v)
+
     def test_myr_disabled_by_default(self):
         with self.assertRaises(ValidationFailed):
             create_topup_intent(USER, 50_000_000, "myr", gateway=self.gw, idempotency=TOKEN, config=self.cfg,
@@ -107,8 +116,14 @@ class CreateIntentTests(unittest.TestCase):
         # the webhook credits exactly the locked USD amount
         pi = {"id": "pi_abc", "object": "payment_intent", "amount": 23665, "amount_received": 23665,
               "currency": "myr", "status": "succeeded", "metadata": md}
+        fetched = dict(pi, latest_charge={"balance_transaction": {"amount": 23665, "fee": 0, "currency": "myr"}})
+
+        class G:
+            def retrieve_payment_intent(self, pi_id, expand=()):
+                return fetched
+
         out = handle_event({"id": "evt", "object": "event", "type": "payment_intent.succeeded", "livemode": False,
-                            "data": {"object": pi}}, config=cfg)
+                            "data": {"object": pi}}, config=cfg, gateway=G())
         self.assertEqual(out.credits[0].amount_micro, 50_000_000)
 
     def test_myr_stale_or_insane_quote(self):
@@ -150,8 +165,8 @@ class FakeSession:
         self.calls.append(("POST", url, data, headers, timeout))
         return self.resp
 
-    def get(self, url, headers=None, timeout=None):
-        self.calls.append(("GET", url, None, headers, timeout))
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.calls.append(("GET", url, params, headers, timeout))
         return self.resp
 
 
@@ -190,8 +205,9 @@ class HttpGatewayTests(unittest.TestCase):
         gw = StripeHttpGateway("sk_test_x", session=s)
         with self.assertRaises(ValidationFailed):
             gw.retrieve_payment_intent("pi_1/../customers")
-        self.assertEqual(gw.retrieve_payment_intent("pi_1")["id"], "pi_1")
+        self.assertEqual(gw.retrieve_payment_intent("pi_1", expand=("latest_charge.balance_transaction",))["id"], "pi_1")
         self.assertEqual(s.calls[0][1], "https://api.stripe.com/v1/payment_intents/pi_1")
+        self.assertEqual(s.calls[0][2], [("expand[]", "latest_charge.balance_transaction")])
 
 
 if __name__ == "__main__":

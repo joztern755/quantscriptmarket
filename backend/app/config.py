@@ -103,6 +103,12 @@ class Settings:
     audit_pepper_b64: str                           # ≥32 random bytes, Secret Manager; hashes IPs / user agents
     firebase_auth_domain: str                       # e.g. aijalon.trade (recommended) or <project>.firebaseapp.com
     edge_auth_secret: str                           # shared secret header set by Cloudflare Transform Rule
+    launch_phase: str                               # "internal" (allowlisted emails, small caps) | "public"
+    allowlist_emails: tuple[str, ...]               # internal phase: only these emails may create accounts
+    max_allocation_per_user_micro: int              # cap per user across all subscriptions
+    max_total_platform_allocation_micro: int        # cap across all users
+    max_user_leverage: int                          # launch-phase leverage cap (≤ risk.platform_max_leverage)
+    payouts_enabled: bool
     economics: Economics = field(default_factory=Economics)
     risk: RiskLimits = field(default_factory=RiskLimits)
 
@@ -115,7 +121,7 @@ def _b(name: str, default: str) -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
-# DRAFT list for counsel review (legal/restricted-jurisdictions.md). ISO 3166-1 alpha-2.
+# DRAFT list for counsel review (legal/jurisdiction.md). ISO 3166-1 alpha-2.
 DEFAULT_RESTRICTED = ("US", "CU", "IR", "KP", "SY", "RU", "BY", "MM")
 
 
@@ -151,6 +157,12 @@ def get_settings() -> Settings:
         audit_pepper_b64=os.environ.get("AUDIT_PEPPER_B64", ""),
         firebase_auth_domain=os.environ.get("FIREBASE_AUTH_DOMAIN", ""),
         edge_auth_secret=os.environ.get("EDGE_AUTH_SECRET", ""),
+        launch_phase=os.environ.get("LAUNCH_PHASE", "internal"),
+        allowlist_emails=tuple(e.strip().lower() for e in os.environ.get("ALLOWLIST_EMAILS", "").split(",") if e.strip()),
+        max_allocation_per_user_micro=usd(os.environ.get("MAX_ALLOCATION_PER_USER_USD", "1000")),
+        max_total_platform_allocation_micro=usd(os.environ.get("MAX_TOTAL_PLATFORM_ALLOCATION_USD", "25000")),
+        max_user_leverage=int(os.environ.get("MAX_USER_LEVERAGE", "2")),
+        payouts_enabled=_b("PAYOUTS_ENABLED", "false"),
     )
     if s.is_prod:
         missing = [k for k in ("builder_address", "treasury_address", "kms_key_name", "firebase_project_id", "signals_pubkey_b64",
@@ -159,6 +171,10 @@ def get_settings() -> Settings:
             raise RuntimeError(f"prod config missing: {missing}")
         if s.local_dev_kek_b64:
             raise RuntimeError("LOCAL_DEV_KEK_B64 must not be set in prod")
+        if s.launch_phase not in ("internal", "public"):
+            raise RuntimeError("LAUNCH_PHASE must be internal|public")
+        if s.launch_phase == "internal" and not s.allowlist_emails:
+            raise RuntimeError("internal launch phase requires ALLOWLIST_EMAILS")
         if s.service_role not in ("api", "executor", "sandbox"):
             raise RuntimeError("SERVICE_ROLE must be api|executor|sandbox in prod")
     return s

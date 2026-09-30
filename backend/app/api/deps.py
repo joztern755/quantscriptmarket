@@ -16,6 +16,8 @@ Dependency ladder (each includes the previous):
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import threading
@@ -90,11 +92,25 @@ class ApiConfig:
     scheduler_sa_email: str
     internal_audience: str
     sandbox_url: str
-    ip_hash_salt: str
+    pepper: bytes
     kyc_provider: str
     legal_versions: dict[str, str]
     max_body_bytes: int = 128 * 1024
     max_upload_body_bytes: int = 1024 * 1024
+
+
+def _pepper(settings: Settings) -> bytes:
+    """HMAC pepper for ip/user-agent hashes (same secret as the audit log: AUDIT_PEPPER_B64). Dev falls back to
+    a fixed non-secret value; prod without a pepper refuses to hash (fail closed at startup, see main)."""
+    raw = getattr(settings, "audit_pepper_b64", "") or ""
+    if raw:
+        try:
+            pep = base64.b64decode(raw, validate=True)
+        except (binascii.Error, ValueError):
+            pep = b""
+        if len(pep) >= 32:
+            return pep
+    return b"" if settings.is_prod else b"aijalon-dev-pepper-not-secret-000000"
 
 
 def api_config(settings: Settings) -> ApiConfig:
@@ -105,7 +121,7 @@ def api_config(settings: Settings) -> ApiConfig:
         scheduler_sa_email=(getattr(settings, "scheduler_sa_email", "") or "").lower(),
         internal_audience=getattr(settings, "internal_audience", "") or settings.api_origin,
         sandbox_url=(getattr(settings, "sandbox_url", "") or "").rstrip("/"),
-        ip_hash_salt=getattr(settings, "ip_hash_salt", "") or settings.firebase_project_id or "aijalon-dev-salt",
+        pepper=_pepper(settings),
         kyc_provider=getattr(settings, "kyc_provider", "") or "",
         legal_versions=legal,
     )
@@ -144,7 +160,7 @@ class SealedAgentKey:
 
 
 class AgentKeyPort(Protocol):
-    def generate_sealed(self) -> SealedAgentKey: ...             # plaintext never leaves the adapter
+    def generate_sealed(self, user_id: str) -> SealedAgentKey: ...   # AAD binds user_id; plaintext never leaves
 
 
 class TypedDataPort(Protocol):
@@ -189,7 +205,7 @@ class SandboxPort(Protocol):
 
 
 class CodeVaultPort(Protocol):
-    def seal(self, plaintext: bytes) -> tuple[bytes, str]: ...   # (ciphertext, key_version) — encrypt only
+    def seal(self, plaintext: bytes, aad: bytes) -> tuple[bytes, str]: ...   # (ciphertext, key_version); encrypt only
 
 
 class KycPort(Protocol):
@@ -307,6 +323,11 @@ class AuthCtx:
     def role(self) -> str:
         return str(self.user.get("role") or "user")
 
+    @property
+    def actor(self) -> str:
+        """Audit actor: 'admin:<uuid>' for admins, else 'user:<uuid>'."""
+        return f"{'admin' if self.role == 'admin' else 'user'}:{self.user_id}"
+
 
 # ----------------------------------------------------------------------------------------------- MFA / step-up
 def check_mfa_claims(claims: dict[str, Any]) -> None:
@@ -384,7 +405,7 @@ def _create_user(conn: Any, svc: Services, request: Request, claims: dict[str, A
     if user is None:
         raise Conflict("could not allocate referral code")
     if user.get("_created"):
-        svc.audit.write(conn, actor=str(user["id"]), action="user.created", target=f"user:{user['id']}",
+        svc.audit.write(conn, actor=f"user:{user['id']}", action="user.created", target=f"user:{user['id']}",
                         payload={"referred_by": referrer_id}, ip_hash=ip_hash)
     return user
 
@@ -402,8 +423,8 @@ def current_user(request: Request, svc: Services = Depends(get_services)) -> Aut
     if not svc.ratelimit.hit(f"user:{claims['uid']}", 300, 60):
         raise RateLimited("too many requests", retry_after_seconds=60)
     cfg = svc.config
-    ip_hash = v.hash_identifier(client_ip(request), cfg.ip_hash_salt)
-    ua_hash = v.hash_identifier(request.headers.get("user-agent"), cfg.ip_hash_salt)
+    ip_hash = v.hash_identifier(client_ip(request), cfg.pepper, domain="ip")
+    ua_hash = v.hash_identifier(request.headers.get("user-agent"), cfg.pepper, domain="ua")
     country = edge_country(request)
     with svc.db.begin() as conn:
         user = svc.store.get_user_by_firebase_uid(conn, claims["uid"])
@@ -415,7 +436,7 @@ def current_user(request: Request, svc: Services = Depends(get_services)) -> Aut
             if svc.store.record_login_country(conn, str(user["id"]), country):
                 svc.notifier.notify(conn, user_id=str(user["id"]), severity="warn", kind="login_new_country",
                                     payload={"country": country})
-                svc.audit.write(conn, actor=str(user["id"]), action="auth.new_country",
+                svc.audit.write(conn, actor=f"user:{user['id']}", action="auth.new_country",
                                 target=f"user:{user['id']}", payload={"country": country}, ip_hash=ip_hash)
     ctx = AuthCtx(user=user, claims=claims, ip_hash=ip_hash, ua_hash=ua_hash, request_id=request_id(request),
                   country=country)

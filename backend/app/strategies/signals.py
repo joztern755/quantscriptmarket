@@ -12,7 +12,7 @@ only, printable-ASCII strings — and those exact bytes are what ``signals.sig``
 ``engine_sha256`` = sha256 of the canonical JSON ``{key: script_sha256}`` over every strategy in the file.
 
 Order of checks (fail closed; nothing is parsed before it is authenticated):
-  1. transport: HTTPS only, no redirects, timeout, 1 MB body cap (64 KiB... see ``MAX_SIG_BYTES`` for the signature);
+  1. transport: HTTPS only, no redirects, timeout, 1 MB cap on the body and 1 KiB on the signature;
   2. signature: the raw body bytes against the pinned public key (``Settings.signals_pubkey_b64``, raw 32 bytes, base64);
   3. strict parse: UTF-8, no duplicate keys, no floats / NaN, and the body must equal its own canonical re-encoding;
   4. schema: exactly the known keys at every level, types, formats; weights ∈ registry ``allowed_weights`` ({0,1,2});
@@ -53,13 +53,19 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
-import requests
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from app.errors import AppError, ValidationFailed
 from app.money import BPS
 from app.strategies import registry
+
+try:  # needed only to fetch; verification works without it (tests inject a session). Pinned in backend requirements.
+    import requests
+except ImportError:  # pragma: no cover
+    requests = None  # type: ignore[assignment]
+
+_NET_ERRORS: tuple[type[BaseException], ...] = (requests.RequestException, OSError) if requests else (OSError,)
 
 __all__ = [
     "MAX_BODY_BYTES",
@@ -444,7 +450,6 @@ def verify_and_parse(
         except ValidationFailed:
             raise fail(SignalUnknownStrategy, "strategy not in the in-house registry", strategy_key=skey) from None
         _exact_keys(entry, STRATEGY_KEYS, f"strategies.{skey}")
-        s_markets = spec.markets
         w = entry["target_weight"]
         if type(w) is not int or w not in spec.allowed_weights or (spec.long_only and w < 0) or w > spec.max_weight():
             raise fail(SignalWeightInvalid, "target_weight not allowed", strategy_key=skey, target_weight=repr(w)[:20],
@@ -482,7 +487,6 @@ def verify_and_parse(
             generated_at=generated_at, last_action=la, last_action_date=lad_d, status=status, script_sha256=sh,
             engine_sha256=engine,
         ))
-        del s_markets
     if hashlib.sha256(canonical_json(hashes)).hexdigest() != engine:
         raise fail(SignalEngineMismatch, "engine_sha256 does not match the per-strategy script hashes")
 
@@ -539,7 +543,7 @@ def _get_capped(session: Any, url: str, cap: int, timeout: Any, markets: Sequenc
     try:
         resp = session.get(url, timeout=timeout, stream=True, allow_redirects=False,
                            headers={"Accept": "application/json, text/plain", "Cache-Control": "no-cache"})
-    except requests.RequestException as e:
+    except _NET_ERRORS as e:
         raise SignalFetchError("signal fetch failed", url=url, error=type(e).__name__, markets=markets) from None
     try:
         if resp.status_code != 200:
@@ -554,7 +558,7 @@ def _get_capped(session: Any, url: str, cap: int, timeout: Any, markets: Sequenc
                     buf += chunk
                     if len(buf) > cap:
                         raise SignalTooLarge("signal file larger than the cap", url=url, cap=cap, markets=markets)
-        except requests.RequestException as e:
+        except _NET_ERRORS as e:
             raise SignalFetchError("signal fetch failed while reading", url=url, error=type(e).__name__,
                                    markets=markets) from None
         return bytes(buf)
@@ -598,7 +602,12 @@ def fetch_signals(
     for u in (url, sig_url):
         if not (u.startswith("https://") or (allow_http and u.startswith("http://"))):
             raise SignalConfigError("signal URLs must be https://", url=u, markets=markets)
-    _pubkey(pubkey_b64 or "")                               # config errors before any network I/O
+    try:
+        _pubkey(pubkey_b64 or "")                           # config errors before any network I/O
+    except SignalConfigError as e:
+        raise SignalConfigError(e.message, markets=markets, **e.details) from None
+    if session is None and requests is None:
+        raise SignalConfigError("the requests package is not installed", markets=markets)
     sess = session if session is not None else requests.Session()
     try:
         body = _get_capped(sess, url, MAX_BODY_BYTES, timeout, markets)
