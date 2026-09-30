@@ -18,6 +18,10 @@ metadata:
     app: aijalon
   annotations:
     run.googleapis.com/ingress: internal
+#@if BINAUTHZ_ANNOTATE=1
+    # REVIEW_WEB_INFRA H2: Binary Authorization project policy (bootstrap `binauthz`): only builder-attested images
+    run.googleapis.com/binary-authorization: default
+#@endif
 spec:
   template:
     metadata:

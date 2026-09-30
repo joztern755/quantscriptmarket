@@ -500,6 +500,9 @@ class SubscriptionOut(Out):
     cum_pnl_micro: int = 0
     hwm_micro: int = 0
     created_at: datetime
+    end_reason: Optional[str] = None             # 'strategy_delisted' when a delisting ended it (H5; else user)
+    price_monthly_micro: Optional[int] = None    # M8: the terms pinned at subscribe (renewals use these)
+    profit_share_bps: Optional[int] = None
 
 
 class SubscriptionCreateOut(Out):

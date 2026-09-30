@@ -513,6 +513,15 @@ class ExecIntegrationDbTest(unittest.TestCase):
         post_transaction(self.admin, f"test-topup:{user_id}:{uuid.uuid4().hex}", "deposit_usdc", "test top-up",
                          [("treasury:hl_usdc", amount), (f"user:{user_id}:fee_balance", -amount)], "test")
 
+    def paid_activity(self, user_id: str, amount: int = 1_000_000) -> None:
+        """REVIEW_MONEY M2 (0011): a referee counts for referral rewards / tiers only after a real paid activity (not
+        free showcase-only usage). Net-zero for the balance: top up, then pay a plan charge of the same amount."""
+        from app.ledger.service import post_transaction
+
+        self.topup(user_id, amount)
+        post_transaction(self.admin, f"test-plan:{user_id}:{uuid.uuid4().hex}", "plan_purchase", "test plan",
+                         [(f"user:{user_id}:fee_balance", amount), ("platform:revenue:plans", -amount)], "test")
+
     def ingest_fills(self, hl: Any, address: str) -> int:
         """Stand-in for the data-jobs fills sync: attribute by cloid (orders table) and store (idempotent)."""
         from app.hl.fills import attribute_fills
@@ -620,6 +629,7 @@ class ExecIntegrationDbTest(unittest.TestCase):
         self.connect_wallet(u, master)
         sub = self.subscribe(u, sid, vid, master, allocation=2_000_000_000)   # $2,000
         self.topup(u, 50_000_000)
+        self.paid_activity(u)            # M2: SILVER-only (free showcase) usage alone would pay the referrer nothing
         bar1 = self.now - timedelta(minutes=10)
         self.signal(sid, vid, bar1, 10_000)                                   # weight 1 → long $2,000
 
@@ -1038,6 +1048,10 @@ class ExecIntegrationDbTest(unittest.TestCase):
         for i in range(2):
             u = self.user(f"tier{i}", referred_by=ref)
             self.subscribe(u, sid, vid, addr(f"tier{i}-{u}"))
+            self.paid_activity(u)        # M2: only referees with a paid activity count towards a tier
+        # a referee with free showcase-only usage (no paid activity) is not counted
+        idle = self.user("tier-idle", referred_by=ref)
+        self.subscribe(idle, sid, vid, addr(f"tier-idle-{idle}"))
         out = jobs.referral_tiers(db=self.exe, now=self.now, runtime=rt)
         self.assertIn({"user_id": ref, "from": "starter", "to": "partner", "active_users": 2, "notional_micro": 0},
                       out["changes"])

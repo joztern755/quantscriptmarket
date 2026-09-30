@@ -12,6 +12,10 @@ metadata:
   annotations:
     # internal: only same-project VPC traffic and Google-internal sources (Cloud Scheduler) can reach it
     run.googleapis.com/ingress: internal
+#@if BINAUTHZ_ANNOTATE=1
+    # REVIEW_WEB_INFRA H2: Binary Authorization project policy (bootstrap `binauthz`): only builder-attested images
+    run.googleapis.com/binary-authorization: default
+#@endif
 spec:
   template:
     metadata:
@@ -65,6 +69,8 @@ spec:
             - {name: HL_API_URL, value: "https://api.hyperliquid.xyz"}
             - {name: HL_IS_MAINNET, value: "true"}
             - {name: AGENT_NAME, value: aijalon}
+            # REVIEW_WEB_INFRA H1: KMS EC_SIGN_P256_SHA256 key version the executor signs agent attestations with
+            - {name: AGENT_ATTEST_KEY_VERSION, value: "${KMS_ATTEST_KEY_VERSION_NAME}"}
             - {name: SANDBOX_URL, value: "${SANDBOX_URL}"}
             - {name: SIGNALS_URL, value: "https://aijalon-terminal.web.app/signals.json"}   # = config.py default
             - {name: FEATURE_CREATOR_UPLOADS, value: "true"}
@@ -133,6 +139,18 @@ spec:
           livenessProbe:
             httpGet: {path: /liveness, port: 9801}
             periodSeconds: 30
+  # REVIEW_WEB_INFRA M4: deploy.sh renders EXECUTOR_CANARY=1 — the new revision gets 0 % under the `candidate` tag
+  # while the serving revision keeps 100 %; only after /v1/internal/selftest passed on the candidate (with `tick`
+  # paused) does deploy.sh move traffic. EXECUTOR_CANARY=0 = plain 100 % to the latest revision (manual renders).
   traffic:
+#@if EXECUTOR_CANARY=1
+    - revisionName: ${PREV_EXECUTOR_REVISION}
+      percent: 100
+    - latestRevision: true
+      percent: 0
+      tag: ${CANDIDATE_TAG}
+#@endif
+#@if EXECUTOR_CANARY=0
     - latestRevision: true
       percent: 100
+#@endif

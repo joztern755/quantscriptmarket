@@ -3,6 +3,9 @@
 # DB_MIGRATOR_PASSWORD secret. Connects straight to the Cloud SQL private IP over TLS (sslmode=require;
 # the instance is ENCRYPTED_ONLY) as the built-in `migrator` user created by infra/gcp/db_bootstrap.sh.
 # `$DB_MIGRATOR_PASSWORD` (no braces) is expanded by the container shell at run time, not by render.py.
+# TLS (REVIEW_WEB_INFRA L6): the server certificate is VERIFIED against the instance's server CA (secret
+# CLOUDSQL_SERVER_CA, bootstrap `sqlca`, mounted at /cloudsql-ca): sslmode=verify-full when DB_TLS_HOST is the
+# instance's DNS name, else verify-ca against the private IP (deploy.sh picks; `require` is no longer used).
 apiVersion: run.googleapis.com/v1
 kind: Job
 metadata:
@@ -10,6 +13,10 @@ metadata:
   labels:
     cloud.googleapis.com/location: ${REGION}
     app: aijalon
+#@if BINAUTHZ_ANNOTATE=1
+  annotations:
+    run.googleapis.com/binary-authorization: default
+#@endif
 spec:
   template:
     metadata:
@@ -34,14 +41,21 @@ spec:
               command: ["/bin/sh", "-c"]
               args:
                 - >-
-                  export DATABASE_URL="postgresql://${DB_MIGRATOR_USER}:$DB_MIGRATOR_PASSWORD@${DB_PRIVATE_IP}:5432/${DB_NAME}?sslmode=require";
+                  export DATABASE_URL="postgresql://${DB_MIGRATOR_USER}:$DB_MIGRATOR_PASSWORD@${DB_TLS_HOST}:5432/${DB_NAME}?sslmode=${DB_SSLMODE}&sslrootcert=/cloudsql-ca/server-ca.pem";
                   unset DB_MIGRATOR_PASSWORD;
                   exec ${MIGRATE_CMD}
               env:
                 - {name: SERVICE_ROLE, value: migrate}
                 - name: DB_MIGRATOR_PASSWORD
                   valueFrom: {secretKeyRef: {name: DB_MIGRATOR_PASSWORD, key: latest}}
+              volumeMounts:
+                - {name: cloudsql-ca, mountPath: /cloudsql-ca}
               resources:
                 limits:
                   cpu: "1"
                   memory: 512Mi
+          volumes:
+            - name: cloudsql-ca
+              secret:
+                secretName: CLOUDSQL_SERVER_CA
+                items: [{key: latest, path: server-ca.pem}]

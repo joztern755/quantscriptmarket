@@ -56,7 +56,9 @@ def _out(row: dict) -> S.SubscriptionOut:
         status=row["status"], cancel_positions=row.get("cancel_positions"), cancelled_at=row.get("cancelled_at"),
         current_period_end=row.get("current_period_end"),
         cum_pnl_micro=int(row.get("cum_pnl_micro") or 0), hwm_micro=int(row.get("hwm_micro") or 0),
-        created_at=row["created_at"])
+        created_at=row["created_at"], end_reason=row.get("end_reason"),
+        price_monthly_micro=row.get("pinned_price_micro", row.get("price_monthly_micro")),
+        profit_share_bps=row.get("pinned_profit_share_bps", row.get("profit_share_bps")))
 
 
 def _leverage_cap_x100(svc: Services, version: Optional[dict]) -> int:

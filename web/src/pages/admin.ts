@@ -254,6 +254,33 @@ interface Payout {
   checker_admin: string | null;
   tx_hash: string | null;
   created_at: string;
+  // REVIEW_AUTH_API F5 — context for the approving admins (open requests only)
+  to_address_verified_at?: string | null;
+  wallet_age_hours?: number | null;
+  security_hold_until?: string | null;
+  hold_reasons?: string[];
+  recent_security_events?: { action: string; at: string }[];
+  send_issued_at?: string | null; // M4: typed data issued → no reject for 72 h
+}
+
+const HOLD_LABEL: Record<string, string> = {
+  payout_address_hold: "wallet verified < 48 h ago",
+  security_hold: "security hold (MFA change / new device)",
+};
+
+/** Wallet age, security hold and recent security events of the beneficiary (shown before every approval). */
+function securityContext(p: Payout): HTMLElement {
+  const events = p.recent_security_events ?? [];
+  return h(
+    "div",
+    { class: "stack" },
+    kv([
+      ["Wallet age", p.wallet_age_hours == null ? "unknown" : p.wallet_age_hours < 48 ? badge(`${p.wallet_age_hours} h`, "bad") : `${Math.floor(p.wallet_age_hours / 24)} days`],
+      ["Security hold", p.security_hold_until && Date.parse(p.security_hold_until) > Date.now() ? badge(`until ${fmtRelative(p.security_hold_until)}`, "bad") : "none"],
+      ["Recent security events (30 d)", events.length ? events.map((e) => `${e.action} · ${fmtRelative(e.at)}`).join("; ") : "none"],
+    ]),
+    (p.hold_reasons ?? []).length ? note(`The second approval is refused while: ${(p.hold_reasons ?? []).map((r) => HOLD_LABEL[r] ?? r).join(", ")}.`, "warn") : null,
+  );
 }
 
 /** After a treasury usdSend, find its hash in the treasury's ledger (userNonFundingLedgerUpdates). */
@@ -344,7 +371,7 @@ async function payoutsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
                   await confirmDialog({ title: "Cannot approve", message: h("div", { class: "stack" }, destinationBlock(p.to_address, proof), note("Reject this request, or ask the beneficiary to request again: they must sign the ownership proof with the destination wallet.", "warn")), confirmLabel: "OK" });
                   return;
                 }
-                if (!(await confirmDialog({ title: "Approve payout?", message: h("div", { class: "stack" }, kv([["Kind", p.kind], ["Amount", fmtUsd(p.amount_micro)], ["Beneficiary", h("span", { class: "mono" }, p.beneficiary)]]), destinationBlock(p.to_address, proof)), confirmLabel: "Approve" }))) return;
+                if (!(await confirmDialog({ title: "Approve payout?", message: h("div", { class: "stack" }, kv([["Kind", p.kind], ["Amount", fmtUsd(p.amount_micro)], ["Beneficiary", h("span", { class: "mono" }, p.beneficiary)]]), destinationBlock(p.to_address, proof), securityContext(p)), confirmLabel: "Approve" }))) return;
                 await api.post(`${base(p)}/approve`, {}, { signal: ctx.signal });
                 toast("Approved.", "good");
                 reload();
@@ -382,6 +409,7 @@ async function payoutsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
         { key: "amt", label: "Amount", value: (p) => fmtUsd(p.amount_micro), align: "right", mono: true },
         { key: "to", label: "To", value: (p) => h("span", { class: "mono", title: p.to_address }, shortAddr(p.to_address)) },
         { key: "st", label: "Status", value: (p) => badge(p.status.replace(/_/g, " "), p.status === "sent" ? "good" : p.status === "rejected" ? "bad" : "warn") },
+        { key: "chk", label: "Checks", value: (p) => ((p.hold_reasons ?? []).length ? badge((p.hold_reasons ?? []).map((r) => HOLD_LABEL[r] ?? r).join(", "), "bad") : p.wallet_age_hours != null ? `wallet ${Math.floor(p.wallet_age_hours / 24)} d` : "—"), hideOnMobile: true },
         { key: "mk", label: "Maker / checker", value: (p) => `${p.maker_admin ? shortAddr(p.maker_admin, 8, 4) : "—"} / ${p.checker_admin ? shortAddr(p.checker_admin, 8, 4) : "—"}`, hideOnMobile: true },
         { key: "at", label: "Requested", value: (p) => fmtRelative(p.created_at), hideOnMobile: true },
         { key: "a", label: "", value: action },

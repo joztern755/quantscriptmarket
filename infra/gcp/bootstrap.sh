@@ -6,8 +6,8 @@
 #   gcloud auth login app.aijalon@gmail.com && gcloud auth application-default login
 #   BILLING_ACCOUNT=XXXXXX-XXXXXX-XXXXXX ./infra/gcp/bootstrap.sh            # all steps
 #   ./infra/gcp/bootstrap.sh network sql                                     # selected steps only
-# Steps (in order): project apis firebase audit network kms registry sa secrets sql run lb scheduler wif
-#                   monitoring budget harden outputs
+# Steps (in order): project apis firebase audit network kms registry sa secrets sql sqlca run lb aop scheduler
+#                   wif binauthz monitoring budget harden outputs
 # Re-running is safe: every step checks before it creates, and never deletes data.
 set -euo pipefail
 
@@ -619,13 +619,28 @@ step_scheduler() {
       [[ "${SCHEDULER_START_PAUSED}" == "1" ]] && gcloud scheduler jobs pause "${name}" --location="${REGION}" >/dev/null
     fi
   done
+  # Deploy probe (REVIEW_WEB_INFRA M4): the new executor revision's candidate tag URL, OIDC as the scheduler SA with
+  # the tag URL as audience (the executor also accepts it for /selftest only). Always PAUSED; the deploy runs it.
+  local host="${url#https://}" cand
+  cand="https://${CANDIDATE_TAG}---${host}"
+  common=(--location="${REGION}" --schedule="0 0 1 1 *" --time-zone=Etc/UTC
+    --uri="${cand}${INTERNAL_PREFIX}/selftest" --http-method=POST --message-body='{}'
+    --oidc-service-account-email="${SA_SCHEDULER}" --oidc-token-audience="${cand}"
+    --attempt-deadline=300s --max-retry-attempts=0)
+  if exists gcloud scheduler jobs describe "${SELFTEST_JOB}" --location="${REGION}"; then
+    gcloud scheduler jobs update http "${SELFTEST_JOB}" "${common[@]}" --update-headers=Content-Type=application/json >/dev/null
+  else
+    gcloud scheduler jobs create http "${SELFTEST_JOB}" "${common[@]}" --headers=Content-Type=application/json >/dev/null
+  fi
+  gcloud scheduler jobs pause "${SELFTEST_JOB}" --location="${REGION}" >/dev/null 2>&1 || true
 }
 
 step_wif() {
-  log "Workload Identity Federation: ${GITHUB_REPO} @ main, environment 'production', deploy.yml only"
+  log "Workload Identity Federation: ${GITHUB_REPO} @ main, deploy.yml only; one SA per GitHub environment"
   exists gcloud iam workload-identity-pools describe "${WIF_POOL}" --location=global || \
     gcloud iam workload-identity-pools create "${WIF_POOL}" --location=global --display-name="GitHub Actions"
-  local cond="assertion.repository == '${GITHUB_REPO}' && assertion.ref == 'refs/heads/main' && assertion.environment == 'production' && assertion.workflow_ref == '${GITHUB_REPO}/.github/workflows/deploy.yml@refs/heads/main'"
+  # REVIEW_WEB_INFRA L12: GitHub-hosted runners only, push/workflow_dispatch only, the three deploy environments only.
+  local cond="assertion.repository == '${GITHUB_REPO}' && assertion.ref == 'refs/heads/main' && assertion.environment in ['${GH_ENV_DEPLOY}', '${GH_ENV_BUILD}', '${GH_ENV_HOSTING}'] && assertion.workflow_ref == '${GITHUB_REPO}/.github/workflows/deploy.yml@refs/heads/main' && assertion.runner_environment == 'github-hosted' && assertion.event_name in ['push', 'workflow_dispatch']"
   [[ -n "${GITHUB_REPO_ID}" ]] && cond+=" && assertion.repository_id == '${GITHUB_REPO_ID}'"
   local mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.repository_id=assertion.repository_id,attribute.ref=assertion.ref,attribute.environment=assertion.environment,attribute.workflow_ref=assertion.workflow_ref,attribute.actor=assertion.actor"
   if exists gcloud iam workload-identity-pools providers describe "${WIF_PROVIDER}" --workload-identity-pool="${WIF_POOL}" --location=global; then
@@ -636,8 +651,17 @@ step_wif() {
       --location=global --issuer-uri=https://token.actions.githubusercontent.com \
       --attribute-mapping="${mapping}" --attribute-condition="${cond}"
   fi
-  gcloud iam service-accounts add-iam-policy-binding "${SA_DEPLOYER}" --role=roles/iam.workloadIdentityUser \
-    --member="principalSet://iam.googleapis.com/projects/$(project_number)/locations/global/workloadIdentityPools/${WIF_POOL}/attribute.repository/${GITHUB_REPO}" >/dev/null
+  # REVIEW_WEB_INFRA H2: separate bindings — a job in environment X can impersonate ONLY X's service account.
+  local pset="principalSet://iam.googleapis.com/projects/$(project_number)/locations/global/workloadIdentityPools/${WIF_POOL}"
+  local pair env sa
+  for pair in "${GH_ENV_DEPLOY}|${SA_DEPLOYER}" "${GH_ENV_BUILD}|${SA_BUILDER}" "${GH_ENV_HOSTING}|${SA_HOSTING}"; do
+    IFS='|' read -r env sa <<<"${pair}"
+    gcloud iam service-accounts add-iam-policy-binding "${sa}" --role=roles/iam.workloadIdentityUser \
+      --member="${pset}/attribute.environment/${env}" >/dev/null
+  done
+  # legacy: any environment of the repo could impersonate the deployer
+  gcloud iam service-accounts remove-iam-policy-binding "${SA_DEPLOYER}" --role=roles/iam.workloadIdentityUser \
+    --member="${pset}/attribute.repository/${GITHUB_REPO}" >/dev/null 2>&1 || true
 }
 
 step_monitoring() {
@@ -646,6 +670,8 @@ step_monitoring() {
   SA_MIGRATOR="${SA_MIGRATOR}" SA_DEPLOYER="${SA_DEPLOYER}" KMS_KEY="${KMS_KEY}" SQL_INSTANCE="${SQL_INSTANCE}" \
   API_DOMAIN="${API_DOMAIN}" WEB_DOMAIN="${WEB_DOMAIN}" EXECUTOR_SERVICE="${EXECUTOR_SERVICE}" \
   API_SERVICE="${API_SERVICE}" SANDBOX_SERVICE="${SANDBOX_SERVICE}" \
+  SA_SANDBOX="${SA_SANDBOX}" SA_BUILDER="${SA_BUILDER}" SA_HOSTING="${SA_HOSTING}" SA_SCHEDULER="${SA_SCHEDULER}" \
+  KMS_ATTEST_KEY="${KMS_ATTEST_KEY}" KMS_BINAUTHZ_KEY="${KMS_BINAUTHZ_KEY}" REGION="${REGION}" \
     python3 "${HERE}/monitoring.py"
 }
 
@@ -690,6 +716,8 @@ GCP_PROJECT_NUMBER=${num}
 GCP_REGION=${REGION}
 WIF_PROVIDER=projects/${num}/locations/global/workloadIdentityPools/${WIF_POOL}/providers/${WIF_PROVIDER}
 DEPLOYER_SA=${SA_DEPLOYER}
+BUILDER_SA=${SA_BUILDER}
+HOSTING_SA=${SA_HOSTING}
 SQL_CONNECTION_NAME=${SQL_CONNECTION_NAME}
 DB_PRIVATE_IP=${db_ip}
 EXECUTOR_URL=${exec_url}
@@ -700,12 +728,21 @@ API_CERT_DNS_AUTH_VALUE=${dns_data}
 NAT_EGRESS_IP=${nat_ip}
 EXECUTOR_NAT_EGRESS_IP=${exec_nat_ip}
 EOF
+  # REVIEW_WEB_INFRA H1: the agent-attestation public key (base64 DER SPKI) for web/public/app-config.json
+  # trust.agentAttestPublicKeySpki — copy it through a REVIEWED commit (DEPLOY.md §12), never automatically.
+  local pk; pk="$(mktemp)"
+  if gcloud kms keys versions get-public-key "${KMS_ATTEST_KEY_VERSION}" --key="${KMS_ATTEST_KEY}" \
+       --keyring="${KMS_KEYRING}" --location="${REGION}" --output-file="${pk}" >/dev/null 2>&1; then
+    echo "AGENT_ATTEST_PUBLIC_KEY_SPKI=$(openssl pkey -pubin -in "${pk}" -outform DER | base64 | tr -d '\n')" >> "${OUT_DIR}/outputs.env"
+    echo "AGENT_ATTEST_KEY_VERSION_NAME=${KMS_ATTEST_KEY_VERSION_NAME}" >> "${OUT_DIR}/outputs.env"
+  fi
+  rm -f "${pk}"
   cat "${OUT_DIR}/outputs.env"
   echo
   log "GitHub environment variables (run once; repo ${GITHUB_REPO}, environment 'production'):"
   local k v
   while IFS='=' read -r k v; do
-    case "${k}" in GCP_PROJECT_ID|GCP_PROJECT_NUMBER|GCP_REGION|WIF_PROVIDER|DEPLOYER_SA|SQL_CONNECTION_NAME|DB_PRIVATE_IP|EXECUTOR_URL|SANDBOX_URL)
+    case "${k}" in GCP_PROJECT_ID|GCP_PROJECT_NUMBER|GCP_REGION|WIF_PROVIDER|DEPLOYER_SA|BUILDER_SA|HOSTING_SA|SQL_CONNECTION_NAME|DB_PRIVATE_IP|EXECUTOR_URL|SANDBOX_URL)
       echo "gh variable set ${k} --env production -R ${GITHUB_REPO} --body '${v}'" ;; esac
   done < "${OUT_DIR}/outputs.env"
   if [[ -f "${OUT_DIR}/firebase.env" ]]; then
@@ -717,7 +754,162 @@ EOF
   log "Cloudflare inputs for infra/cloudflare/dns.sh: API_LB_IP, API_CERT_DNS_AUTH_NAME, API_CERT_DNS_AUTH_VALUE"
 }
 
-ALL_STEPS=(project apis firebase audit network kms registry sa secrets sql run lb scheduler wif monitoring budget harden outputs)
+# =========================================================================================================
+# REVIEW_WEB_INFRA L6 — the migrate job verifies the Cloud SQL server certificate (sslmode verify-ca / verify-full with
+# sslrootcert) instead of `require`. The instance's server CA certificate(s) (public) go into secret
+# CLOUDSQL_SERVER_CA, readable by the migrator SA only, mounted as a file into the job. Re-run after a server CA
+# rotation (Cloud SQL lists the old and the new CA during the overlap; both are kept in the bundle).
+step_sqlca() {
+  log "Cloud SQL server CA bundle -> secret CLOUDSQL_SERVER_CA (migrator only)"
+  local d; d="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '${d}'; trap - RETURN" RETURN
+  gcloud sql ssl server-ca-certs list --instance="${SQL_INSTANCE}" --format='value(cert)' > "${d}/ca.pem" 2>/dev/null || true
+  [[ -s "${d}/ca.pem" ]] || gcloud sql instances describe "${SQL_INSTANCE}" --format='value(serverCaCert.cert)' > "${d}/ca.pem"
+  grep -q 'BEGIN CERTIFICATE' "${d}/ca.pem" || die "could not read the Cloud SQL server CA of ${SQL_INSTANCE}"
+  exists gcloud secrets describe CLOUDSQL_SERVER_CA || \
+    gcloud secrets create CLOUDSQL_SERVER_CA --replication-policy=user-managed --locations="${REGION}" --labels=app=aijalon
+  local cur; cur="$(gcloud secrets versions access latest --secret=CLOUDSQL_SERVER_CA 2>/dev/null || true)"
+  if [[ "${cur}" != "$(cat "${d}/ca.pem")" ]]; then
+    gcloud secrets versions add CLOUDSQL_SERVER_CA --data-file="${d}/ca.pem" >/dev/null
+    log "  new CA bundle version stored"
+  fi
+  gcloud secrets add-iam-policy-binding CLOUDSQL_SERVER_CA --member="serviceAccount:${SA_MIGRATOR}" \
+    --role=roles/secretmanager.secretAccessor >/dev/null
+  local dns; dns="$(gcloud sql instances describe "${SQL_INSTANCE}" --format='value(dnsName)' 2>/dev/null || true)"
+  [[ -n "${dns}" ]] && log "  instance DNS name ${dns}: set GitHub variable DB_TLS_HOST to it for sslmode=verify-full (DEPLOY.md §9)"
+}
+
+# =========================================================================================================
+# REVIEW_WEB_INFRA M3 — Cloudflare Authenticated Origin Pulls with a ZONE-LEVEL client certificate + LB mTLS.
+# Cloudflare's shared AOP CA would admit ANY Cloudflare customer; our own CA admits only our zone.
+#   1. bootstrap aop                CA + client cert (P-256) -> Secret Manager (owner-only; no service account has
+#                                   access); Certificate Manager TrustConfig (our CA only) + ServerTlsPolicy (mTLS,
+#                                   REJECT_INVALID)
+#   2. AOP=1 make dns               uploads the client cert to the zone and turns zone AOP on (Cloudflare presents it)
+#   3. AOP_ATTACH=1 bootstrap aop   attaches the ServerTlsPolicy to the api HTTPS proxy -> the LB rejects any TLS
+#                                   client without our certificate (X-Edge-Auth stays as defence in depth)
+# Order matters: attaching before step 2 takes the API offline. Rotate: AOP_ROTATE=1 (new client cert, same CA).
+: "${AOP_TRUST_CONFIG:=api-aop-trust}"
+: "${AOP_SERVER_TLS_POLICY:=api-aop-mtls}"
+: "${AOP_ATTACH:=0}"
+: "${AOP_ROTATE:=0}"
+has_secret_version() { [[ -n "$(gcloud secrets versions list "$1" --filter='state=ENABLED' --format='value(name)' --limit=1)" ]]; }
+step_aop() {
+  log "Authenticated Origin Pulls: zone client CA -> TrustConfig ${AOP_TRUST_CONFIG} + ServerTlsPolicy ${AOP_SERVER_TLS_POLICY}"
+  gcloud services enable networksecurity.googleapis.com certificatemanager.googleapis.com >/dev/null
+  local d; d="$(mktemp -d)"; chmod 700 "${d}"
+  # shellcheck disable=SC2064
+  trap "rm -rf '${d}'; trap - RETURN" RETURN
+  local name
+  for name in CF_AOP_CA_CERT CF_AOP_CA_KEY CF_AOP_CLIENT_CERT CF_AOP_CLIENT_KEY; do
+    exists gcloud secrets describe "${name}" || \
+      gcloud secrets create "${name}" --replication-policy=user-managed --locations="${REGION}" --labels=app=aijalon,use=aop
+  done
+  if ! has_secret_version CF_AOP_CA_CERT; then
+    log "  generating the AOP client CA (10 years)"
+    ( umask 077
+      openssl ecparam -name prime256v1 -genkey -noout -out "${d}/ca.key"
+      openssl req -x509 -new -key "${d}/ca.key" -sha256 -days 3650 -subj "/O=aijalon.trade/CN=aijalon Cloudflare AOP CA" \
+        -addext "basicConstraints=critical,CA:TRUE,pathlen:0" -addext "keyUsage=critical,keyCertSign,cRLSign" -out "${d}/ca.pem" )
+    gcloud secrets versions add CF_AOP_CA_KEY --data-file="${d}/ca.key" >/dev/null
+    gcloud secrets versions add CF_AOP_CA_CERT --data-file="${d}/ca.pem" >/dev/null
+  else
+    gcloud secrets versions access latest --secret=CF_AOP_CA_CERT > "${d}/ca.pem"
+  fi
+  if ! has_secret_version CF_AOP_CLIENT_CERT || [[ "${AOP_ROTATE}" == "1" ]]; then
+    log "  issuing the Cloudflare client certificate (2 years)"
+    ( umask 077
+      gcloud secrets versions access latest --secret=CF_AOP_CA_KEY > "${d}/ca.key"
+      openssl ecparam -name prime256v1 -genkey -noout -out "${d}/client.key"
+      openssl req -new -key "${d}/client.key" -subj "/O=aijalon.trade/CN=cloudflare-aop.${WEB_DOMAIN}" -out "${d}/client.csr"
+      printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > "${d}/ext"
+      openssl x509 -req -in "${d}/client.csr" -CA "${d}/ca.pem" -CAkey "${d}/ca.key" -CAcreateserial -sha256 -days 730 \
+        -extfile "${d}/ext" -out "${d}/client.pem" 2>/dev/null )
+    gcloud secrets versions add CF_AOP_CLIENT_KEY --data-file="${d}/client.key" >/dev/null
+    gcloud secrets versions add CF_AOP_CLIENT_CERT --data-file="${d}/client.pem" >/dev/null
+  fi
+  # TrustConfig: our CA is the ONLY trust anchor
+  python3 - "${d}/ca.pem" "${d}/trust.yaml" <<'PY'
+import sys
+pem = open(sys.argv[1]).read().strip()
+body = "\n".join("      " + l for l in pem.splitlines())
+open(sys.argv[2], "w").write("trustStores:\n- trustAnchors:\n  - pemCertificate: |\n" + body + "\n")
+PY
+  gcloud certificate-manager trust-configs import "${AOP_TRUST_CONFIG}" --location=global --source="${d}/trust.yaml" --quiet >/dev/null
+  cat > "${d}/stp.yaml" <<YAML
+name: projects/${PROJECT_ID}/locations/global/serverTlsPolicies/${AOP_SERVER_TLS_POLICY}
+mtlsPolicy:
+  clientValidationMode: REJECT_INVALID
+  clientValidationTrustConfig: projects/$(project_number)/locations/global/trustConfigs/${AOP_TRUST_CONFIG}
+YAML
+  gcloud network-security server-tls-policies import "${AOP_SERVER_TLS_POLICY}" --location=global --source="${d}/stp.yaml" --quiet >/dev/null
+  if [[ "${AOP_ATTACH}" == "1" ]]; then
+    warn "  attaching mTLS to ${LB_PROXY}: requests without the Cloudflare zone client certificate are now refused"
+    gcloud compute target-https-proxies export "${LB_PROXY}" --global --destination="${d}/proxy.yaml" >/dev/null
+    grep -v '^serverTlsPolicy:' "${d}/proxy.yaml" > "${d}/proxy2.yaml"
+    echo "serverTlsPolicy: //networksecurity.googleapis.com/projects/${PROJECT_ID}/locations/global/serverTlsPolicies/${AOP_SERVER_TLS_POLICY}" >> "${d}/proxy2.yaml"
+    gcloud compute target-https-proxies import "${LB_PROXY}" --global --source="${d}/proxy2.yaml" --quiet >/dev/null
+  else
+    log "  not attached yet: run AOP=1 make dns first, then AOP_ATTACH=1 ./infra/gcp/bootstrap.sh aop"
+  fi
+}
+
+# =========================================================================================================
+# REVIEW_WEB_INFRA H2 — Binary Authorization for Cloud Run: only images attested by the BUILDER identity (KMS key
+# binauthz-attestor, signer = aijalon-builder only) may run. BINAUTHZ_ENFORCE=0 (default) = dry-run: violations are
+# only audit-logged (alert "SEC: Binary Authorization"), so the first deploys cannot be bricked; set 1 after a clean
+# deploy. The deployer cannot attest, so a compromised deploy job (or anyone holding only run.* + actAs) can no
+# longer run an arbitrary image as the executor.
+step_binauthz() {
+  log "Binary Authorization: attestor ${BINAUTHZ_ATTESTOR} (KMS ${KMS_BINAUTHZ_KEY}), enforce=${BINAUTHZ_ENFORCE}"
+  gcloud services enable binaryauthorization.googleapis.com containeranalysis.googleapis.com >/dev/null
+  local note="projects/${PROJECT_ID}/notes/${BINAUTHZ_ATTESTOR}-note" tok d
+  d="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '${d}'; trap - RETURN" RETURN
+  tok="$(gcloud auth print-access-token)"
+  if ! curl -fsS -o /dev/null -H @<(printf 'Authorization: Bearer %s\n' "${tok}") \
+       "https://containeranalysis.googleapis.com/v1/${note}"; then
+    printf '{"attestation":{"hint":{"humanReadableName":"aijalon CI build attestation"}}}' | \
+      curl -fsS -X POST -H @<(printf 'Authorization: Bearer %s\n' "${tok}") -H "Content-Type: application/json" \
+        --data-binary @- "https://containeranalysis.googleapis.com/v1/projects/${PROJECT_ID}/notes?noteId=${BINAUTHZ_ATTESTOR}-note" >/dev/null
+  fi
+  if ! exists gcloud container binauthz attestors describe "${BINAUTHZ_ATTESTOR}"; then
+    gcloud container binauthz attestors create "${BINAUTHZ_ATTESTOR}" --attestation-authority-note="${BINAUTHZ_ATTESTOR}-note" \
+      --attestation-authority-note-project="${PROJECT_ID}" --description="images built by the aijalon-builder CI identity"
+    gcloud beta container binauthz attestors public-keys add --attestor="${BINAUTHZ_ATTESTOR}" \
+      --keyversion-project="${PROJECT_ID}" --keyversion-location="${REGION}" --keyversion-keyring="${KMS_KEYRING}" \
+      --keyversion-key="${KMS_BINAUTHZ_KEY}" --keyversion=1
+  fi
+  # only the builder signs; it also attaches occurrences to the note and reads the attestor
+  gcloud kms keys add-iam-policy-binding "${KMS_BINAUTHZ_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" \
+    --member="serviceAccount:${SA_BUILDER}" --role=roles/cloudkms.signerVerifier >/dev/null
+  printf '{"policy":{"bindings":[{"role":"roles/containeranalysis.notes.attacher","members":["serviceAccount:%s"]}]}}' "${SA_BUILDER}" | \
+    curl -fsS -X POST -H @<(printf 'Authorization: Bearer %s\n' "${tok}") -H "Content-Type: application/json" \
+      --data-binary @- "https://containeranalysis.googleapis.com/v1/${note}:setIamPolicy" >/dev/null
+  gcloud container binauthz attestors add-iam-policy-binding "${BINAUTHZ_ATTESTOR}" \
+    --member="serviceAccount:${SA_BUILDER}" --role=roles/binaryauthorization.attestorsViewer >/dev/null
+  local mode=DRYRUN_AUDIT_LOG_ONLY
+  [[ "${BINAUTHZ_ENFORCE}" == "1" ]] && mode=ENFORCED_BLOCK_AND_AUDIT_LOG
+  cat > "${d}/policy.yaml" <<YAML
+globalPolicyEvaluationMode: ENABLE
+admissionWhitelistPatterns:
+  # Google-built sidecar / bootstrap placeholders (the proxy is pinned by digest in env.sh)
+  - namePattern: gcr.io/cloud-sql-connectors/cloud-sql-proxy@sha256:*
+  - namePattern: us-docker.pkg.dev/cloudrun/container/*
+defaultAdmissionRule:
+  evaluationMode: REQUIRE_ATTESTATION
+  enforcementMode: ${mode}
+  requireAttestationsBy:
+    - projects/${PROJECT_ID}/attestors/${BINAUTHZ_ATTESTOR}
+name: projects/${PROJECT_ID}/policy
+YAML
+  gcloud container binauthz policy import "${d}/policy.yaml" --quiet >/dev/null
+  log "  policy imported (${mode}); Cloud Run templates carry run.googleapis.com/binary-authorization: default"
+}
+
+ALL_STEPS=(project apis firebase audit network kms registry sa secrets sql sqlca run lb aop scheduler wif binauthz monitoring budget harden outputs)
 main() {
   local steps=("$@")
   ((${#steps[@]})) || steps=("${ALL_STEPS[@]}")

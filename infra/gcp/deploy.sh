@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# aijalon.trade — application deploy steps. Called by .github/workflows/deploy.yml (as the deployer SA via
-# Workload Identity Federation); the owner can run the same steps locally for a break-glass deploy.
+# aijalon.trade — application deploy steps. Called by .github/workflows/deploy.yml; each step runs as the CI
+# identity of its GitHub environment (REVIEW_WEB_INFRA H2; bootstrap `sa`/`wif`); the owner can run the same steps
+# locally for a break-glass deploy.
 #
 #   PROJECT_ID=... REGION=... DB_PRIVATE_IP=... ./infra/gcp/deploy.sh preflight
-#   ./infra/gcp/deploy.sh images      # build + push backend (and sandbox) images, record digests
-#   ./infra/gcp/deploy.sh migrate     # Cloud Run Job "migrate" BEFORE any new revision takes traffic
-#   ./infra/gcp/deploy.sh services    # sandbox -> executor -> api (records previous revisions for rollback)
+#   ./infra/gcp/deploy.sh images      # [builder]  build + push backend (and sandbox) images, record digests
+#   ./infra/gcp/deploy.sh attest      # [builder]  Binary Authorization attestation of those digests (KMS)
+#   ./infra/gcp/deploy.sh migrate     # [deployer] Cloud Run Job "migrate" BEFORE any new revision takes traffic
+#   ./infra/gcp/deploy.sh services    # [deployer] sandbox -> executor CANARY (0 %, tick paused, selftest) -> api
 #   ./infra/gcp/deploy.sh smoke-api   # api health + edge enforcement (+ run.app origin NOT reachable)
-#   ./infra/gcp/deploy.sh smoke-web   # served CSP == infra/csp.txt, new build live, .well-known
-#   ./infra/gcp/deploy.sh rollback    # route 100% back to the recorded previous api/executor revisions
+#   ./infra/gcp/deploy.sh hosting     # [hosting]  Firebase Hosting REST deploy of web/dist (infra/hosting/deploy_hosting.py)
+#   ./infra/gcp/deploy.sh smoke-web   # served CSP == infra/csp.txt on every document path, new build live, .well-known
+#   ./infra/gcp/deploy.sh rollback    # route 100% back to the recorded previous api/executor/sandbox revisions
 #
 # State between steps (image digests, previous revisions) lives in $DEPLOY_STATE (default $RUNNER_TEMP).
 # Migrations must be backward compatible with the revision still serving (expand -> deploy -> contract),
@@ -43,6 +46,11 @@ export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 : "${TELEGRAM_BOT_USERNAME:=}"               # required (preflight): BotFather username, e.g. aijalon_alerts_bot
 : "${SANDBOX_DOCKERFILE:=sandbox/Dockerfile}"
 : "${SANDBOX_CONTEXT:=.}"               # build context for the sandbox image, relative to the repo root
+: "${BINAUTHZ_ANNOTATE:=1}"              # render run.googleapis.com/binary-authorization: default (bootstrap `binauthz`)
+: "${DB_TLS_HOST:=}"                     # Cloud SQL DNS name -> migrate sslmode=verify-full; empty -> verify-ca on the IP
+: "${SELFTEST_TIMEOUT_S:=300}"
+: "${SELFTEST_POLL_S:=10}"
+: "${SELFTEST_SETTLE_S:=90}"
 GIT_SHA_SHORT="${GIT_SHA:0:12}"
 
 touch "${DEPLOY_STATE}"
@@ -57,7 +65,10 @@ export_render_env() {
     EXEC_SUBNET KMS_CODE_KEY_NAME \
     WEB_DOMAIN API_DOMAIN SQL_CONNECTION_NAME CLOUDSQL_PROXY_IMAGE DB_MIGRATOR_USER MIGRATE_CMD \
     LAUNCH_PHASE PAYOUTS_ENABLED STRIPE_PUBLISHABLE_KEY STRIPE_MAX_TOPUP_USD STRIPE_FEE_ESTIMATE_BPS \
-    STRIPE_FEE_ESTIMATE_FIXED_USD STRIPE_API_VERSION KYC_PROVIDER KYC_LEVEL_NAME TELEGRAM_BOT_USERNAME
+    STRIPE_FEE_ESTIMATE_FIXED_USD STRIPE_API_VERSION KYC_PROVIDER KYC_LEVEL_NAME TELEGRAM_BOT_USERNAME \
+    KMS_ATTEST_KEY_VERSION_NAME BINAUTHZ_ANNOTATE CANDIDATE_TAG
+  : "${EXECUTOR_CANARY:=0}"
+  export EXECUTOR_CANARY
   DB_IAM_USER_API_URLENC="$(urlenc_at "${DB_IAM_USER_API}")"
   DB_IAM_USER_EXECUTOR_URLENC="$(urlenc_at "${DB_IAM_USER_EXECUTOR}")"
   BACKEND_IMAGE="$(state_get BACKEND_IMAGE)"
@@ -93,6 +104,17 @@ cmd_preflight() {
   done
   [[ -n "${STRIPE_API_VERSION}" ]] || warn "STRIPE_API_VERSION empty: Stripe uses the account default (pin it to the webhook endpoint's version)"
   python3 "${REPO_ROOT}/infra/csp_sync.py" check >/dev/null || { warn "firebase.json CSP != infra/csp.txt"; bad=1; }
+  # REVIEW_WEB_INFRA M2: the production web build refuses to build without SRI; fail early here too
+  [[ -f "${REPO_ROOT}/web/sri.json" ]] || { warn "web/sri.json missing — run 'make sri' (with network), review, commit"; bad=1; }
+  # REVIEW_WEB_INFRA H1: until the trust anchors are pinned the site refuses every wallet signature (fail closed)
+  if grep -q '"REPLACE_ME"' <(python3 -c "import json;print(json.dumps(json.load(open('${REPO_ROOT}/web/public/app-config.json'))['trust']))"); then
+    warn "web/public/app-config.json trust anchors still REPLACE_ME: wallet signing stays disabled (DEPLOY.md §12)"
+    [[ "${LAUNCH_PHASE}" == "public" ]] && { warn "LAUNCH_PHASE=public requires pinned trust anchors"; bad=1; }
+  fi
+  # REVIEW_WEB_INFRA M4: the public smoke test (and its automatic rollback) may be skipped only before go-live
+  if [[ "${SMOKE_SKIP_PUBLIC:-}" == "true" && "${LAUNCH_PHASE}" == "public" ]]; then
+    warn "SMOKE_SKIP_PUBLIC=true is not allowed with LAUNCH_PHASE=public (delete the GitHub variable)"; bad=1
+  fi
   ((bad == 0)) || die "preflight failed"
   log "preflight ok"
 }
@@ -123,10 +145,30 @@ cmd_images() {
   fi
 }
 
+# REVIEW_WEB_INFRA H2: Binary Authorization attestations, signed with the builder-only KMS key.
+cmd_attest() {
+  local img
+  for img in "$(state_get BACKEND_IMAGE)" "$(state_get SANDBOX_IMAGE)"; do
+    [[ -n "${img}" ]] || continue
+    [[ "${img}" =~ @sha256:[0-9a-f]{64}$ ]] || die "refusing to attest a non-digest reference ${img}"
+    log "attest ${img}"
+    gcloud beta container binauthz attestations sign-and-create --artifact-url="${img}" \
+      --attestor="${BINAUTHZ_ATTESTOR}" --attestor-project="${PROJECT_ID}" \
+      --keyversion-project="${PROJECT_ID}" --keyversion-location="${REGION}" --keyversion-keyring="${KMS_KEYRING}" \
+      --keyversion-key="${KMS_BINAUTHZ_KEY}" --keyversion=1 >/dev/null
+  done
+}
+
 cmd_migrate() {
   export_render_env
   [[ -n "${BACKEND_IMAGE}" ]] || die "no BACKEND_IMAGE in ${DEPLOY_STATE} (run images first)"
   export DB_PRIVATE_IP="${DB_PRIVATE_IP:?DB_PRIVATE_IP required}"
+  # REVIEW_WEB_INFRA L6: verify the server certificate (CA bundle secret CLOUDSQL_SERVER_CA, bootstrap `sqlca`)
+  if [[ -n "${DB_TLS_HOST}" ]]; then
+    export DB_SSLMODE=verify-full
+  else
+    export DB_TLS_HOST="${DB_PRIVATE_IP}" DB_SSLMODE=verify-ca
+  fi
   local f; f="$(mktemp --suffix=.yaml)"
   render "${HERE}/run/migrate.job.yaml" > "${f}"
   log "migrate job -> ${BACKEND_IMAGE}"
@@ -145,13 +187,97 @@ replace_service() { # service template
   log "  ${svc} -> $(gcloud run services describe "${svc}" --region="${REGION}" --format='value(status.latestReadyRevisionName)')"
 }
 
+# The revision currently receiving 100 % of a service's traffic (not merely the latest ready one).
+serving_revision() {
+  gcloud run services describe "$1" --region="${REGION}" --format=json | python3 -c '
+import json, sys
+st = json.load(sys.stdin).get("status", {})
+full = [t for t in st.get("traffic", []) if int(t.get("percent") or 0) == 100 and t.get("revisionName")]
+print(full[0]["revisionName"] if full else st.get("latestReadyRevisionName", ""))'
+}
+
+TICK_BEFORE=""
+restore_tick() {   # resume `tick` only if it was running before this deploy paused it (go-live state is sacred)
+  if [[ "${TICK_BEFORE}" == "ENABLED" && "$(sched_state tick)" == "PAUSED" ]]; then
+    gcloud scheduler jobs resume tick --location="${REGION}" >/dev/null && log "  tick resumed"
+  fi
+}
+
+sched_state() { gcloud scheduler jobs describe "$1" --location="${REGION}" --format='value(state)' 2>/dev/null || true; }
+
+# Runs the deploy probe (Cloud Scheduler job SELFTEST_JOB -> candidate tag URL, OIDC as the scheduler SA) and waits
+# for its result. The deployer may only run/pause/resume that job (bootstrap `sa`), never change its target.
+run_selftest() {
+  local before st0 t0 now js last code
+  js="$(gcloud scheduler jobs describe "${SELFTEST_JOB}" --location="${REGION}" --format=json)" \
+    || die "scheduler job ${SELFTEST_JOB} missing — run ./infra/gcp/bootstrap.sh scheduler"
+  before="$(printf '%s' "${js}" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("lastAttemptTime",""))')"
+  st0="$(printf '%s' "${js}" | python3 -c 'import json,sys;print(int((json.load(sys.stdin).get("status") or {}).get("code") or 0))')"
+  gcloud scheduler jobs resume "${SELFTEST_JOB}" --location="${REGION}" >/dev/null 2>&1 || true
+  gcloud scheduler jobs run "${SELFTEST_JOB}" --location="${REGION}" >/dev/null
+  t0="$(date +%s)"
+  local seen="" settle=0
+  while :; do
+    sleep "${SELFTEST_POLL_S}"
+    now="$(date +%s)"
+    js="$(gcloud scheduler jobs describe "${SELFTEST_JOB}" --location="${REGION}" --format=json)"
+    last="$(printf '%s' "${js}" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("lastAttemptTime",""))')"
+    code="$(printf '%s' "${js}" | python3 -c 'import json,sys;print(int((json.load(sys.stdin).get("status") or {}).get("code") or 0))')"
+    if [[ -n "${last}" && "${last}" != "${before}" ]]; then
+      [[ -z "${seen}" ]] && seen="${now}"
+      # the status of THIS attempt is known once it differs from the previous one, or after a settle period
+      # (the attempt deadline is 300 s; the selftest itself takes seconds)
+      if [[ "${code}" != "${st0}" ]] || (( now - seen >= SELFTEST_SETTLE_S )); then settle=1; fi
+    fi
+    (( settle == 1 )) && break
+    (( now - t0 > SELFTEST_TIMEOUT_S )) && { code=-1; break; }
+  done
+  gcloud scheduler jobs pause "${SELFTEST_JOB}" --location="${REGION}" >/dev/null 2>&1 || true
+  [[ "${code}" == "0" ]]
+}
+
+# REVIEW_WEB_INFRA M4: the executor moves real money every minute, so a new revision never gets traffic blind:
+#   1. `tick` is paused (only if it was running; restored on any exit);
+#   2. the new revision is deployed at 0 % under the `candidate` tag (serving revision keeps 100 %);
+#   3. /v1/internal/selftest runs ON THE CANDIDATE through Cloud Scheduler OIDC (dry-run of the tick's inputs:
+#      DB, flags, signals, due subscriptions, Hyperliquid, one KMS agent-key open, the attestation key — no order);
+#   4. pass -> 100 % to the candidate, tag removed; fail -> traffic untouched, tag removed, deploy fails.
+# Not skippable (SMOKE_SKIP_PUBLIC does not apply to it).
+executor_canary() {
+  local prev tick_before
+  prev="$(serving_revision "${EXECUTOR_SERVICE}")"
+  [[ -n "${prev}" ]] || die "cannot determine the executor's serving revision"
+  state_set PREV_EXECUTOR "${prev}"
+  tick_before="$(sched_state tick)"
+  state_set TICK_STATE_BEFORE "${tick_before}"
+  TICK_BEFORE="${tick_before}"
+  trap restore_tick EXIT             # also on die / set -e failures below
+  if [[ "${tick_before}" == "ENABLED" ]]; then
+    gcloud scheduler jobs pause tick --location="${REGION}" >/dev/null
+    log "  tick paused for the executor rollout"
+  else
+    log "  tick is ${tick_before:-absent}: left as it is"
+  fi
+  export EXECUTOR_CANARY=1 PREV_EXECUTOR_REVISION="${prev}"
+  replace_service "${EXECUTOR_SERVICE}" "${HERE}/run/executor.service.yaml"
+  export EXECUTOR_CANARY=0
+  if run_selftest; then
+    log "  selftest passed on the candidate: moving 100 % to it"
+    gcloud run services update-traffic "${EXECUTOR_SERVICE}" --region="${REGION}" --to-latest >/dev/null
+    gcloud run services update-traffic "${EXECUTOR_SERVICE}" --region="${REGION}" --remove-tags="${CANDIDATE_TAG}" >/dev/null || true
+  else
+    gcloud run services update-traffic "${EXECUTOR_SERVICE}" --region="${REGION}" --remove-tags="${CANDIDATE_TAG}" >/dev/null || true
+    die "executor selftest FAILED on the candidate revision — traffic stays on ${prev} (logs: executor_selftest)"
+  fi
+  restore_tick
+  trap - EXIT
+}
+
 cmd_services() {
   export_render_env
   [[ -n "${BACKEND_IMAGE}" ]] || die "no BACKEND_IMAGE in ${DEPLOY_STATE} (run images first)"
-  local s
-  for s in "${API_SERVICE}" "${EXECUTOR_SERVICE}"; do
-    state_set "PREV_${s^^}" "$(gcloud run services describe "${s}" --region="${REGION}" --format='value(status.latestReadyRevisionName)')"
-  done
+  state_set PREV_API "$(serving_revision "${API_SERVICE}")"
+  state_set PREV_SANDBOX "$(serving_revision "${SANDBOX_SERVICE}")"
   if [[ -n "${SANDBOX_IMAGE}" ]]; then
     if [[ "${SANDBOX_EGRESS_MODE}" == "connector" ]]; then
       replace_service "${SANDBOX_SERVICE}" "${HERE}/run/sandbox.connector.service.yaml"
@@ -159,8 +285,18 @@ cmd_services() {
       replace_service "${SANDBOX_SERVICE}" "${HERE}/run/sandbox.service.yaml"
     fi
   fi
-  replace_service "${EXECUTOR_SERVICE}" "${HERE}/run/executor.service.yaml"
+  executor_canary
   replace_service "${API_SERVICE}" "${HERE}/run/api.service.yaml"
+}
+
+# REVIEW_WEB_INFRA H2: Hosting is deployed through the Firebase Hosting REST API with the hosting-only identity's
+# access token (no firebase-tools / npm while credentials exist). Needs HOSTING_ACCESS_TOKEN (auth step output).
+cmd_hosting() {
+  : "${HOSTING_ACCESS_TOKEN:?HOSTING_ACCESS_TOKEN required (google-github-actions/auth token_format: access_token)}"
+  [[ -f "${REPO_ROOT}/web/dist/index.html" ]] || die "web/dist missing (download the web-dist artifact first)"
+  python3 "${REPO_ROOT}/infra/hosting/deploy_hosting.py" --site "${HOSTING_SITE:-${PROJECT_ID}}" \
+    --public "${REPO_ROOT}/web/dist" --config "${REPO_ROOT}/firebase.json" \
+    --message "deploy ${GIT_SHA_SHORT} run ${GITHUB_RUN_ID:-local}"
 }
 
 http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$@" || true; }
@@ -178,6 +314,9 @@ cmd_smoke_api() {
   [[ "${c}" != 2* ]] || die "api run.app origin is publicly reachable (got ${c}) — ingress misconfigured"
   c="$(http_code "$(svc_url "${EXECUTOR_SERVICE}")/healthz")"
   [[ "${c}" != 2* ]] || die "executor is publicly reachable (got ${c}) — ingress misconfigured"
+  local host; host="$(svc_url "${EXECUTOR_SERVICE}")"; host="${host#https://}"
+  c="$(http_code "https://${CANDIDATE_TAG}---${host}/healthz")"
+  [[ "${c}" != 2* ]] || die "executor candidate tag URL is publicly reachable (got ${c})"
   log "smoke api ok"
 }
 
@@ -193,6 +332,14 @@ cmd_smoke_web() {
   done
   [[ "${got}" == "${want}" ]] || die "served CSP differs from infra/csp.txt: '${got}'"
   printf '%s' "${hdrs}" | grep -qi '^strict-transport-security: max-age=63072000' || die "HSTS header missing"
+  # REVIEW_WEB_INFRA M1: document headers on EVERY path the SPA is served from (not only /), incl. /__x-style paths
+  local p h
+  for p in /__x /__ /_x /s/x /index.html; do
+    h="$(curl -sSI --max-time 15 "https://${WEB_DOMAIN}${p}" | tr -d '\r' || true)"
+    printf '%s' "${h}" | grep -qi '^x-frame-options: DENY' || die "X-Frame-Options missing on ${p}"
+    printf '%s' "${h}" | grep -qi "^content-security-policy: .*frame-ancestors 'none'" || die "CSP frame-ancestors missing on ${p}"
+    printf '%s' "${h}" | grep -qi '^reporting-endpoints: csp=' || die "Reporting-Endpoints missing on ${p}"
+  done
   if [[ -f "${REPO_ROOT}/web/dist/build-info.json" ]]; then
     local build live
     build="$(python3 -c "import json;print(json.load(open('${REPO_ROOT}/web/dist/build-info.json'))['build'])")"
@@ -210,23 +357,29 @@ cmd_smoke_web() {
 
 cmd_rollback() {
   local s prev
-  for s in "${API_SERVICE}" "${EXECUTOR_SERVICE}"; do
+  for s in "${API_SERVICE}" "${EXECUTOR_SERVICE}" "${SANDBOX_SERVICE}"; do
     prev="$(state_get "PREV_${s^^}")"
     if [[ -n "${prev}" ]]; then
       warn "rolling ${s} back to ${prev}"
       gcloud run services update-traffic "${s}" --region="${REGION}" --to-revisions="${prev}=100" >/dev/null
     fi
   done
+  gcloud run services update-traffic "${EXECUTOR_SERVICE}" --region="${REGION}" --remove-tags="${CANDIDATE_TAG}" >/dev/null 2>&1 || true
+  if [[ "$(state_get TICK_STATE_BEFORE)" == "ENABLED" && "$(sched_state tick)" == "PAUSED" ]]; then
+    gcloud scheduler jobs resume tick --location="${REGION}" >/dev/null && warn "tick resumed (it was running before the deploy)"
+  fi
   warn "Hosting is not rolled back automatically: Firebase console > Hosting > release history > Rollback"
 }
 
 case "${1:-}" in
   preflight) cmd_preflight ;;
   images)    cmd_images ;;
+  attest)    cmd_attest ;;
   migrate)   cmd_migrate ;;
   services)  cmd_services ;;
   smoke-api) cmd_smoke_api ;;
   smoke-web) cmd_smoke_web ;;
+  hosting)   cmd_hosting ;;
   rollback)  cmd_rollback ;;
-  *) die "usage: $0 preflight|images|migrate|services|smoke-api|smoke-web|rollback" ;;
+  *) die "usage: $0 preflight|images|attest|migrate|services|smoke-api|hosting|smoke-web|rollback" ;;
 esac

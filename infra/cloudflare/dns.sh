@@ -33,6 +33,10 @@
 #   GEO_BLOCK=1                block restricted jurisdictions at the API edge (webhooks + /healthz exempt).
 #   RESTRICTED_COUNTRIES       default = app/config.py DEFAULT_RESTRICTED.
 #   DMARC_POLICY               default "reject" (set up your e-mail provider's SPF/DKIM before sending mail).
+#   AOP=1                      Authenticated Origin Pulls with OUR zone-level client certificate (REVIEW_WEB_INFRA M3):
+#                              uploads CF_AOP_CLIENT_CERT/_KEY (created by `bootstrap.sh aop`, read from Secret Manager
+#                              into shell variables — never argv) and enables zone AOP. Then attach the LB mTLS policy
+#                              with `AOP_ATTACH=1 ./infra/gcp/bootstrap.sh aop`.
 #
 # Rulesets are written as whole phase entrypoints (PUT): the rules below ARE the configuration. Manual edits in
 # the Cloudflare dashboard for these phases are overwritten on the next run — change this file instead.
@@ -186,6 +190,20 @@ setting ip_geolocation '"on"'         # CF-IPCountry header (app uses it only af
 
 log "DNSSEC"
 cf PATCH "/zones/${ZONE_ID}/dnssec" '{"status":"active"}' >/dev/null || warn "enable DNSSEC in the dashboard"
+# REVIEW_WEB_INFRA L13: DNSSEC only protects once the registrar publishes the DS record Cloudflare shows.
+DNSSEC_INFO="$(cf GET "/zones/${ZONE_ID}/dnssec")"
+DNSSEC_STATUS="$(printf '%s' "${DNSSEC_INFO}" | jget "d.get('status','')")"
+DNSSEC_DS="$(printf '%s' "${DNSSEC_INFO}" | jget "d.get('ds','') or ''")"
+if command -v dig >/dev/null 2>&1; then
+  LIVE_DS="$(dig +short DS "${ZONE_NAME}" @1.1.1.1 2>/dev/null || true)"
+  if [[ -z "${LIVE_DS}" ]]; then
+    warn "DNSSEC status '${DNSSEC_STATUS}': NO DS record is published for ${ZONE_NAME}. HUMAN: add this DS at the registrar: ${DNSSEC_DS}"
+  else
+    log "  DS published at the registrar: ${LIVE_DS}"
+  fi
+else
+  warn "dig not installed: verify the DS record yourself (dig +dnssec DS ${ZONE_NAME}); Cloudflare DS: ${DNSSEC_DS}"
+fi
 
 # ---- rulesets ---------------------------------------------------------------------------------------------
 put_phase() { # phase json-rules-array   (rules via env, not argv: the transform rule carries the edge secret)
@@ -255,6 +273,29 @@ if [[ "${CF_PLAN}" != "free" ]]; then
      "action_parameters":{"id":"4814384a9e5d4991b9815dcfc25d2f1f"}}]'
 else
   warn "CF_PLAN=free: only the auto-deployed Free Managed Ruleset applies. Pro is recommended before public launch."
+fi
+
+if [[ "${AOP:-0}" == "1" ]]; then
+  log "Authenticated Origin Pulls: zone-level client certificate (ours, not Cloudflare's shared CA)"
+  command -v gcloud >/dev/null || die "AOP=1 needs gcloud (the certificate lives in Secret Manager)"
+  AOP_CERT="$(gcloud secrets versions access latest --secret=CF_AOP_CLIENT_CERT --project="${PROJECT_ID}")"
+  AOP_KEY="$(gcloud secrets versions access latest --secret=CF_AOP_CLIENT_KEY --project="${PROJECT_ID}")"
+  [[ "${AOP_CERT}" == *"BEGIN CERTIFICATE"* && "${AOP_KEY}" == *"PRIVATE KEY"* ]] || die "CF_AOP_CLIENT_CERT/_KEY missing — run ./infra/gcp/bootstrap.sh aop"
+  HAVE="$(cf GET "/zones/${ZONE_ID}/origin_tls_client_auth" | AOP_CERT="${AOP_CERT}" python3 -c '
+import json,os,sys
+want="".join(os.environ["AOP_CERT"].split())
+print(next((c.get("id","") for c in (json.load(sys.stdin) or []) if "".join(str(c.get("certificate","")).split())==want),""))')"
+  if [[ -z "${HAVE}" ]]; then
+    body="$(AOP_CERT="${AOP_CERT}" AOP_KEY="${AOP_KEY}" python3 -c 'import json,os;print(json.dumps({"certificate":os.environ["AOP_CERT"],"private_key":os.environ["AOP_KEY"]}))')"
+    cf POST "/zones/${ZONE_ID}/origin_tls_client_auth" "${body}" >/dev/null
+    unset body
+    log "  zone client certificate uploaded"
+  else
+    log "  zone client certificate already present (${HAVE})"
+  fi
+  unset AOP_KEY AOP_CERT
+  cf PUT "/zones/${ZONE_ID}/origin_tls_client_auth/settings" '{"enabled":true}' >/dev/null
+  log "  zone AOP enabled. NEXT: AOP_ATTACH=1 ./infra/gcp/bootstrap.sh aop (the LB then requires this certificate)"
 fi
 
 log "done. Check: https://${ZONE_NAME} (Firebase cert may take up to 24 h), https://${API_HOST}/healthz"

@@ -445,7 +445,7 @@ class JobsDataDbTest(unittest.TestCase):
         self.assertEqual(ev[0]["user_id"], uid)
         self.assertNotIn(addr, json.dumps(ev))                                   # never the full address
         self.assertEqual(len(self.events(f"fill_unattributed:{addr}:%")), 1)
-        # idempotent re-run (overlap re-fetch) → nothing new; late fill after settlement → critical ops event
+        # idempotent re-run (overlap re-fetch) → nothing new; late fill after settlement → ops event (warn)
         self.admin.fetchall("UPDATE subscriptions SET pnl_cursor = :p WHERE id = CAST(:s AS uuid)",
                             {"p": T0, "s": sub})
         c_late = _cloid(self.seed * 4 + 9)
@@ -455,7 +455,8 @@ class JobsDataDbTest(unittest.TestCase):
         rep = fills_ingest(self.db, T0 + timedelta(minutes=5), info=info, weight_per_minute=100_000)
         self.assertEqual((rep["inserted"], rep["late_fills"]), (1, 1))
         late = self.events(f"fill_after_settlement:{addr}:%")
-        self.assertEqual((len(late), late[0]["severity"]), (1, "critical"))
+        # REVIEW_MONEY M3: booked into the next settlement (claimed), so no longer critical
+        self.assertEqual((len(late), late[0]["severity"]), (1, "warn"))
         rep = fills_ingest(self.db, T0 + timedelta(minutes=10), info=info, weight_per_minute=100_000)
         self.assertEqual(rep["inserted"], 0)
         # settlement reads realized PnL from net_pnl_micro of the subscription's fills (pnl_since contract)
