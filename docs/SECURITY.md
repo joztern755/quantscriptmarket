@@ -38,7 +38,7 @@ Related: `docs/SPEC.md` §2, §4, §5 · `docs/RUNBOOK.md` · `docs/INCIDENT_RES
                                                          Cloud Scheduler
 Cloud Run sandbox (no egress, no SA perms) <-- code + bars / --> weights
 Cloud SQL (private IP, CMEK) <-- api (app_api) / executor (app_executor) / migrator
-Cloud KMS HSM key "agent-keys": api=encrypt-only, executor=decrypt-only
+Cloud KMS HSM key "agent-keys": executor only (encrypt + decrypt; it generates agent keys, migrations/0016); api: no role
 Terminal GitHub Action --Ed25519-signed signals.json--> fetched by /internal/ingest-signals
 Stripe --signed webhook--> api /webhooks/stripe
 Admin browser + hardware wallet --> usdSend (payouts); treasury key never on servers
@@ -74,7 +74,8 @@ S = Spoofing, T = Tampering, R = Repudiation, I = Information disclosure, D = De
 | T | IDOR: changing another user's subscription, allocation or withdrawal address | Every query is scoped by `user_id` from the token; authorisation tests per router | [DESIGN] |
 | T | Race conditions: double spend of the fee balance, double withdrawal | DB transactions with row locks or serialisable isolation on balance-affecting operations; idempotency keys; ledger Σ=0 constraint | [DESIGN] |
 | R | Admin denies an action | Hash-chained `audit_log` for every security or financial event | [BUILT: audit.py] |
-| I | Agent key ciphertext exposed via the API | `app_api` has no SELECT on `agent_keys.key_ciphertext` (column privilege); api SA can encrypt only | [DESIGN: verify grants] |
+| I | Agent key ciphertext exposed via the API | `app_api` has no SELECT on `agent_keys.key_ciphertext` (column privilege) and no INSERT/UPDATE on any key-material column (0016); the api SA has no KMS role on agent-keys | [DESIGN: verify grants — `infra/gcp/sql/20_verify.sql`] |
+| T | Compromised api plants an agent key it KNOWS (seals it, the executor attests it, the user approves it) | The api cannot generate or seal agent keys at all (migrations/0016): POST /v1/agents only inserts a request row; the EXECUTOR generates the key, seals it, re-opens it and signs the `aijalon-agent-v2` attestation. api SA: no role on agent-keys; `kms.make_encryptor` refuses the api role; DB: api lacks column privileges on key material, trigger allows the executor one write (requested → pending_approval); only executor-generated keys can be attested or activated. Alert: agent-keys Encrypt by anyone but the executor (CRITICAL) | [DONE: tests/test_executor_keygen.py] |
 | I | Verbose errors or logs leaking secrets | Typed errors; the log filter redacts 64-hex strings and tokens | [BUILT: logging.py] |
 | D | API abuse | Per-user and per-IP rate limits; Cloudflare rules; Cloud Run max instances | [BUILT: ratelimit.py] |
 | E | Normal user reaches admin routes | Role check plus step-up plus a separate admin allowlist; admin routes separated and tested | [DESIGN] |
@@ -163,8 +164,8 @@ S = Spoofing, T = Tampering, R = Repudiation, I = Information disclosure, D = De
 
 | Key | Where | Who can use | Rotation / recovery |
 |---|---|---|---|
-| Agent keys (per user) | Generated in the `api` process, **encrypted with KMS (HSM) immediately**, stored as ciphertext in Cloud SQL. Plaintext exists briefly in api memory at generation, and in executor memory during a tick. | Executor SA only (KMS decrypt) | Per-user rotation: the user approves a new agent (step-up), and the old one is revoked on-chain. Mass rotation after compromise requires **every user to re-sign `approveAgent`** (we cannot rotate without them). See RUNBOOK §7. Approving a new agent under the same name is expected to replace the old one **[VERIFY]**. |
-| KMS key `agent-keys` | Cloud KMS, HSM protection level, `asia-southeast1` | Encrypt: api SA. Decrypt: executor SA. **No human.** | Automatic rotation of the primary version (e.g. every 90 days) [DESIGN]; re-wrap old ciphertexts in the background; never destroy a version while ciphertexts reference it |
+| Agent keys (per user) | Generated in the **executor** process (migrations/0016; the api only files a request), **encrypted with KMS (HSM) immediately**, stored as ciphertext in Cloud SQL. Plaintext exists only in executor memory: briefly at generation, and during a tick. | Executor SA only (KMS encrypt + decrypt) | Per-user rotation: the user approves a new agent (step-up), and the old one is revoked on-chain. Mass rotation after compromise requires **every user to re-sign `approveAgent`** (we cannot rotate without them). See RUNBOOK §7. Approving a new agent under the same name is expected to replace the old one **[VERIFY]**. |
+| KMS key `agent-keys` | Cloud KMS, HSM protection level, `asia-southeast1` | Encrypt + decrypt: executor SA only (0016; the api SA has no role). **No human.** | Automatic rotation of the primary version (e.g. every 90 days) [DESIGN]; re-wrap old ciphertexts in the background; never destroy a version while ciphertexts reference it |
 | Treasury / builder key | **Hardware wallets only** (e.g. two devices with the same seed, held by two named officers in separate locations; seed backups on metal, in two separate secure locations). Never typed into a computer. | Signing in the admin browser, after maker-checker approval | Key ceremony (GO_LIVE_CHECKLIST §B). Compromise: move funds to a new address generated in a new ceremony; update config through maker-checker. Consider Hyperliquid multi-sig. |
 | Signal signing key (Ed25519) | Terminal repo GitHub secret | Terminal Action | Rotation: publish the new public key, dual-verify during the overlap, then pin the new key through maker-checker config |
 | Stripe keys | Secret Manager; **restricted keys** with minimum scopes; webhook secret separate | api SA | Rotate yearly and on suspicion |
@@ -186,7 +187,7 @@ S = Spoofing, T = Tampering, R = Repudiation, I = Information disclosure, D = De
 
 ## 6. Segregation of duties
 
-**Service accounts (IAM).** See SPEC §2.1: api encrypts only; executor decrypts only (and alone signs agent attestations); sandbox has nothing; builder pushes and attests images; deployer updates the named Cloud Run services (it holds no secret or KMS role, but code it deploys runs with the runtime SA's rights — Binary Authorization bounds that); hosting deploys Hosting only.
+**Service accounts (IAM).** See SPEC §2.1: api encrypts creator code only (no role on agent-keys); executor generates, seals and decrypts agent keys (and alone signs agent attestations); sandbox has nothing; builder pushes and attests images; deployer updates the named Cloud Run services (it holds no secret or KMS role, but code it deploys runs with the runtime SA's rights — Binary Authorization bounds that); hosting deploys Hosting only.
 
 **Database roles.**
 - `app_api`: no SELECT on `agent_keys.key_ciphertext` or `strategy_versions.code_ciphertext`; no UPDATE/DELETE on the ledger, audit or consents.
