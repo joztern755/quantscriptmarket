@@ -109,6 +109,14 @@ class Settings:
     max_total_platform_allocation_micro: int        # cap across all users
     max_user_leverage: int                          # launch-phase leverage cap (≤ risk.platform_max_leverage)
     payouts_enabled: bool
+    stripe_max_topup_micro: int
+    feature_stripe_myr: bool                        # FPX / GrabPay need MYR; off until an FX source is chosen
+    stripe_myr_fx_spread_bps: int
+    stripe_api_version: str
+    stripe_fee_estimate_bps: int                    # estimate shown BEFORE payment; set from Stripe MY pricing [CONFIRM]
+    stripe_fee_estimate_fixed_micro: int
+    ops_emails: tuple[str, ...]
+    email_from: str
     economics: Economics = field(default_factory=Economics)
     risk: RiskLimits = field(default_factory=RiskLimits)
 
@@ -163,6 +171,14 @@ def get_settings() -> Settings:
         max_total_platform_allocation_micro=usd(os.environ.get("MAX_TOTAL_PLATFORM_ALLOCATION_USD", "25000")),
         max_user_leverage=int(os.environ.get("MAX_USER_LEVERAGE", "2")),
         payouts_enabled=_b("PAYOUTS_ENABLED", "false"),
+        stripe_max_topup_micro=usd(os.environ.get("STRIPE_MAX_TOPUP_USD", "10000")),
+        feature_stripe_myr=_b("FEATURE_STRIPE_MYR", "false"),
+        stripe_myr_fx_spread_bps=int(os.environ.get("STRIPE_MYR_FX_SPREAD_BPS", "150")),
+        stripe_api_version=os.environ.get("STRIPE_API_VERSION", ""),
+        stripe_fee_estimate_bps=int(os.environ.get("STRIPE_FEE_ESTIMATE_BPS", "0")),
+        stripe_fee_estimate_fixed_micro=usd(os.environ.get("STRIPE_FEE_ESTIMATE_FIXED_USD", "0")),
+        ops_emails=tuple(e.strip() for e in os.environ.get("OPS_EMAILS", "").split(",") if e.strip()),
+        email_from=os.environ.get("EMAIL_FROM", "alerts@aijalon.trade"),
     )
     if s.is_prod:
         missing = [k for k in ("builder_address", "treasury_address", "kms_key_name", "firebase_project_id", "signals_pubkey_b64",

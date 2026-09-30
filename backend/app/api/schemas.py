@@ -282,9 +282,13 @@ class PlanChangeOut(Out):
     fee_balance_micro: int
 
 
+Sha256Hex = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+
+
 class ConsentItem(In):
     doc: LegalDoc
     version: DocVersion
+    doc_text_sha256: Sha256Hex                  # sha256 of the exact rendered text the user saw
     country: Optional[Country] = None           # required when doc == "jurisdiction"
 
     @model_validator(mode="after")
@@ -372,6 +376,7 @@ MIN_ALLOCATION_MICRO = 100 * 1_000_000          # $100: below this, min order si
 class SubscriptionAck(In):
     """Strategy-specific risk acknowledgement + the exact fees the user was shown (must match current terms)."""
     version: DocVersion
+    doc_text_sha256: Sha256Hex
     accepted: Literal[True]
     quoted_price_monthly_micro: MicroOrZero
     quoted_profit_share_bps: Annotated[StrictInt, Field(ge=0, le=10_000)]
@@ -709,7 +714,10 @@ class KycSessionOut(Out):
 
 
 # ---------------------------------------------------------------------------------------------------- admin
-FLAG_KEY_PATTERN = r"^(kill_switch_global|new_entries_paused|kill_switch_market:(?:[a-z0-9]{1,12}:)?[A-Za-z0-9]{1,20})$"
+# Global switches, or per-market `kill_switch_market:{coin}` / `new_entries_paused:{coin}`; coin may carry a builder
+# dex prefix with its own ':' (e.g. new_entries_paused:xyz:SILVER).
+FLAG_KEY_PATTERN = (r"^(?:kill_switch_global|new_entries_paused"
+                    r"|(?:kill_switch_market|new_entries_paused):(?:[a-z0-9]{1,16}:)?[A-Za-z0-9]{1,32})$")
 
 
 class FlagOut(Out):

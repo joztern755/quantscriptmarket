@@ -1,0 +1,343 @@
+// Hyperliquid user-signed actions (SPEC §6): ApproveAgent, ApproveBuilderFee, UsdSend.
+//
+// Policy: typed data offered by our server is VALIDATED (never signed as received); the payload that
+// is actually signed is always rebuilt here with the wallet's CURRENT chain id as signatureChainId and
+// a fresh nonce. Addresses/limits come from /v1/public/config (builder, treasury, agent name, fee cap).
+//
+// Action key order mirrors the Hyperliquid Python SDK (hyperliquid/exchange.py + utils/signing.py
+// `sign_user_signed_action`, which APPENDS signatureChainId and hyperliquidChain to the dict built by
+// the caller). UNVERIFIED here (no network/SDK source in this environment). For user-signed actions
+// the exchange verifies an EIP-712 hash built from the typed fields, so JSON key order should not
+// affect validity — but check against the SDK before go-live.
+
+import { publicConfig, ApiError } from "./api.js";
+import { appConfig } from "./config.js";
+import { microToDecimal, toMicro, type MicroLike } from "./format.js";
+import { isAddress } from "./keccak.js";
+import type { TypedData, Wallet } from "./wallet.js";
+
+export type HlChain = "Mainnet" | "Testnet";
+export type HlKind = "approveAgent" | "approveBuilderFee" | "usdSend";
+type Field = { name: string; type: string };
+
+const ZERO = "0x0000000000000000000000000000000000000000";
+const DOMAIN_TYPES: Field[] = [
+  { name: "name", type: "string" },
+  { name: "version", type: "string" },
+  { name: "chainId", type: "uint256" },
+  { name: "verifyingContract", type: "address" },
+];
+
+export const HL_TYPES: Record<HlKind, { primaryType: string; fields: Field[] }> = {
+  approveAgent: {
+    primaryType: "HyperliquidTransaction:ApproveAgent",
+    fields: [
+      { name: "hyperliquidChain", type: "string" },
+      { name: "agentAddress", type: "address" },
+      { name: "agentName", type: "string" },
+      { name: "nonce", type: "uint64" },
+    ],
+  },
+  approveBuilderFee: {
+    primaryType: "HyperliquidTransaction:ApproveBuilderFee",
+    fields: [
+      { name: "hyperliquidChain", type: "string" },
+      { name: "maxFeeRate", type: "string" },
+      { name: "builder", type: "address" },
+      { name: "nonce", type: "uint64" },
+    ],
+  },
+  usdSend: {
+    primaryType: "HyperliquidTransaction:UsdSend",
+    fields: [
+      { name: "hyperliquidChain", type: "string" },
+      { name: "destination", type: "string" },
+      { name: "amount", type: "string" },
+      { name: "time", type: "uint64" },
+    ],
+  },
+};
+
+export class HlValidationError extends ApiError {
+  constructor(message: string) {
+    super(0, "hl_validation_failed", message);
+    this.name = "HlValidationError";
+  }
+}
+
+export interface BuiltAction {
+  kind: HlKind;
+  action: Record<string, unknown>;
+  nonce: number;
+  typedData: TypedData;
+}
+
+function chainIdNum(hex: string): number {
+  if (!/^0x[0-9a-fA-F]{1,16}$/.test(hex)) throw new HlValidationError("Invalid signatureChainId");
+  const n = parseInt(hex, 16);
+  if (!Number.isSafeInteger(n) || n <= 0) throw new HlValidationError("Invalid signatureChainId");
+  return n;
+}
+
+function typed(kind: HlKind, chainHex: string, message: Record<string, unknown>): TypedData {
+  const t = HL_TYPES[kind];
+  return {
+    types: { EIP712Domain: DOMAIN_TYPES, [t.primaryType]: t.fields },
+    primaryType: t.primaryType,
+    domain: { name: "HyperliquidSignTransaction", version: "1", chainId: chainIdNum(chainHex), verifyingContract: ZERO },
+    message,
+  };
+}
+
+function checkNonce(n: number): void {
+  if (!Number.isSafeInteger(n) || n < 1_600_000_000_000 || n > 9_999_999_999_999) throw new HlValidationError("Invalid nonce");
+}
+
+function checkAddr(a: string, what: string): string {
+  if (!isAddress(a)) throw new HlValidationError(`Invalid ${what} address`);
+  return a.toLowerCase();
+}
+
+/** Tenths of a bp → Hyperliquid percent string: 100 → "0.1%", 10 → "0.01%", 1 → "0.001%". */
+export function maxFeeRateFromTenthsBp(t: number): string {
+  if (!Number.isInteger(t) || t < 0 || t > 1000) throw new HlValidationError("Invalid builder fee rate");
+  const whole = Math.floor(t / 1000);
+  const frac = String(t % 1000).padStart(3, "0").replace(/0+$/, "");
+  return `${whole}${frac ? "." + frac : ""}%`;
+}
+
+/** "0.1%" → 100 tenths-of-bp (rounded UP so a larger rate can never slip through). Null if malformed. */
+export function tenthsBpFromMaxFeeRate(s: string): number | null {
+  const m = /^(\d{1,3})(?:\.(\d{1,8}))?%$/.exec(s);
+  if (!m) return null;
+  const frac = m[2] ?? "";
+  const scaled = BigInt(m[1]! + frac.padEnd(8, "0")); // percent × 1e8
+  const per = 100_000n; // 1 tenth-bp = 0.001% = 1e5 in percent×1e8
+  return Number((scaled + per - 1n) / per);
+}
+
+export function buildApproveAgent(p: { agentAddress: string; agentName: string; nonce: number; signatureChainId: `0x${string}`; hyperliquidChain: HlChain }): BuiltAction {
+  checkNonce(p.nonce);
+  const agentAddress = checkAddr(p.agentAddress, "agent");
+  if (!/^[A-Za-z0-9_-]{1,16}$/.test(p.agentName)) throw new HlValidationError("Invalid agent name");
+  const action = {
+    type: "approveAgent",
+    agentAddress,
+    agentName: p.agentName,
+    nonce: p.nonce,
+    signatureChainId: p.signatureChainId,
+    hyperliquidChain: p.hyperliquidChain,
+  };
+  return {
+    kind: "approveAgent",
+    action,
+    nonce: p.nonce,
+    typedData: typed("approveAgent", p.signatureChainId, { hyperliquidChain: p.hyperliquidChain, agentAddress, agentName: p.agentName, nonce: p.nonce }),
+  };
+}
+
+export function buildApproveBuilderFee(p: { builder: string; maxFeeRate: string; nonce: number; signatureChainId: `0x${string}`; hyperliquidChain: HlChain }): BuiltAction {
+  checkNonce(p.nonce);
+  const builder = checkAddr(p.builder, "builder");
+  if (tenthsBpFromMaxFeeRate(p.maxFeeRate) === null) throw new HlValidationError("Invalid maxFeeRate");
+  const action = {
+    maxFeeRate: p.maxFeeRate,
+    builder,
+    nonce: p.nonce,
+    type: "approveBuilderFee",
+    signatureChainId: p.signatureChainId,
+    hyperliquidChain: p.hyperliquidChain,
+  };
+  return {
+    kind: "approveBuilderFee",
+    action,
+    nonce: p.nonce,
+    typedData: typed("approveBuilderFee", p.signatureChainId, { hyperliquidChain: p.hyperliquidChain, maxFeeRate: p.maxFeeRate, builder, nonce: p.nonce }),
+  };
+}
+
+export function buildUsdSend(p: { destination: string; amount: string; time: number; signatureChainId: `0x${string}`; hyperliquidChain: HlChain }): BuiltAction {
+  checkNonce(p.time);
+  const destination = checkAddr(p.destination, "destination");
+  if (!/^(0|[1-9]\d{0,11})(\.\d{1,6})?$/.test(p.amount) || /^0(\.0+)?$/.test(p.amount)) throw new HlValidationError("Invalid amount");
+  const action = {
+    destination,
+    amount: p.amount,
+    time: p.time,
+    type: "usdSend",
+    signatureChainId: p.signatureChainId,
+    hyperliquidChain: p.hyperliquidChain,
+  };
+  return {
+    kind: "usdSend",
+    action,
+    nonce: p.time,
+    typedData: typed("usdSend", p.signatureChainId, { hyperliquidChain: p.hyperliquidChain, destination, amount: p.amount, time: p.time }),
+  };
+}
+
+export interface ValidateExpect {
+  hyperliquidChain: HlChain;
+  agentAddress?: string;
+  agentName?: string;
+  builder?: string;
+  maxFeeTenthsBp?: number;
+  destination?: string;
+  amountMicro?: MicroLike;
+}
+
+/**
+ * Validates typed data offered by our server against what the client expects. Throws HlValidationError
+ * on ANY deviation (a compromised or buggy server must not be able to get a different action signed).
+ */
+export function validateServerTypedData(kind: HlKind, raw: unknown, expect: ValidateExpect): { nonce: number; message: Record<string, unknown> } {
+  const t = HL_TYPES[kind];
+  const td = (typeof raw === "string" ? JSON.parse(raw) : raw) as Partial<TypedData> | null;
+  if (!td || typeof td !== "object") throw new HlValidationError("Missing typed data");
+  if (td.primaryType !== t.primaryType) throw new HlValidationError("Unexpected action type");
+  const d = td.domain as Record<string, unknown> | undefined;
+  if (!d || d.name !== "HyperliquidSignTransaction" || d.version !== "1" || String(d.verifyingContract).toLowerCase() !== ZERO) throw new HlValidationError("Unexpected signing domain");
+  const fields = td.types?.[t.primaryType];
+  if (!Array.isArray(fields) || fields.length !== t.fields.length || fields.some((f, i) => f.name !== t.fields[i]!.name || f.type !== t.fields[i]!.type)) throw new HlValidationError("Unexpected typed-data fields");
+  const extraTypes = Object.keys(td.types ?? {}).filter((k) => k !== t.primaryType && k !== "EIP712Domain");
+  if (extraTypes.length) throw new HlValidationError("Unexpected extra types");
+  const msg = (td.message ?? {}) as Record<string, unknown>;
+  if (msg.hyperliquidChain !== expect.hyperliquidChain) throw new HlValidationError("Wrong Hyperliquid chain");
+  const nonceKey = kind === "usdSend" ? "time" : "nonce";
+  const nonce = Number(msg[nonceKey]);
+  checkNonce(nonce);
+  const eqAddr = (a: unknown, b: string | undefined, what: string) => {
+    if (!b || !isAddress(b)) throw new HlValidationError(`No expected ${what} address configured`);
+    if (typeof a !== "string" || a.toLowerCase() !== b.toLowerCase()) throw new HlValidationError(`${what} address does not match`);
+  };
+  if (kind === "approveAgent") {
+    eqAddr(msg.agentAddress, expect.agentAddress, "Agent");
+    if (msg.agentName !== expect.agentName) throw new HlValidationError("Agent name does not match");
+  } else if (kind === "approveBuilderFee") {
+    eqAddr(msg.builder, expect.builder, "Builder");
+    const rate = typeof msg.maxFeeRate === "string" ? tenthsBpFromMaxFeeRate(msg.maxFeeRate) : null;
+    if (rate === null || expect.maxFeeTenthsBp === undefined || rate > expect.maxFeeTenthsBp) throw new HlValidationError("Builder fee rate is above the published maximum");
+  } else {
+    eqAddr(msg.destination, expect.destination, "Destination");
+    if (expect.amountMicro === undefined || typeof msg.amount !== "string") throw new HlValidationError("Amount missing");
+    const m = /^(\d+)(?:\.(\d{1,6}))?$/.exec(msg.amount);
+    if (!m) throw new HlValidationError("Invalid amount");
+    const micro = BigInt(m[1]!) * 1_000_000n + BigInt((m[2] ?? "").padEnd(6, "0") || "0");
+    if (micro !== toMicro(expect.amountMicro)) throw new HlValidationError("Amount does not match");
+  }
+  return { nonce, message: msg };
+}
+
+export function splitSignature(sig: string): { r: string; s: string; v: number } {
+  if (!/^0x[0-9a-fA-F]{130}$/.test(sig)) throw new HlValidationError("Invalid signature");
+  const r = "0x" + sig.slice(2, 66).toLowerCase();
+  const s = "0x" + sig.slice(66, 130).toLowerCase();
+  let v = parseInt(sig.slice(130, 132), 16);
+  if (v < 27) v += 27;
+  if (v !== 27 && v !== 28) throw new HlValidationError("Invalid signature recovery id");
+  return { r, s, v };
+}
+
+export interface HlResult {
+  ok: boolean;
+  status: "ok" | "err";
+  response: unknown;
+  error?: string;
+}
+
+function hlUrl(path: "/exchange" | "/info"): string {
+  return `${appConfig().hlApiUrl}${path}`;
+}
+
+export async function postExchange(body: { action: Record<string, unknown>; nonce: number; signature: { r: string; s: string; v: number } }): Promise<HlResult> {
+  let res: Response;
+  try {
+    res = await fetch(hlUrl("/exchange"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: body.action, nonce: body.nonce, signature: body.signature }),
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      cache: "no-store",
+    });
+  } catch {
+    throw new ApiError(0, "network_error", "Couldn't reach Hyperliquid. Your signature was not submitted.");
+  }
+  const textBody = await res.text();
+  let json: unknown = null;
+  try {
+    json = JSON.parse(textBody);
+  } catch { /* non-JSON error */ }
+  if (!res.ok) return { ok: false, status: "err", response: json ?? textBody, error: `Hyperliquid HTTP ${res.status}: ${textBody.slice(0, 200)}` };
+  const j = (json ?? {}) as { status?: string; response?: unknown };
+  if (j.status === "ok") {
+    // Some actions nest per-item errors (e.g. {"response":{"type":"default"}} is success).
+    const inner = j.response as { data?: { statuses?: { error?: string }[] } } | undefined;
+    const nestedErr = inner?.data?.statuses?.find((s) => s && typeof s.error === "string")?.error;
+    if (nestedErr) return { ok: false, status: "err", response: j.response, error: nestedErr };
+    return { ok: true, status: "ok", response: j.response };
+  }
+  const err = typeof j.response === "string" ? j.response : JSON.stringify(j.response ?? textBody).slice(0, 300);
+  return { ok: false, status: "err", response: j.response, error: err };
+}
+
+export async function hlInfo<T>(body: Record<string, unknown>): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(hlUrl("/info"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), credentials: "omit", referrerPolicy: "no-referrer" });
+  } catch {
+    throw new ApiError(0, "network_error", "Couldn't reach Hyperliquid.");
+  }
+  if (!res.ok) throw new ApiError(res.status, "hl_info_error", `Hyperliquid info error (${res.status})`);
+  return (await res.json()) as T;
+}
+
+export async function signAndSubmit(wallet: Wallet, built: BuiltAction): Promise<HlResult> {
+  const sig = await wallet.signTypedDataV4(built.typedData);
+  return postExchange({ action: built.action, nonce: built.nonce, signature: splitSignature(sig) });
+}
+
+async function liveConfig() {
+  const cfg = await publicConfig();
+  if (cfg._fallback) throw new ApiError(0, "config_unavailable", "Couldn't load the platform configuration. Try again in a moment.");
+  return cfg;
+}
+
+/** Master wallet approves our per-user agent (named `agent_name`). */
+export async function approveAgent(wallet: Wallet, p: { agentAddress: string; serverTypedData?: unknown }): Promise<HlResult> {
+  const cfg = await liveConfig();
+  if (p.serverTypedData !== undefined) {
+    validateServerTypedData("approveAgent", p.serverTypedData, { hyperliquidChain: cfg.hl_chain, agentAddress: p.agentAddress, agentName: cfg.agent_name });
+  }
+  const built = buildApproveAgent({ agentAddress: p.agentAddress, agentName: cfg.agent_name, nonce: Date.now(), signatureChainId: await wallet.chainIdHex(), hyperliquidChain: cfg.hl_chain });
+  return signAndSubmit(wallet, built);
+}
+
+/** Master wallet approves our builder fee at the published rate (never above config). */
+export async function approveBuilderFee(wallet: Wallet, p: { serverTypedData?: unknown } = {}): Promise<HlResult> {
+  const cfg = await liveConfig();
+  if (!cfg.builder_address) throw new ApiError(0, "config_unavailable", "Builder address is not configured.");
+  const maxT = cfg.economics.builder_fee_tenths_bp;
+  if (p.serverTypedData !== undefined) {
+    validateServerTypedData("approveBuilderFee", p.serverTypedData, { hyperliquidChain: cfg.hl_chain, builder: cfg.builder_address, maxFeeTenthsBp: maxT });
+  }
+  const built = buildApproveBuilderFee({ builder: cfg.builder_address, maxFeeRate: maxFeeRateFromTenthsBp(maxT), nonce: Date.now(), signatureChainId: await wallet.chainIdHex(), hyperliquidChain: cfg.hl_chain });
+  return signAndSubmit(wallet, built);
+}
+
+/**
+ * USDC transfer (perps balance) — fee-balance deposits to the treasury, or admin payouts.
+ * `expectDestination` must come from a trusted source (public config treasury, or the maker-checker
+ * approved payout record) and must equal `destination`.
+ */
+export async function usdSend(wallet: Wallet, p: { destination: string; amountMicro: MicroLike; expectDestination: string; serverTypedData?: unknown }): Promise<HlResult> {
+  const cfg = await liveConfig();
+  if (!isAddress(p.destination) || p.destination.toLowerCase() !== String(p.expectDestination).toLowerCase()) throw new HlValidationError("Destination does not match the expected address");
+  const amt = toMicro(p.amountMicro);
+  if (amt <= 0n) throw new HlValidationError("Amount must be positive");
+  if (p.serverTypedData !== undefined) {
+    validateServerTypedData("usdSend", p.serverTypedData, { hyperliquidChain: cfg.hl_chain, destination: p.expectDestination, amountMicro: amt });
+  }
+  const built = buildUsdSend({ destination: p.destination, amount: microToDecimal(amt), time: Date.now(), signatureChainId: await wallet.chainIdHex(), hyperliquidChain: cfg.hl_chain });
+  return signAndSubmit(wallet, built);
+}

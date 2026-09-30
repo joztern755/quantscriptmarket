@@ -192,7 +192,7 @@ def _main():
     exec("def _imp(name, globals=None, locals=None, fromlist=(), level=0):\n"
          "    if level == 0 and name in _mods:\n"
          "        return _mods[name]\n"
-         "    raise ImportError('import of ' + str(name) + ' is not allowed')\n", ig)
+         "    raise ImportError('import of %r is not allowed' % (name,))\n", ig)
     safe["__import__"] = ig["_imp"]
 
     class _CallTimeout(BaseException):

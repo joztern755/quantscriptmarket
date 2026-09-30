@@ -198,13 +198,15 @@ test('keygen.js prints a usable PEM + base64 public key', () => {
 test('real terminal data (SIGNALS_TERMINAL_DIR): emit --terminal equals the terminal\'s own run', () => {
   const dir = process.env.SIGNALS_TERMINAL_DIR;
   if (!dir || !fs.existsSync(path.join(dir, 'data', 'tradfi', 'SILVER.json'))) return 'skip';
+  // the clock of the daily build that would run just after the newest bar in the data (00:30 UTC the next day)
+  const rowsFile = JSON.parse(fs.readFileSync(path.join(dir, 'data', 'tradfi', 'SILVER.json'))).rows, now = rowsFile[rowsFile.length - 1][0] + L.DAY + 30 * 60e3;
   const out = tmp(), k = newKey();
-  const log = execFileSync(process.execPath, [path.join(__dirname, 'emit.js'), '--terminal', dir, '--out-dir', out], { env: { ...process.env, SIGNALS_ED25519_PRIVATE_KEY_PEM: pemOf(k) }, encoding: 'utf8' });
+  const log = execFileSync(process.execPath, [path.join(__dirname, 'emit.js'), '--terminal', dir, '--out-dir', out, '--now', new Date(now).toISOString()], { env: { ...process.env, SIGNALS_ED25519_PRIVATE_KEY_PEM: pemOf(k) }, encoding: 'utf8' });
   process.stdout.write(log.split('\n').map(l => l && '    | ' + l).filter(Boolean).join('\n') + '\n');
   const p = JSON.parse(fs.readFileSync(path.join(out, 'signals.json')));
   // reference: the terminal's own script and loader, exactly as crest/gen_multi.js runScript (run 1)
   const G = require(path.join(dir, 'crest', 'gen_multi.js')), S = require(path.join(dir, 'crest_silver.js'));
-  const TO = L.lastCompletedBarT(Date.now());
+  const TO = L.lastCompletedBarT(now);
   const w = G.load('data/tradfi/SILVER.json').rows.filter(r => r.t >= G.fromFor('silver') && r.t <= TO);
   const ref = S.run(w, { wfId: 'SILVER' }, G.ctx()), st = L.posAfter(ref.trades);
   assert.strictEqual(p.as_of, ref.last);

@@ -111,8 +111,9 @@ function posAfter(trades) {
 // rows: the script's full history (normalizeRows output), ctx: {REF: rows}. Cuts both at the last completed bar for `now`,
 // validates what the live setting needs, runs the vendored script exactly as crest/gen_multi.js does (params {wfId}), and
 // returns the state at the last bar. opts.maxLagDays: the last bar may be at most this many days before the last completed
-// day (weekends and holidays; the terminal's check_data.js uses 5 for TradFi).
-function computeStrategy(script, rowsIn, ctxIn, { now = Date.now(), maxLagDays = 5, ctxMaxLagDays = 7 } = {}) {
+// day (weekend + one holiday = 3). Kept one day stricter than the marketplace's as_of window (today - as_of <= 4 days,
+// backend/app/strategies/signals.py) so the terminal never signs a file the marketplace would call stale.
+function computeStrategy(script, rowsIn, ctxIn, { now = Date.now(), maxLagDays = 3, ctxMaxLagDays = 7 } = {}) {
   const { key, spec, api } = script, TO = lastCompletedBarT(now);
   const rows = normalizeRows(rowsIn, `${key} rows`).filter(r => r.t <= TO);
   if (rows.length < 400) throw new Error(`${key}: only ${rows.length} completed bars (need the full history)`);

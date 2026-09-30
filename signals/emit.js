@@ -18,6 +18,8 @@
 //   --now ISO               clock override (tests); default: the real time
 //   --out-dir DIR           where signals.json and signals.sig are written (atomically; nothing is written on failure)
 //   --no-sign               write signals.json only (local dry run); never use in the daily build
+//   --max-lag-days N        the last bar may be at most N days before the last completed UTC day (default 3: weekend +
+//                           one holiday; the marketplace rejects as_of more than 4 days before today). Dry runs on old data.
 //   --self-test-cuts N      evenly spaced extra cut points for the no-look-ahead self-test (default 40; 0 = trades and
 //                           last 20 bars only). The self-test always runs; a failure stops the emit.
 // Env
@@ -29,7 +31,7 @@ const fs = require('fs'), path = require('path');
 const L = require('./lib.js');
 
 function args(argv) {
-  const o = { keys: null, terminal: null, input: null, now: null, outDir: null, sign: true, strict: false, spread: 40 };
+  const o = { keys: null, terminal: null, input: null, now: null, outDir: null, sign: true, strict: false, spread: 40, maxLagDays: 3 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i], next = () => { if (i + 1 >= argv.length) throw new Error(`${a} needs a value`); return argv[++i]; };
     if (a === '--keys') o.keys = next().split(',').map(s => s.trim()).filter(Boolean);
@@ -39,6 +41,7 @@ function args(argv) {
     else if (a === '--out-dir') o.outDir = path.resolve(next());
     else if (a === '--no-sign') o.sign = false;
     else if (a === '--strict-terminal-match') o.strict = true;
+    else if (a === '--max-lag-days') o.maxLagDays = Math.max(0, parseInt(next(), 10) || 0);
     else if (a === '--self-test-cuts') o.spread = Math.max(0, parseInt(next(), 10) || 0);
     else throw new Error(`unknown option ${a}`);
   }
@@ -81,7 +84,7 @@ function main() {
   for (const key of keys) {
     const script = L.loadScript(key, { manifest });
     const src = o.terminal ? fromTerminal(o.terminal, script, o.strict) : (input && input[key]) || (() => { throw new Error(`--input has no "${key}"`); })();
-    const c = L.computeStrategy(script, src.rows, src.ctx || {}, { now });
+    const c = L.computeStrategy(script, src.rows, src.ctx || {}, { now, maxLagDays: o.maxLagDays });
     const t = L.selfTestNoLookahead(script, c.rows, c.ctx, { cuts: L.defaultCuts(c.rows.length, c.result.trades, { spread: o.spread }) });
     if (t.failures.length) throw new Error(`${key}: no-look-ahead self-test failed at ${t.failures.length} of ${t.cuts} cuts, first ${JSON.stringify(t.failures[0])}`);
     const lt = c.result.trades[c.result.trades.length - 1];

@@ -26,6 +26,7 @@ from collections import OrderedDict
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Callable, Iterable, Optional, Protocol
 
 from fastapi import Depends, Header, Request
@@ -95,8 +96,48 @@ class ApiConfig:
     pepper: bytes
     kyc_provider: str
     legal_versions: dict[str, str]
+    legal_doc_hashes: dict[str, str]          # doc -> sha256 of the current rendered text ({} = not enforced)
+    launch: "LaunchConfig"
     max_body_bytes: int = 128 * 1024
     max_upload_body_bytes: int = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class LaunchConfig:
+    """Launch-phase guard rails (owner decision). Read with getattr so the API works before config.py has them;
+    missing values fail CLOSED in prod (internal phase, no payouts)."""
+    phase: str                                   # "internal" | "public"
+    allowlist_emails: frozenset[str]
+    max_allocation_per_user_micro: Optional[int]
+    max_total_platform_allocation_micro: Optional[int]
+    max_user_leverage_x100: Optional[int]
+    payouts_enabled: bool
+
+    @property
+    def internal(self) -> bool:
+        return self.phase != "public"
+
+
+def _launch(settings: Settings) -> LaunchConfig:
+    prod = settings.is_prod
+    phase = str(getattr(settings, "launch_phase", "internal" if prod else "public") or "internal").lower()
+    emails = getattr(settings, "allowlist_emails", ()) or ()
+    if isinstance(emails, str):
+        emails = [e for e in emails.split(",")]
+    lev = getattr(settings, "max_user_leverage", None)
+
+    def _opt_int(name: str) -> Optional[int]:
+        val = getattr(settings, name, None)
+        return int(val) if val is not None else None
+
+    return LaunchConfig(
+        phase=phase,
+        allowlist_emails=frozenset(e.strip().lower() for e in emails if e and e.strip()),
+        max_allocation_per_user_micro=_opt_int("max_allocation_per_user_micro"),
+        max_total_platform_allocation_micro=_opt_int("max_total_platform_allocation_micro"),
+        max_user_leverage_x100=(int(Decimal(str(lev)) * 100) if lev is not None else None),
+        payouts_enabled=bool(getattr(settings, "payouts_enabled", not prod)),
+    )
 
 
 def _pepper(settings: Settings) -> bytes:
@@ -124,6 +165,8 @@ def api_config(settings: Settings) -> ApiConfig:
         pepper=_pepper(settings),
         kyc_provider=getattr(settings, "kyc_provider", "") or "",
         legal_versions=legal,
+        legal_doc_hashes=dict(getattr(settings, "legal_doc_hashes", None) or {}),
+        launch=_launch(settings),
     )
 
 
@@ -410,6 +453,21 @@ def _create_user(conn: Any, svc: Services, request: Request, claims: dict[str, A
     return user
 
 
+def enforce_launch_allowlist(launch: LaunchConfig, claims: dict[str, Any]) -> None:
+    """Internal launch phase: only allow-listed, verified emails may create an account or sign in."""
+    if not launch.internal:
+        return
+    email = str(claims.get("email") or "").strip().lower()
+    if not email or claims.get("email_verified") is not True or email not in launch.allowlist_emails:
+        raise Forbidden("aijalon.trade is in private testing; this account is not on the allowlist",
+                        reason="not_allowlisted")
+
+
+def require_payouts_enabled(svc: "Services") -> None:
+    if not svc.config.launch.payouts_enabled:
+        raise Forbidden("withdrawals and payouts are not enabled yet", reason="payouts_disabled")
+
+
 def current_user(request: Request, svc: Services = Depends(get_services)) -> AuthCtx:
     token = _bearer(request)
     claims = svc.auth.verify(token)
@@ -423,6 +481,7 @@ def current_user(request: Request, svc: Services = Depends(get_services)) -> Aut
     if not svc.ratelimit.hit(f"user:{claims['uid']}", 300, 60):
         raise RateLimited("too many requests", retry_after_seconds=60)
     cfg = svc.config
+    enforce_launch_allowlist(cfg.launch, claims)
     ip_hash = v.hash_identifier(client_ip(request), cfg.pepper, domain="ip")
     ua_hash = v.hash_identifier(request.headers.get("user-agent"), cfg.pepper, domain="ua")
     country = edge_country(request)

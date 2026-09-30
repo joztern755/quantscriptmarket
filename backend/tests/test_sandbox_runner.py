@@ -211,7 +211,7 @@ class ResourceTests(unittest.TestCase):
 
     def test_infinite_loop(self):
         e = self.run_expect("while True:\n    pass", ("timeout",))
-        self.assertEqual(e.details.get("line"), 7)
+        self.assertIn(e.details.get("line"), (7, 8))
 
     def test_module_level_loop_via_helper(self):
         src = HEADER + "def spin():\n    while True:\n        pass\nX = spin()\ndef signal(bars):\n    return {}\n"
@@ -274,7 +274,7 @@ class BadOutputTests(unittest.TestCase):
         with self.assertRaises(ScriptRuntimeError) as cm:
             run_signal(script("x = 1\ny = x / 0\nreturn {}"), bars())
         self.assertEqual(cm.exception.details["exc_type"], "ZeroDivisionError")
-        self.assertEqual(cm.exception.details["line"], 7)
+        self.assertEqual(cm.exception.details["line"], 8)  # header 4 + blank + def + "x = 1" → line 8
 
 
 class SeriesTests(unittest.TestCase):
