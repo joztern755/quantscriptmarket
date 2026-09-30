@@ -20,6 +20,9 @@ DB="aijalon_test_$$"
 URL="postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${DB}"
 API_USER="aj_test_api_$$"
 EXEC_USER="aj_test_exec_$$"
+# Throwaway per-run password for the two test logins: CI's Postgres container uses password auth for TCP, so a
+# login without one cannot connect and every "as app_api / app_executor" privilege check would fail to run.
+TEST_LOGIN_PW="$(openssl rand -hex 16)"
 CLONES=()
 PASS=0
 FAIL=0
@@ -49,7 +52,11 @@ bad()  { FAIL=$((FAIL + 1)); FAILED+=("$1"); printf '  FAIL  %s\n%s\n' "$1" "${2
 
 # run SQL from stdin as ONE transaction-per-statement session (autocommit), optionally as another user
 _psql() { # $1=db $2=user ; stdin = sql
-    psql -X -q -A -t -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -d "$1" -U "$2" -f - 2>&1
+    if [ "$2" = "$API_USER" ] || [ "$2" = "$EXEC_USER" ]; then
+        PGPASSWORD="$TEST_LOGIN_PW" psql -X -q -A -t -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -d "$1" -U "$2" -f - 2>&1
+    else
+        psql -X -q -A -t -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -d "$1" -U "$2" -f - 2>&1
+    fi
 }
 
 # expect_ok NAME [DB] [USER] <<SQL
@@ -388,8 +395,8 @@ SQL
 # ------------------------------------------------------------------------------------------------ roles
 echo "-- role privileges"
 expect_ok "create test login users" postgres <<SQL
-CREATE ROLE ${API_USER} LOGIN IN ROLE app_api;
-CREATE ROLE ${EXEC_USER} LOGIN IN ROLE app_executor;
+CREATE ROLE ${API_USER} LOGIN PASSWORD '${TEST_LOGIN_PW}' IN ROLE app_api;
+CREATE ROLE ${EXEC_USER} LOGIN PASSWORD '${TEST_LOGIN_PW}' IN ROLE app_executor;
 SQL
 expect_ok "agent key fixture" <<SQL
 INSERT INTO agent_keys (user_id, master_address, agent_address, key_ciphertext, kms_key_version)

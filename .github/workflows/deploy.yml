@@ -129,7 +129,8 @@ jobs:
       PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
       REGION: ${{ vars.GCP_REGION }}
       GIT_SHA: ${{ github.sha }}
-      DEPLOY_STATE: ${{ runner.temp }}/aijalon-deploy.state
+      # DEPLOY_STATE: not set here (the runner context is not available in job env); deploy.sh defaults it to
+      # $RUNNER_TEMP/aijalon-deploy.state, and steps that read it use the same default.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -155,7 +156,7 @@ jobs:
       - name: Image package inventory (SBOM, REVIEW_WEB_INFRA L10)
         run: |
           set -e
-          img="$(grep -E '^BACKEND_IMAGE=' "$DEPLOY_STATE" | tail -1 | cut -d= -f2-)"
+          img="$(grep -E '^BACKEND_IMAGE=' "${DEPLOY_STATE:-$RUNNER_TEMP/aijalon-deploy.state}" | tail -1 | cut -d= -f2-)"
           docker run --rm --entrypoint python "$img" -c 'import importlib.metadata as m, json; print(json.dumps(sorted(d.name + "==" + d.version for d in m.distributions()), indent=1))' \
             > "${RUNNER_TEMP}/backend-image-packages.json"
           wc -l "${RUNNER_TEMP}/backend-image-packages.json"
@@ -201,7 +202,8 @@ jobs:
       SMOKE_SKIP_PUBLIC: ${{ vars.SMOKE_SKIP_PUBLIC }}
       BINAUTHZ_ANNOTATE: ${{ vars.BINAUTHZ_ANNOTATE }}
       GIT_SHA: ${{ github.sha }}
-      DEPLOY_STATE: ${{ runner.temp }}/aijalon-deploy.state
+      # DEPLOY_STATE: not set here (the runner context is not available in job env); deploy.sh defaults it to
+      # $RUNNER_TEMP/aijalon-deploy.state, and steps that read it use the same default.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
