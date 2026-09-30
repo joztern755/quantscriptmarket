@@ -58,6 +58,31 @@ export function newIdempotencyKey(): string {
   return `${hx.slice(0, 8)}-${hx.slice(8, 12)}-${hx.slice(12, 16)}-${hx.slice(16, 20)}-${hx.slice(20)}`;
 }
 
+/**
+ * Stable per-browser device id (random 128 bits, hex), sent as X-Device-Id on every API request for the backend's
+ * self-referral / device checks. Kept in localStorage (never derived from the user agent), created when missing,
+ * and deliberately NOT cleared on sign-out (core/state.ts clearUserLocalData) so it stays stable per device.
+ * Storage blocked → one id per page load.
+ */
+const DEVICE_KEY = "aij.device.v1";
+let deviceMem: string | null = null;
+export function deviceId(): string {
+  if (deviceMem) return deviceMem;
+  let id: string | null = null;
+  try {
+    const v = localStorage.getItem(DEVICE_KEY);
+    if (v && /^[0-9a-f]{32}$/.test(v)) id = v;
+  } catch { /* storage blocked */ }
+  if (!id) {
+    id = Array.from(crypto.getRandomValues(new Uint8Array(16)), (x) => x.toString(16).padStart(2, "0")).join("");
+    try {
+      localStorage.setItem(DEVICE_KEY, id);
+    } catch { /* storage blocked: per-page-load id */ }
+  }
+  deviceMem = id;
+  return id;
+}
+
 function buildUrl(path: string): string {
   if (!path.startsWith("/") || path.startsWith("//") || /[\s\\]/.test(path)) throw new ApiError(0, "bad_path", "Invalid API path");
   return `${appConfig().apiOrigin}/v1${path}`;
@@ -89,7 +114,7 @@ async function parseError(res: Response): Promise<ApiError> {
 }
 
 async function once(method: string, path: string, body: unknown, opts: ReqOpts, idemKey: string | null, forceToken: boolean): Promise<Response> {
-  const headers: Record<string, string> = { Accept: "application/json" };
+  const headers: Record<string, string> = { Accept: "application/json", "X-Device-Id": deviceId() };
   const wantsAuth = opts.auth ?? !path.startsWith("/public/");
   if (wantsAuth) {
     const token = await hooks.getIdToken(forceToken);

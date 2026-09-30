@@ -176,6 +176,9 @@ SECRETS_SPEC=(
   # without it (every prod role). OPS_EMAILS: ops alert recipients (api + executor notifier).
   "ALLOWLIST_EMAILS|api executor|owner"
   "OPS_EMAILS|api executor|owner"
+  # ADMIN_EMAILS: comma-separated e-mails that may hold the admin role; the prod api refuses to start without it
+  # (API fixer, admin hardening). Seeded with OWNER_EMAIL like the lists above; api only.
+  "ADMIN_EMAILS|api|owner"
   # creator KYC (app/kyc/sumsub.py) — only when KYC_PROVIDER=sumsub; the launch default is `manual`
   "KYC_APP_TOKEN|api|opt"
   "KYC_SECRET_KEY|api|opt"

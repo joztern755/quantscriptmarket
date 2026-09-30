@@ -21,9 +21,13 @@
 --       stripe_refund/…     → only through ledger_post_payment_reversal()   (SECURITY DEFINER; runs as app_migrator,
 --                             checks key prefix + exact 2-entry shape fee_balance → stripe:clearing)
 --       ps_pending_release  → only through ps_pending_release()             (SECURITY DEFINER)
---     and records the authorisation in ledger_tx_authorizations (app_api cannot insert there). The deferred balance
---     check refuses a gated kind without that row, so a direct INSERT into ledger_transactions/ledger_entries by an
---     app role cannot use them either. Protected accounts are forced non-negative by trigger + CHECK whoever creates
+--     and records the authorisation in ledger_tx_authorizations (no app role can insert there directly). The deferred
+--     balance check refuses a gated kind without that row, so a direct INSERT into ledger_transactions/ledger_entries
+--     by an app role cannot use them either. A profit_share transaction is authorised only by
+--     ledger_authorize_profit_share() (SECURITY DEFINER, executor only), which also enforces C1 in the DB: exactly one
+--     debit, on a user fee balance; credits only to creator payables, platform:revenue:profit_share and that user's
+--     ps_pending:* accounts; and Σ credits to payables/revenue ≤ what the fee balance held BEFORE the charge
+--     (a compromised or buggy executor cannot credit a creator with uncollected profit share either). Protected accounts are forced non-negative by trigger + CHECK whoever creates
 --     them: user fee balances, creator/referrer payables, ps_pending:*, withdrawals:pending, payouts:pending,
 --     refunds:usdc_pending, suspense:* (existing rows are flipped here). Per-user shapes must carry the right kind
 --     and owner (owner taken from the code when omitted, AJ422 when it differs).
@@ -288,6 +292,57 @@ CREATE TRIGGER ledger_tx_authorizations_append_only BEFORE UPDATE OR DELETE ON l
 CREATE TRIGGER ledger_tx_authorizations_no_truncate BEFORE TRUNCATE ON ledger_tx_authorizations
     FOR EACH STATEMENT EXECUTE FUNCTION forbid_mutation();
 
+-- C1 in the database: authorise ONE profit_share transaction (its entries already inserted) only when it takes one
+-- user's fee balance and credits creator payables / platform revenue with no more than that balance held before
+-- the charge; the uncollected rest may only go to that user's ps_pending accounts. SECURITY DEFINER (it writes the
+-- authorisation row, which no app role may insert); EXECUTE for app_executor only (ledger_post calls it).
+CREATE FUNCTION ledger_authorize_profit_share(p_tx_id uuid) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_kind    text;
+    v_debits  int;
+    v_fee     text;
+    v_debit   bigint;
+    v_user    text;
+    v_paid    bigint;
+    v_bad     int;
+    v_before  bigint;
+BEGIN
+    SELECT t.kind INTO v_kind FROM ledger_transactions t WHERE t.id = p_tx_id;
+    IF v_kind IS DISTINCT FROM 'profit_share' THEN
+        RAISE EXCEPTION 'not a profit_share transaction' USING ERRCODE = 'AJ403';
+    END IF;
+    SELECT count(*), min(a.code), sum(e.amount_micro)::bigint INTO v_debits, v_fee, v_debit
+      FROM ledger_entries e JOIN ledger_accounts a ON a.id = e.account_id
+     WHERE e.tx_id = p_tx_id AND e.amount_micro > 0;
+    IF v_debits <> 1 OR v_fee !~ '^user:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:fee_balance$' THEN
+        RAISE EXCEPTION 'profit_share must debit exactly one user fee balance' USING ERRCODE = 'AJ403';
+    END IF;
+    v_user := split_part(v_fee, ':', 2);
+    SELECT count(*) FILTER (WHERE NOT (
+               a.code ~ '^creator:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:payable$'
+               OR a.code = 'platform:revenue:profit_share'
+               OR a.code IN ('ps_pending:' || v_user || ':platform')
+               OR a.code ~ ('^ps_pending:' || v_user || ':[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))),
+           coalesce(sum(-e.amount_micro) FILTER (WHERE a.code !~ '^ps_pending:'), 0)::bigint
+      INTO v_bad, v_paid
+      FROM ledger_entries e JOIN ledger_accounts a ON a.id = e.account_id
+     WHERE e.tx_id = p_tx_id AND e.amount_micro < 0;
+    IF v_bad > 0 THEN
+        RAISE EXCEPTION 'profit_share may only credit creator payables, platform profit-share revenue and the user''s ps_pending accounts'
+            USING ERRCODE = 'AJ403';
+    END IF;
+    -- spendable before this charge = −(raw balance before) = debit − raw balance now (running balance, O(1))
+    v_before := v_debit - ledger_raw_balance(v_fee);
+    IF v_paid > greatest(0, v_before) THEN
+        RAISE EXCEPTION 'profit_share credits % to payables/revenue but only % was collected from %', v_paid,
+            greatest(0, v_before), v_fee USING ERRCODE = 'AJ402';
+    END IF;
+    INSERT INTO ledger_tx_authorizations (tx_id, kind, authorized_as) VALUES (p_tx_id, 'profit_share', session_user);
+END
+$$;
+
 -- Integrity of ONE ledger transaction (replaces 0001's version; same callers: ledger_post + deferred triggers).
 CREATE OR REPLACE FUNCTION ledger_check_tx(p_tx_id uuid) RETURNS void
 LANGUAGE plpgsql
@@ -410,15 +465,18 @@ BEGIN
     INSERT INTO ledger_transactions (idempotency_key, kind, memo, created_by, entries_digest)
     VALUES (p_idempotency_key, p_kind, p_memo, p_created_by, v_digest)
     RETURNING id INTO v_id;
-    IF ledger_kind_requires_auth(p_kind) THEN
-        INSERT INTO ledger_tx_authorizations (tx_id, kind, authorized_as) VALUES (v_id, p_kind, current_user);
-    END IF;
 
     INSERT INTO ledger_entries (tx_id, account_id, amount_micro)
     SELECT v_id, a.id, x.amt
       FROM unnest(v_codes, v_amounts) WITH ORDINALITY AS x(code, amt, o)
       JOIN ledger_accounts a ON a.code = x.code
      ORDER BY x.o;
+
+    IF p_kind = 'profit_share' THEN
+        PERFORM ledger_authorize_profit_share(v_id);          -- shape + collection invariant (C1), then authorises
+    ELSIF ledger_kind_requires_auth(p_kind) THEN              -- only reachable inside the SECURITY DEFINER wrappers
+        INSERT INTO ledger_tx_authorizations (tx_id, kind, authorized_as) VALUES (v_id, p_kind, current_user);
+    END IF;
 
     PERFORM ledger_check_tx(v_id);
     RETURN QUERY SELECT v_id, true;
@@ -729,7 +787,6 @@ UPDATE fills f SET oid_verified = true
 
 -- ---------------------------------------------------------------- grants (no DELETE for anyone)
 GRANT SELECT ON ledger_account_balances, ledger_tx_authorizations, ledger_chain_anchors TO app_api, app_executor;
-GRANT INSERT ON ledger_tx_authorizations TO app_executor;          -- profit_share (guard trigger checks the role)
 GRANT INSERT ON ledger_chain_anchors TO app_executor;              -- /internal/verify-chain
 GRANT SELECT, INSERT, UPDATE ON subscription_positions, subscription_pnl_events TO app_executor;
 GRANT SELECT ON subscription_positions, subscription_pnl_events TO app_api;
@@ -738,6 +795,8 @@ GRANT ALL ON ledger_account_balances, ledger_tx_authorizations, ledger_chain_anc
 
 REVOKE EXECUTE ON FUNCTION ledger_post_payment_reversal(text, text, text, text, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION ledger_post_payment_reversal(text, text, text, text, jsonb) TO app_api, app_executor;
+REVOKE EXECUTE ON FUNCTION ledger_authorize_profit_share(uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION ledger_authorize_profit_share(uuid) TO app_executor;
 REVOKE EXECUTE ON FUNCTION ps_pending_release(uuid, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION ps_pending_release(uuid, text) TO app_api, app_executor;
 REVOKE EXECUTE ON FUNCTION ledger_entries_apply_balance() FROM PUBLIC;

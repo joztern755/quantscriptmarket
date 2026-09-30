@@ -85,6 +85,8 @@ class InMemoryLedgerStore:
                 deltas[c] = deltas.get(c, 0) + a
             if kind != PS_PENDING_RELEASE_KIND and any(c.startswith("ps_pending:") and raw > 0 for c, raw in canon):
                 raise ValidationFailed("ps_pending accounts may only be debited by ps_pending_release")
+            if kind == "profit_share":
+                self._check_profit_share(deltas)
             for c, raw in deltas.items():
                 acct = self.accounts[c]
                 if not acct.non_negative or overdraft_allowed(kind, c):
@@ -106,6 +108,29 @@ class InMemoryLedgerStore:
             self.txs.append(tx)
             self._by_key[idempotency_key] = tx
             return tx
+
+    def _check_profit_share(self, deltas: dict[str, int]) -> None:
+        """= SQL ledger_authorize_profit_share (0010, REVIEW_MONEY C1): one fee-balance debit; credits only to creator
+        payables, platform profit-share revenue and that user's ps_pending accounts; payables + revenue credited no
+        more than the fee balance held before the charge."""
+        debits = [(c, a) for c, a in deltas.items() if a > 0]
+        if len(debits) != 1 or not (debits[0][0].startswith("user:") and debits[0][0].endswith(":fee_balance")):
+            raise ValidationFailed("profit_share must debit exactly one user fee balance")
+        fee, debit = debits[0]
+        user = fee.split(":")[1]
+        paid = 0
+        for c, a in deltas.items():
+            if a >= 0:
+                continue
+            if c.startswith(f"ps_pending:{user}:"):
+                continue
+            if not (c == "platform:revenue:profit_share" or (c.startswith("creator:") and c.endswith(":payable"))):
+                raise ValidationFailed("profit_share may only credit payables, revenue and the user's ps_pending")
+            paid += -a
+        before = -self._balances.get(fee, 0)
+        if paid > max(0, before):
+            raise InsufficientBalance("profit share credits more than was collected", account=fee,
+                                      shortfall_micro=paid - max(0, before))
 
     # -- balances
     def balance(self, code: str) -> int | None:

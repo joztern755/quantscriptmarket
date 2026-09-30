@@ -208,7 +208,7 @@ class FixMoneyDbTest(unittest.TestCase):
         s, db = self.store, self.db
         u = self.user("d")
         service.post_transaction(self.ex, f"ps:{uuid.uuid4()}:2026-10-01", "profit_share", "t",
-                                 [(ledger_ops.fee_balance(u), 100 * USD), ("platform:revenue:profit_share", -100 * USD)],
+                                 [(ledger_ops.fee_balance(u), 100 * USD), (f"ps_pending:{u}:platform", -100 * USD)],  # uncollected (C1, 0010)
                                  "system:settlement")
         self.assertEqual(self.spendable(u), -100 * USD)
         self.card(u, 150 * USD)                                   # 100 of it pays the debt at once
@@ -274,7 +274,7 @@ class FixMoneyDbTest(unittest.TestCase):
         owner, u = self.user("o"), self.user("q")
         sid, vid = self.strategy(owner, price=0, ps=1000)
         service.post_transaction(self.ex, f"ps:{uuid.uuid4()}:2026-10-01", "profit_share", "t",
-                                 [(ledger_ops.fee_balance(u), 5 * USD), ("platform:revenue:profit_share", -5 * USD)],
+                                 [(ledger_ops.fee_balance(u), 5 * USD), (f"ps_pending:{u}:platform", -5 * USD)],  # uncollected (C1, 0010)
                                  "system:settlement")
         since = now - timedelta(hours=10)
         sub = self.sub(u, sid, vid, status="past_due", past_due_since=since.isoformat())

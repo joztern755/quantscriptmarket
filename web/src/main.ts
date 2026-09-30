@@ -2,7 +2,7 @@
 
 import { api, ApiError, setApiHooks } from "./core/api.js";
 import { currentUser, getIdToken, initAuth, onAuthChange, signOut, stepUp, takeRedirectNext, type SessionUser } from "./core/auth.js";
-import { loadAppConfig } from "./core/config.js";
+import { appConfig, loadAppConfig } from "./core/config.js";
 import { showGateModal, syncConsents } from "./core/gate.js";
 import { currentPath, navigate, onRouteChange, render, startRouter, type PageName } from "./core/router.js";
 import { clearMe, getMe, onMeChange, setMeLoader, storage, type Me } from "./core/state.js";
@@ -159,6 +159,15 @@ async function boot(): Promise<void> {
   }
   initTheme();
   await loadAppConfig();
+  // SECURITY L5: Firebase also serves this site on <project>.web.app / .firebaseapp.com. Never run the app (sign-in,
+  // wallet prompts) on those look-alike origins: send the user to the canonical site instead.
+  try {
+    const canon = new URL(appConfig().siteOrigin);
+    if (location.hostname !== canon.hostname && /\.(web\.app|firebaseapp\.com)$/i.test(location.hostname)) {
+      location.replace(`${canon.origin}/${location.hash}`);
+      return;
+    }
+  } catch { /* malformed siteOrigin: config.ts already fell back to the default */ }
   setApiHooks({
     getIdToken,
     stepUp,

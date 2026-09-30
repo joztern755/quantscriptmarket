@@ -124,7 +124,7 @@ SQL
 # ------------------------------------------------------------------------------------------------ seed
 echo "-- seed"
 # 0003 seeds the 8 SPEC §4 platform accounts; 0006 adds suspense:usdc_unattributed, 0009 refunds:usdc_pending.
-expect_eq "platform ledger accounts seeded (exact set)" "builder:hl_receivable:asset:false,platform:revenue:builder:revenue:false,platform:revenue:plans:revenue:false,platform:revenue:posts:revenue:false,platform:revenue:profit_share:revenue:false,platform:revenue:subscription:revenue:false,refunds:usdc_pending:liability:false,stripe:clearing:asset:false,suspense:usdc_unattributed:liability:false,treasury:hl_usdc:asset:false" <<SQL
+expect_eq "platform ledger accounts seeded (exact set)" "builder:hl_receivable:asset:false,platform:revenue:builder:revenue:false,platform:revenue:plans:revenue:false,platform:revenue:posts:revenue:false,platform:revenue:profit_share:revenue:false,platform:revenue:subscription:revenue:false,refunds:usdc_pending:liability:true,stripe:clearing:asset:false,suspense:usdc_unattributed:liability:true,treasury:hl_usdc:asset:false" <<SQL
 SELECT string_agg(code || ':' || kind || ':' || non_negative::text, ',' ORDER BY code)
   FROM ledger_accounts WHERE owner_user_id IS NULL;
 SQL
@@ -225,14 +225,23 @@ INSERT INTO ledger_entries (tx_id, account_id, amount_micro)
   SELECT t.id, a.id, -20000000 FROM ledger_transactions t, ledger_accounts a WHERE t.idempotency_key = 'od:1' AND a.code = 'platform:revenue:posts';
 COMMIT;
 SQL
-expect_eq "profit_share may overdraw (debt)" "t" <<<"$(post ps:1 profit_share '[{"account":"'$FEE1'","amount_micro":15000000},{"account":"platform:revenue:profit_share","amount_micro":-15000000}]')"
+expect_ok "pending account for the uncollected part (0010)" <<SQL
+INSERT INTO ledger_accounts (code, kind) VALUES ('ps_pending:${U1}:platform', 'liability');
+SQL
+expect_err "profit_share cannot credit revenue beyond what was collected (C1) -> AJ402" AJ402 <<<"$(post ps:0 profit_share '[{"account":"'$FEE1'","amount_micro":15000000},{"account":"platform:revenue:profit_share","amount_micro":-15000000}]')"
+expect_eq "profit_share may overdraw (debt; uncollected part pending)" "t" <<<"$(post ps:1 profit_share '[{"account":"'$FEE1'","amount_micro":15000000},{"account":"platform:revenue:profit_share","amount_micro":-10000000},{"account":"ps_pending:'$U1':platform","amount_micro":-5000000}]')"
 expect_eq "top-up onto a negative balance is allowed" "t" <<<"$(post dep:2 deposit '[{"account":"stripe:clearing","amount_micro":2000000},{"account":"'$FEE1'","amount_micro":-2000000}]')"
 expect_err "spending while in debt -> AJ402" AJ402 <<<"$(post post:1 post_purchase '[{"account":"'$FEE1'","amount_micro":1},{"account":"platform:revenue:posts","amount_micro":-1}]')"
 expect_eq "fee balance is -3 USD" "-3000000" <<SQL
 SELECT normal_balance_micro FROM ledger_balances WHERE code = '$FEE1';
 SQL
-expect_err "fee_balance account must be a non-negative liability" 23514 <<SQL
-INSERT INTO ledger_accounts (code, kind, owner_user_id, non_negative) VALUES ('user:${U2}:fee_balance', 'liability', '$U2', false);
+# 0010 (REVIEW_MONEY M5): protected accounts are FORCED non-negative whoever creates them; the wrong kind is refused
+expect_eq "fee_balance account is forced non-negative" "t" <<SQL
+INSERT INTO ledger_accounts (code, kind, owner_user_id, non_negative) VALUES ('user:${U2}:fee_balance', 'liability', '$U2', false)
+  RETURNING non_negative;
+SQL
+expect_err "fee_balance account must be a liability" AJ422 <<SQL
+INSERT INTO ledger_accounts (code, kind, owner_user_id, non_negative) VALUES ('user:${A2}:fee_balance', 'asset', '$A2', true);
 SQL
 
 echo "-- append-only (even for the superuser)"
@@ -465,7 +474,7 @@ expect_eq "tampered entry amount -> entries digest mismatch" "ledger_transaction
 SET session_replication_role = replica;
 UPDATE ledger_entries SET amount_micro = amount_micro * 2
  WHERE tx_id = (SELECT id FROM ledger_transactions WHERE seq = 1);
-SELECT chain, seq, reason FROM verify_chain();
+SELECT chain, seq, reason FROM verify_chain() WHERE chain = 'ledger_transactions';
 SQL
 T2="${DB}_t2"; clone_db "$T2"
 expect_eq "tampered memo -> row hash mismatch" "ledger_transactions|2|row hash mismatch (row altered)" "$T2" <<SQL
@@ -478,7 +487,7 @@ expect_eq "deleted middle tx -> sequence gap" "ledger_transactions|3|sequence ga
 SET session_replication_role = replica;
 DELETE FROM ledger_entries WHERE tx_id = (SELECT id FROM ledger_transactions WHERE seq = 2);
 DELETE FROM ledger_transactions WHERE seq = 2;
-SELECT chain, seq, reason FROM verify_chain();
+SELECT chain, seq, reason FROM verify_chain() WHERE chain = 'ledger_transactions';
 SQL
 T4="${DB}_t4"; clone_db "$T4"
 expect_eq "tampered audit payload -> audit row hash mismatch" "audit_log|2|row hash mismatch (row altered)" "$T4" <<SQL

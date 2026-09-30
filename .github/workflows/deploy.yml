@@ -1,17 +1,30 @@
 # Deploy aijalon.trade to production (Google Cloud project in vars.GCP_PROJECT_ID, region asia-southeast1).
 #
-# Gates, in order:
-#   1. the full CI (reusable ci.yml) must pass in this same run;
-#   2. the job runs in the GitHub environment "production" — configure it with Required reviewers (the owner, and
-#      a second person when there is one), "Prevent self-review" when two reviewers exist, and Deployment
-#      branches = main only (docs/DEPLOY.md §6). Nothing below runs until a reviewer approves;
-#   3. Google auth is Workload Identity Federation: GitHub's OIDC token is exchanged for a short-lived token of
-#      the deployer SA. The WIF provider only accepts tokens whose claims say repo joztern755/quantscriptmarket,
-#      ref refs/heads/main, environment production AND workflow .github/workflows/deploy.yml — so no other
-#      branch, workflow, fork or environment can obtain credentials. No JSON keys exist anywhere.
-# Order: images (by digest) -> migrations (Cloud Run Job) -> sandbox -> executor -> api -> api smoke
-#        -> web build with production app-config -> CSP check -> Firebase Hosting -> web smoke.
-# A failed api smoke test routes traffic back to the previous api/executor revisions automatically.
+# REVIEW_WEB_INFRA H2 — the deploy is split so that no job runs third-party npm code while it holds cloud
+# credentials, and each credentialed job can only impersonate ONE narrowly-scoped service account:
+#
+#   ci              reusable ci.yml (must pass in this same run)
+#   build-web       environment production-build, NO id-token: TypeScript + web build with the production
+#                   app-config (npm runs HERE only, without credentials) -> artifact web-dist
+#   build-images    environment production-build, WIF -> aijalon-builder (Artifact Registry write + Binary
+#                   Authorization attestor key): docker build/push by digest, attest -> artifact deploy-state
+#   deploy-run      environment production (REQUIRED REVIEWERS), WIF -> aijalon-deployer (custom role: update the
+#                   named Cloud Run services + migrate job only; actAs the runtime SAs; pause/resume `tick`):
+#                   migrate -> sandbox -> executor CANARY (0 %, tick paused, OIDC selftest, then 100 %) -> api ->
+#                   api smoke; automatic rollback on failure
+#   deploy-hosting  environment production-hosting, WIF -> aijalon-hosting-deployer (roles/firebasehosting.admin
+#                   ONLY, access token only, no credentials file): Hosting REST deploy of web-dist (stdlib Python,
+#                   no firebase-tools) -> web smoke
+#
+# The WIF provider accepts only repo joztern755/quantscriptmarket (+ repo id), ref refs/heads/main, workflow
+# deploy.yml, GitHub-hosted runners, push/workflow_dispatch events and these three environments; each environment
+# is bound to its own service account (bootstrap `wif`). Configure all three environments with "Deployment
+# branches: main only"; `production` also with Required reviewers (+ "Prevent self-review" with two people).
+# No JSON keys exist anywhere.
+#
+# Every third-party action is pinned to a commit SHA; the trailing comment is the tag. The artifact actions were
+# added offline (REVIEW_WEB_INFRA round) — run `python3 infra/pin.py actions` (make pin) to re-resolve them from
+# the tag comments before the first run.
 name: Deploy
 on:
   push:
@@ -25,6 +38,9 @@ concurrency:
   group: deploy-production
   cancel-in-progress: false
 
+env:
+  TYPESCRIPT_VERSION: "6.0.2"
+
 jobs:
   ci:
     uses: ./.github/workflows/ci.yml
@@ -32,104 +48,43 @@ jobs:
       contents: read
       pull-requests: read
 
-  deploy:
+  # ------------------------------------------------------------------------------------------------ web build
+  build-web:
+    name: web build (no cloud credentials)
     needs: ci
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
     environment:
-      name: production
-      url: https://aijalon.trade
+      name: production-build
     permissions:
-      contents: read
-      id-token: write          # GitHub OIDC token for Workload Identity Federation (nothing else)
+      contents: read            # deliberately NO id-token: nothing here can obtain Google credentials
     env:
       PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-      REGION: ${{ vars.GCP_REGION }}
-      DB_PRIVATE_IP: ${{ vars.DB_PRIVATE_IP }}
-      # plain runtime settings (docs/DEPLOY.md §5.3); empty -> the default in infra/gcp/deploy.sh.
-      # ALLOWLIST_EMAILS / OPS_EMAILS are Secret Manager secrets (personal data), never GitHub variables.
-      LAUNCH_PHASE: ${{ vars.LAUNCH_PHASE }}
-      PAYOUTS_ENABLED: ${{ vars.PAYOUTS_ENABLED }}
-      STRIPE_PUBLISHABLE_KEY: ${{ vars.STRIPE_PUBLISHABLE_KEY }}
-      STRIPE_API_VERSION: ${{ vars.STRIPE_API_VERSION }}
-      STRIPE_FEE_ESTIMATE_BPS: ${{ vars.STRIPE_FEE_ESTIMATE_BPS }}
-      STRIPE_FEE_ESTIMATE_FIXED_USD: ${{ vars.STRIPE_FEE_ESTIMATE_FIXED_USD }}
-      STRIPE_MAX_TOPUP_USD: ${{ vars.STRIPE_MAX_TOPUP_USD }}
-      KYC_PROVIDER: ${{ vars.KYC_PROVIDER }}
-      KYC_LEVEL_NAME: ${{ vars.KYC_LEVEL_NAME }}
-      TELEGRAM_BOT_USERNAME: ${{ vars.TELEGRAM_BOT_USERNAME }}
-      GIT_SHA: ${{ github.sha }}
-      TYPESCRIPT_VERSION: "6.0.2"
-      FIREBASE_TOOLS_VERSION: "15.32.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - name: Required GitHub environment variables
-        run: |
-          set -e
-          for v in GCP_PROJECT_ID GCP_REGION WIF_PROVIDER DEPLOYER_SA DB_PRIVATE_IP FIREBASE_WEB_API_KEY FIREBASE_APP_ID STRIPE_PUBLISHABLE_KEY TELEGRAM_BOT_USERNAME; do
-            eval "val=\${VARS_$v:-}"
-            [ -n "$val" ] || { echo "::error::GitHub environment variable $v is not set (docs/DEPLOY.md §6)"; exit 1; }
-          done
-        env:
-          VARS_GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-          VARS_GCP_REGION: ${{ vars.GCP_REGION }}
-          VARS_WIF_PROVIDER: ${{ vars.WIF_PROVIDER }}
-          VARS_DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}
-          VARS_DB_PRIVATE_IP: ${{ vars.DB_PRIVATE_IP }}
-          VARS_FIREBASE_WEB_API_KEY: ${{ vars.FIREBASE_WEB_API_KEY }}
-          VARS_FIREBASE_APP_ID: ${{ vars.FIREBASE_APP_ID }}
-          VARS_STRIPE_PUBLISHABLE_KEY: ${{ vars.STRIPE_PUBLISHABLE_KEY }}
-          VARS_TELEGRAM_BOT_USERNAME: ${{ vars.TELEGRAM_BOT_USERNAME }}
-
-      - name: Preflight (lock files, image digests, CSP)
-        run: ./infra/gcp/deploy.sh preflight
-
-      - name: Authenticate to Google Cloud (Workload Identity Federation, no keys)
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        with:
-          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
-          service_account: ${{ vars.DEPLOYER_SA }}
-          create_credentials_file: true      # ADC for firebase-tools (external_account credentials)
-          export_environment_variables: true
-          access_token_lifetime: 3600s
-
-      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
-
-      - name: Build and push images (deployed by digest)
-        run: ./infra/gcp/deploy.sh images
-
-      - name: Run database migrations (Cloud Run Job, before any traffic shift)
-        run: ./infra/gcp/deploy.sh migrate
-
-      - name: Deploy Cloud Run services (sandbox -> executor -> api)
-        id: services
-        run: ./infra/gcp/deploy.sh services
-
-      - name: API smoke test (health, edge enforcement, origins not public)
-        id: smoke_api
-        if: vars.SMOKE_SKIP_PUBLIC != 'true'
-        run: ./infra/gcp/deploy.sh smoke-api
-
-      - name: Roll back api/executor on failed smoke test
-        if: failure() && (steps.services.outcome == 'failure' || steps.smoke_api.outcome == 'failure')
-        run: ./infra/gcp/deploy.sh rollback
-
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           package-manager-cache: false
-
-      - name: Build web with the production app-config
+      - name: Required variables
+        env:
+          V_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          V_KEY: ${{ vars.FIREBASE_WEB_API_KEY }}
+          V_APP: ${{ vars.FIREBASE_APP_ID }}
+        run: |
+          [ -n "$V_PROJECT" ] && [ -n "$V_KEY" ] && [ -n "$V_APP" ] || {
+            echo "::error::production-build needs GCP_PROJECT_ID, FIREBASE_WEB_API_KEY, FIREBASE_APP_ID (docs/DEPLOY.md §6)"; exit 1; }
+      - name: TypeScript (pinned; credential-free job, no lifecycle scripts)
+        run: npm install --global --ignore-scripts --no-fund --no-audit "typescript@${TYPESCRIPT_VERSION}"
+      - name: Build web with the production app-config (SRI required, trust anchors = the committed ones)
         env:
           FIREBASE_WEB_API_KEY: ${{ vars.FIREBASE_WEB_API_KEY }}
           FIREBASE_APP_ID: ${{ vars.FIREBASE_APP_ID }}
         run: |
           set -e
-          npm install --global --no-fund --no-audit "typescript@${TYPESCRIPT_VERSION}"
           cfg="${RUNNER_TEMP}/app-config.prod.json"
           python3 - "$cfg" <<'PY'
           import json, os, sys
@@ -146,25 +101,224 @@ jobs:
           mkdir -p web/dist/.well-known
           find infra/hosting/well-known -maxdepth 1 -type f ! -name README.md -exec cp {} web/dist/.well-known/ \;
           ls -la web/dist/.well-known
-
       - name: CSP of the production build == infra/csp.txt == firebase.json
         run: python3 infra/csp_sync.py check --require-dist
+      - name: Header rules (firebase.json emulation, SECURITY M1)
+        run: node web/tests/headers.test.mjs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: web-dist
+          path: web/dist
+          include-hidden-files: true      # .well-known/
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Deploy Firebase Hosting
+  # --------------------------------------------------------------------------------------------- images
+  build-images:
+    name: images (builder identity)
+    needs: ci
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: production-build
+    permissions:
+      contents: read
+      id-token: write           # WIF -> aijalon-builder only (bootstrap `wif`)
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION }}
+      GIT_SHA: ${{ github.sha }}
+      DEPLOY_STATE: ${{ runner.temp }}/aijalon-deploy.state
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Digests pinned
         run: |
-          npx --yes "firebase-tools@${FIREBASE_TOOLS_VERSION}" deploy --only hosting \
-            --project "${PROJECT_ID}" --non-interactive --message "deploy ${GITHUB_SHA::12} run ${GITHUB_RUN_ID}"
+          if grep -n 'sha256:PIN_ME' backend/Dockerfile sandbox/Dockerfile infra/gcp/env.sh; then
+            echo "::error::image digests not pinned (make pin)"; exit 1; fi
+          [ -f backend/requirements.lock ] || { echo "::error::backend/requirements.lock missing (make lock)"; exit 1; }
+      - name: Authenticate to Google Cloud as the builder (Workload Identity Federation, no keys)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.BUILDER_SA }}
+          create_credentials_file: true
+          export_environment_variables: true
+          access_token_lifetime: 3600s
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+      - name: Build and push images (by digest)
+        run: ./infra/gcp/deploy.sh images
+      - name: Binary Authorization attestations (builder-only KMS key)
+        run: ./infra/gcp/deploy.sh attest
+      - name: Image package inventory (SBOM, REVIEW_WEB_INFRA L10)
+        run: |
+          set -e
+          img="$(grep -E '^BACKEND_IMAGE=' "$DEPLOY_STATE" | tail -1 | cut -d= -f2-)"
+          docker run --rm --entrypoint python "$img" -c 'import importlib.metadata as m, json; print(json.dumps(sorted(d.name + "==" + d.version for d in m.distributions()), indent=1))' \
+            > "${RUNNER_TEMP}/backend-image-packages.json"
+          wc -l "${RUNNER_TEMP}/backend-image-packages.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: deploy-state
+          path: |
+            ${{ runner.temp }}/aijalon-deploy.state
+            ${{ runner.temp }}/backend-image-packages.json
+          if-no-files-found: error
+          retention-days: 30
 
-      - name: Web smoke test (served CSP/HSTS, new build live, app-config, .well-known)
+  # ---------------------------------------------------------------------------------------- Cloud Run
+  deploy-run:
+    name: Cloud Run (deployer identity)
+    needs: [build-web, build-images]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment:
+      name: production          # required reviewers approve HERE
+      url: https://aijalon.trade
+    permissions:
+      contents: read
+      id-token: write           # WIF -> aijalon-deployer only
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION }}
+      DB_PRIVATE_IP: ${{ vars.DB_PRIVATE_IP }}
+      DB_TLS_HOST: ${{ vars.DB_TLS_HOST }}
+      # plain runtime settings (docs/DEPLOY.md §5.3); empty -> the default in infra/gcp/deploy.sh.
+      # ALLOWLIST_EMAILS / OPS_EMAILS / ADMIN_EMAILS are Secret Manager secrets (personal data), never GitHub variables.
+      LAUNCH_PHASE: ${{ vars.LAUNCH_PHASE }}
+      PAYOUTS_ENABLED: ${{ vars.PAYOUTS_ENABLED }}
+      STRIPE_PUBLISHABLE_KEY: ${{ vars.STRIPE_PUBLISHABLE_KEY }}
+      STRIPE_API_VERSION: ${{ vars.STRIPE_API_VERSION }}
+      STRIPE_FEE_ESTIMATE_BPS: ${{ vars.STRIPE_FEE_ESTIMATE_BPS }}
+      STRIPE_FEE_ESTIMATE_FIXED_USD: ${{ vars.STRIPE_FEE_ESTIMATE_FIXED_USD }}
+      STRIPE_MAX_TOPUP_USD: ${{ vars.STRIPE_MAX_TOPUP_USD }}
+      KYC_PROVIDER: ${{ vars.KYC_PROVIDER }}
+      KYC_LEVEL_NAME: ${{ vars.KYC_LEVEL_NAME }}
+      TELEGRAM_BOT_USERNAME: ${{ vars.TELEGRAM_BOT_USERNAME }}
+      SMOKE_SKIP_PUBLIC: ${{ vars.SMOKE_SKIP_PUBLIC }}
+      BINAUTHZ_ANNOTATE: ${{ vars.BINAUTHZ_ANNOTATE }}
+      GIT_SHA: ${{ github.sha }}
+      DEPLOY_STATE: ${{ runner.temp }}/aijalon-deploy.state
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Required GitHub environment variables
+        run: |
+          set -e
+          for v in GCP_PROJECT_ID GCP_REGION WIF_PROVIDER DEPLOYER_SA DB_PRIVATE_IP STRIPE_PUBLISHABLE_KEY TELEGRAM_BOT_USERNAME; do
+            eval "val=\${VARS_$v:-}"
+            [ -n "$val" ] || { echo "::error::GitHub environment variable $v is not set (docs/DEPLOY.md §6)"; exit 1; }
+          done
+        env:
+          VARS_GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          VARS_GCP_REGION: ${{ vars.GCP_REGION }}
+          VARS_WIF_PROVIDER: ${{ vars.WIF_PROVIDER }}
+          VARS_DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}
+          VARS_DB_PRIVATE_IP: ${{ vars.DB_PRIVATE_IP }}
+          VARS_STRIPE_PUBLISHABLE_KEY: ${{ vars.STRIPE_PUBLISHABLE_KEY }}
+          VARS_TELEGRAM_BOT_USERNAME: ${{ vars.TELEGRAM_BOT_USERNAME }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: deploy-state
+          path: ${{ runner.temp }}
+
+      - name: Preflight (lock files, image digests, CSP, SRI, trust anchors, smoke policy)
+        run: ./infra/gcp/deploy.sh preflight
+
+      - name: Authenticate to Google Cloud as the deployer (Workload Identity Federation, no keys)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOYER_SA }}
+          create_credentials_file: true      # gcloud only; no npm / third-party tooling runs in this job
+          export_environment_variables: true
+          access_token_lifetime: 3600s
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Run database migrations (Cloud Run Job, before any traffic shift)
+        run: ./infra/gcp/deploy.sh migrate
+
+      - name: Deploy Cloud Run services (sandbox -> executor canary + selftest -> api)
+        id: services
+        run: ./infra/gcp/deploy.sh services
+
+      - name: API smoke test (health, edge enforcement, origins and candidate tag not public)
+        id: smoke_api
+        if: vars.SMOKE_SKIP_PUBLIC != 'true'
+        run: ./infra/gcp/deploy.sh smoke-api
+
+      - name: Roll back api/executor/sandbox on failure
+        if: failure() && (steps.services.outcome == 'failure' || steps.smoke_api.outcome == 'failure')
+        run: ./infra/gcp/deploy.sh rollback
+
+  # --------------------------------------------------------------------------------------------- Hosting
+  deploy-hosting:
+    name: Hosting (hosting-only identity)
+    needs: [build-web, deploy-run]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: production-hosting
+      url: https://aijalon.trade
+    permissions:
+      contents: read
+      id-token: write           # WIF -> aijalon-hosting-deployer only (roles/firebasehosting.admin)
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION }}
+      GIT_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Authenticate as the hosting deployer (access token only; no credentials file)
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.HOSTING_SA }}
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
+          access_token_lifetime: 900s
+      - name: Deploy Firebase Hosting (REST API, stdlib Python — no firebase-tools / npm)
+        env:
+          HOSTING_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: ./infra/gcp/deploy.sh hosting
+      - name: Web smoke test (served CSP/XFO on every document path, new build live, app-config, .well-known)
         if: vars.SMOKE_SKIP_PUBLIC != 'true'
         run: ./infra/gcp/deploy.sh smoke-web
 
-      - name: Summary
-        if: always()
-        run: |
+  summary:
+    name: summary
+    needs: [build-images, deploy-run, deploy-hosting]
+    if: always() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: deploy-state
+          path: state
+      - run: |
           {
             echo "### Deploy ${GITHUB_SHA::12}"
+            echo "build-images: ${{ needs.build-images.result }} · deploy-run: ${{ needs.deploy-run.result }} · deploy-hosting: ${{ needs.deploy-hosting.result }}"
             echo '```'
-            cat "${RUNNER_TEMP}/aijalon-deploy.state" 2>/dev/null || true   # digests + previous revisions
+            cat state/aijalon-deploy.state 2>/dev/null || true   # digests
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

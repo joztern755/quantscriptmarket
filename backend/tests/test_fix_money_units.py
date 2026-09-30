@@ -306,18 +306,18 @@ class H2Attribution(unittest.TestCase):
         from app.errors import ValidationFailed
         from app.hl import client
 
-        prod = replace(get_settings(), env="prod", cloid_secret="")
-        orig = client.__dict__.get("get_settings")
         import app.config as cfg
 
+        prod = replace(get_settings(), env="prod", cloid_secret="")
         real = cfg.get_settings
         cfg.get_settings = lambda: prod   # type: ignore[assignment]
         try:
             with self.assertRaises(ValidationFailed):
                 client.make_cloid("sub1", 1_700_000_000_000, "BTC|0")
+            cfg.get_settings = lambda: replace(prod, cloid_secret="x" * 32)   # type: ignore[assignment]
+            self.assertTrue(client.make_cloid("sub1", 1_700_000_000_000, "BTC|0").startswith("0x" + client.CLOID_PREFIX))
         finally:
             cfg.get_settings = real       # type: ignore[assignment]
-        self.assertIsNone(orig)
 
 
 # ================================================================================================= M3
@@ -364,7 +364,10 @@ class M5LedgerRules(unittest.TestCase):
         # a payable created as overdraftable is forced non-negative
         acct = st.insert_account(pay, "liability", C, False)
         self.assertTrue(acct.non_negative)
-        # profit_share may overdraw the user fee balance …
+        # profit_share may overdraw the user fee balance, but only the collected part reaches the payable (C1) …
+        with self.assertRaises(InsufficientBalance):
+            post_transaction(st, "ps:0", "profit_share", "", [(f"user:{U}:fee_balance", 100), (pay, -100)], "t")
+        post_transaction(st, "dep:1", "deposit", "", [("treasury:hl_usdc", 100), (f"user:{U}:fee_balance", -100)], "t")
         post_transaction(st, "ps:1", "profit_share", "", [(f"user:{U}:fee_balance", 100), (pay, -100)], "t")
         # … but no kind (not even profit_share) may overdraw a payable
         with self.assertRaises(InsufficientBalance):
@@ -374,6 +377,7 @@ class M5LedgerRules(unittest.TestCase):
         # pending accounts only move by ps_pending_release
         pend = f"ps_pending:{U}:{C}"
         post_transaction(st, "ps:3", "profit_share", "", [(f"user:{U}:fee_balance", 50), (pend, -50)], "t")
+        self.assertEqual(-st.balance(f"user:{U}:fee_balance"), -50)                  # user debt
         with self.assertRaises(ValidationFailed):
             post_transaction(st, "x:1", "adjustment", "", [(pend, 50), (pay, -50)], "t")
         post_transaction(st, "rel:1", "ps_pending_release", "", [(pend, 50), (pay, -50)], "t")

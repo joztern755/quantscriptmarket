@@ -143,8 +143,13 @@ class LedgerContract:
 
     def test_overdraft_kinds_and_topup_on_debt(self):
         self.deposit(usd(10))
+        # REVIEW_MONEY C1 (0010): only the collected $10 may reach revenue; the uncollected $5 goes to ps_pending
+        with self.assertRaises(InsufficientBalance):
+            ledger.post_transaction(self.store, self.key("ps0"), "profit_share", None,
+                                    [(self.fee, usd(15)), (ledger.PLATFORM_REVENUE_PROFIT_SHARE, -usd(15))], "test")
         ledger.post_transaction(self.store, self.key("ps"), "profit_share", None,
-                                [(self.fee, usd(15)), (ledger.PLATFORM_REVENUE_PROFIT_SHARE, -usd(15))], "test")
+                                [(self.fee, usd(15)), (ledger.PLATFORM_REVENUE_PROFIT_SHARE, -usd(10)),
+                                 (ledger.ps_pending_account(self.u, None), -usd(5))], "test")
         self.assertEqual(ledger.available_fee_balance(self.store, self.u), -usd(5))   # debt
         self.deposit(usd(2))                                                          # top-up onto debt is fine
         self.assertEqual(ledger.available_fee_balance(self.store, self.u), -usd(3))

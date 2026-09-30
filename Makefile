@@ -50,6 +50,19 @@ audit:  ## pip-audit against the lock
 web:  ## build the SPA (needs a global tsc)
 	node web/build.mjs
 
+web-test:  ## build + every web test (core, signing trust, header emulation/framing, Playwright smoke)
+	node web/build.mjs
+	node web/tests/core.test.mjs
+	node web/tests/trust.test.mjs
+	node web/tests/headers.test.mjs
+	node web/tests/smoke.mjs
+
+sri:  ## (NETWORK) download the pinned Firebase SDK modules and write web/sri.json — review the diff, commit, then csp-sync
+	node web/tools/gen-sri.mjs
+
+sri-check:  ## (NETWORK) verify web/sri.json still matches the live SDK files
+	node web/tools/gen-sri.mjs --check
+
 csp-check:  ## infra/csp.txt == firebase.json (== web/dist/csp.txt when built)
 	python3 infra/csp_sync.py check
 
@@ -67,6 +80,8 @@ validate:  ## syntax-check every shell script, YAML and JSON this repo's infra u
 	python3 -c "import glob,yaml,json;[yaml.safe_load(open(f)) for f in glob.glob('.github/workflows/*.yml')+glob.glob('infra/**/*.yaml',recursive=True)];[json.load(open(f)) for f in ('firebase.json','.firebaserc')];print('yaml/json ok')"
 	python3 infra/csp_sync.py check
 	python3 infra/pin.py check
+	python3 -c "import tomllib;tomllib.load(open('.github/gitleaks.toml','rb'));print('gitleaks.toml ok')"
+	python3 infra/hosting/test_deploy_hosting.py
 
 # ---------------------------------------------------------------- cloud (owner's machine)
 bootstrap:  ## create/verify all Google Cloud resources (BILLING_ACCOUNT=... required the first time)
@@ -93,4 +108,4 @@ pause-all:  ## emergency: pause every scheduler job (stops ticks; the app kill s
 	source infra/gcp/env.sh; for spec in "$${SCHEDULER_SPEC[@]}"; do j="$${spec%%|*}"; \
 	  gcloud scheduler jobs pause "$$j" --location=$(REGION) --project=$(PROJECT_ID); done
 
-.PHONY: help lock pin pin-check venv lint test audit web csp-check csp-sync docker validate bootstrap auth-config db-bootstrap dns deploy go-live pause-all
+.PHONY: help lock pin pin-check venv lint test audit web web-test sri sri-check csp-check csp-sync docker validate bootstrap auth-config db-bootstrap dns deploy go-live pause-all

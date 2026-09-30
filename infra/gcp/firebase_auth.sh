@@ -5,6 +5,8 @@
 #   GOOGLE_OAUTH_CLIENT_ID=... GOOGLE_OAUTH_CLIENT_SECRET=... ./infra/gcp/firebase_auth.sh google
 #   APPLE_SERVICES_ID=... APPLE_TEAM_ID=... APPLE_KEY_ID=... APPLE_PRIVATE_KEY_FILE=key.p8 ./infra/gcp/firebase_auth.sh apple
 #   ./infra/gcp/firebase_auth.sh show        # print the current config (no secrets are returned by the API)
+#   ./infra/gcp/firebase_auth.sh apikey      # restrict the public Web API key: referrer + Identity Toolkit/Securetoken
+#   AUTH_DROP_FIREBASEAPP_DOMAIN=1 ./infra/gcp/firebase_auth.sh   # authorized domains = aijalon.trade ONLY
 #
 # SPEC §5.2: sign-in with Google or Apple ONLY; TOTP MFA required (enforced by the API: tokens without
 # firebase.sign_in_second_factor are rejected). SMS MFA stays OFF (SIM-swap). Email/password, phone and
@@ -43,9 +45,14 @@ cmd_base() {
   api PATCH "${IDT}/admin/v2/projects/${PROJECT_ID}/config?updateMask=signIn.email.enabled,signIn.phoneNumber.enabled,signIn.anonymous.enabled,signIn.allowDuplicateEmails" \
     '{"signIn":{"email":{"enabled":false},"phoneNumber":{"enabled":false},"anonymous":{"enabled":false},"allowDuplicateEmails":false}}' >/dev/null
 
-  log "authorized domains: ${WEB_DOMAIN}, ${PROJECT_ID}.firebaseapp.com (localhost and web.app removed)"
+  # REVIEW_WEB_INFRA L5: authDomain is aijalon.trade (Hosting serves /__/auth/* on our own domain), so the project's
+  # firebaseapp.com domain is not needed for redirect/popup sign-in. It stays until G9 has been re-tested WITHOUT it
+  # (AUTH_DROP_FIREBASEAPP_DOMAIN=1): every extra authorised domain is a look-alike origin that can run sign-in.
+  local domains="[\"${WEB_DOMAIN}\",\"${PROJECT_ID}.firebaseapp.com\"]"
+  if [[ "${AUTH_DROP_FIREBASEAPP_DOMAIN:-0}" == "1" ]]; then domains="[\"${WEB_DOMAIN}\"]"; fi
+  log "authorized domains: ${domains} (localhost and web.app removed)"
   api PATCH "${IDT}/admin/v2/projects/${PROJECT_ID}/config?updateMask=authorizedDomains" \
-    "{\"authorizedDomains\":[\"${WEB_DOMAIN}\",\"${PROJECT_ID}.firebaseapp.com\"]}" >/dev/null
+    "{\"authorizedDomains\":${domains}}" >/dev/null
 
   log "e-mail enumeration protection; users cannot delete themselves client-side (ledger retention)"
   api PATCH "${IDT}/admin/v2/projects/${PROJECT_ID}/config?updateMask=emailPrivacyConfig.enableImprovedEmailPrivacy,client.permissions.disabledUserDeletion" \
@@ -91,7 +98,30 @@ c=json.load(sys.stdin)
 print(json.dumps({k:c.get(k) for k in ("signIn","mfa","authorizedDomains","emailPrivacyConfig","client")},indent=1))'
 }
 
+# REVIEW_WEB_INFRA L5: the Web API key is public by design, but unrestricted it can be used from any origin against
+# every enabled API that accepts API keys. Restrict it to our site as referrer and to the two Auth APIs.
+# (FIREBASE_WEB_API_KEY_ID: the key's resource id — `gcloud services api-keys list`; default = the key whose
+# keyString equals FIREBASE_WEB_API_KEY from ~/.aijalon-deploy/<project>/firebase.env.)
+cmd_apikey() {
+  local kid="${FIREBASE_WEB_API_KEY_ID:-}"
+  if [[ -z "${kid}" ]]; then
+    local want="${FIREBASE_WEB_API_KEY:-}"
+    [[ -z "${want}" && -f "${OUT_DIR}/firebase.env" ]] && want="$(sed -n 's/^FIREBASE_WEB_API_KEY=//p' "${OUT_DIR}/firebase.env")"
+    [[ -n "${want}" ]] || die "set FIREBASE_WEB_API_KEY_ID or FIREBASE_WEB_API_KEY"
+    local k
+    for k in $(gcloud services api-keys list --project="${PROJECT_ID}" --format='value(name)'); do
+      if [[ "$(gcloud services api-keys get-key-string "${k}" --format='value(keyString)')" == "${want}" ]]; then kid="${k}"; break; fi
+    done
+    [[ -n "${kid}" ]] || die "no API key in ${PROJECT_ID} matches FIREBASE_WEB_API_KEY"
+  fi
+  log "restricting API key ${kid##*/}: referrer https://${WEB_DOMAIN}/*, APIs identitytoolkit + securetoken"
+  gcloud services api-keys update "${kid}" --project="${PROJECT_ID}" \
+    --allowed-referrers="https://${WEB_DOMAIN}/*" \
+    --api-target=service=identitytoolkit.googleapis.com --api-target=service=securetoken.googleapis.com >/dev/null
+  gcloud services api-keys describe "${kid}" --project="${PROJECT_ID}" --format='yaml(displayName,restrictions)'
+}
+
 case "${1:-base}" in
-  base) cmd_base ;; google) cmd_google ;; apple) cmd_apple ;; show) cmd_show ;;
-  *) die "usage: $0 [base|google|apple|show]" ;;
+  base) cmd_base ;; google) cmd_google ;; apple) cmd_apple ;; show) cmd_show ;; apikey) cmd_apikey ;;
+  *) die "usage: $0 [base|google|apple|show|apikey]" ;;
 esac

@@ -237,11 +237,25 @@ class MoneyFixesDbTest(unittest.TestCase):
         # … nor can it forge the authorisation row
         self.assert_sqlstate("42501", self.api.fetchall,
                              "INSERT INTO ledger_tx_authorizations (tx_id, kind, authorized_as) SELECT id, kind, 'x' FROM ledger_transactions LIMIT 1")
-        # app_executor may post profit_share (settlement), not ps_pending_release
+        # app_executor may post profit_share (settlement) — but even it cannot credit a creator with uncollected
+        # profit share (C1 enforced in the DB: the user's balance before the charge is $0)
+        self.assert_sqlstate("AJ402", self.exe.fetchall,
+                             "SELECT created FROM ledger_post(:k, 'profit_share', 'x', 'exe', CAST(:e AS jsonb))",
+                             {"k": f"ps-c1:{u}", "e": json.dumps([{"account": fee, "amount_micro": 100},
+                                                                  {"account": pay, "amount_micro": -100}])})
+        self.assert_sqlstate("AJ403", self.exe.fetchall,        # nor credit anything else (e.g. a referrer payable)
+                             "SELECT created FROM ledger_post(:k, 'profit_share', 'x', 'exe', CAST(:e AS jsonb))",
+                             {"k": f"ps-sh:{u}", "e": json.dumps([{"account": fee, "amount_micro": 100},
+                                                                  {"account": "stripe:clearing", "amount_micro": -100}])})
+        self.admin.fetchall("INSERT INTO ledger_accounts (code, kind, owner_user_id) VALUES (:c, 'liability', NULL)",
+                            {"c": f"ps_pending:{u}:{c}"})
         self.assertEqual(self.exe.fetchall("SELECT created FROM ledger_post(:k, 'profit_share', 'x', 'exe', CAST(:e AS jsonb))",
                                            {"k": f"ps-ok:{u}", "e": json.dumps([{"account": fee, "amount_micro": 100},
-                                                                                {"account": pay, "amount_micro": -100}])}),
+                                                                                {"account": f"ps_pending:{u}:{c}",
+                                                                                 "amount_micro": -100}])}),
                          [{"created": True}])
+        self.assert_sqlstate("42501", self.exe.fetchall,        # the executor cannot forge an authorisation row
+                             "INSERT INTO ledger_tx_authorizations (tx_id, kind, authorized_as) SELECT id, kind, 'x' FROM ledger_transactions LIMIT 1")
         self.assert_sqlstate("AJ403", self.exe.fetchall,
                              "SELECT created FROM ledger_post(:k, 'ps_pending_release', 'x', 'exe', CAST(:e AS jsonb))",
                              {"k": f"rel:{u}", "e": json.dumps([{"account": pay, "amount_micro": 1},

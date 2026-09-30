@@ -49,6 +49,8 @@ jobs:
           done
       - name: CSP identical in infra/csp.txt and firebase.json
         run: python3 infra/csp_sync.py check
+      - name: Hosting REST deployer (fake API)
+        run: python3 infra/hosting/test_deploy_hosting.py
       - name: Shell syntax
         run: |
           set -e
@@ -253,13 +255,17 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
-      - name: TypeScript (pinned)
-        run: npm install --global --no-fund --no-audit "typescript@${TYPESCRIPT_VERSION}"
+      - name: TypeScript (pinned; no lifecycle scripts)
+        run: npm install --global --ignore-scripts --no-fund --no-audit "typescript@${TYPESCRIPT_VERSION}"
       - name: Build
         run: node web/build.mjs
       - name: Core unit tests
         run: |
           if [ -f web/tests/core.test.mjs ]; then node web/tests/core.test.mjs; else echo "::warning::no web unit tests"; fi
+      - name: Signing-trust unit tests (pinned anchors, attestation, ecrecover, wallet proofs — REVIEW_WEB_INFRA H1)
+        run: node web/tests/trust.test.mjs
+      - name: Firebase SDK still matches web/sri.json (network; REVIEW_WEB_INFRA M2)
+        run: node web/tools/gen-sri.mjs --check
       - name: Playwright smoke (entry gate, legal pages, no console errors, 2 viewports x 2 themes)
         run: |
           set -e
@@ -267,6 +273,28 @@ jobs:
           npm install --no-save --no-fund --no-audit "playwright@${PLAYWRIGHT_VERSION}"
           npx playwright install --with-deps chromium
           node web/tests/smoke.mjs
+          node web/tests/headers.test.mjs   # firebase.json header emulation + cross-origin framing (M1)
+
+  sbom:
+    name: SBOM (dependency graph, SPDX)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Export the repository SBOM (GitHub dependency graph; no third-party action)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/dependency-graph/sbom" > sbom.spdx.json \
+            || { echo "::warning::dependency graph SBOM unavailable (enable the dependency graph in repo settings)"; exit 0; }
+          python3 -c "import json;d=json.load(open('sbom.spdx.json'));print(len(d['sbom'].get('packages',[])),'packages')"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: hashFiles('sbom.spdx.json') != ''
+        with:
+          name: sbom-spdx
+          path: sbom.spdx.json
+          retention-days: 90
 
   signals:
     name: signals (Ed25519 feed adapter)

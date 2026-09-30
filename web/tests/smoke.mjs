@@ -244,7 +244,7 @@ async function newPage(viewport, colorScheme, opts = {}) {
   });
   await context.route("https://api.aijalon.trade/**", (r) => {
     const u = new URL(r.request().url());
-    const cors = { "access-control-allow-origin": "*", "access-control-allow-headers": "authorization, content-type, idempotency-key", "access-control-allow-methods": "GET, POST, PATCH, DELETE" };
+    const cors = { "access-control-allow-origin": "*", "access-control-allow-headers": "authorization, content-type, idempotency-key, x-device-id", "access-control-allow-methods": "GET, POST, PATCH, DELETE" };
     if (r.request().method() === "OPTIONS") return r.fulfill({ status: 204, headers: cors });
     if (u.pathname === "/v1/public/config") return r.fulfill({ status: 200, contentType: "application/json", headers: cors, body: JSON.stringify(cfgState) });
     const pub = publicRoute(u.pathname);

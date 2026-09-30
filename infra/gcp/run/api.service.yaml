@@ -91,6 +91,8 @@ spec:
               valueFrom: {secretKeyRef: {name: ALLOWLIST_EMAILS, key: latest}}
             - name: OPS_EMAILS
               valueFrom: {secretKeyRef: {name: OPS_EMAILS, key: latest}}
+            - name: ADMIN_EMAILS                                       # who may hold the admin role (required in prod)
+              valueFrom: {secretKeyRef: {name: ADMIN_EMAILS, key: latest}}
             - name: STRIPE_SECRET_KEY
               valueFrom: {secretKeyRef: {name: STRIPE_SECRET_KEY, key: latest}}
             - name: STRIPE_WEBHOOK_SECRET

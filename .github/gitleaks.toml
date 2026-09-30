@@ -14,9 +14,18 @@ paths = ['''^backend/tests/''']
 regexes = ['''^(sk|rk|pk|whsec)_(test|live)_(abcdefgh[a-z0-9]*|abcdefghijk)$''']
 
 [[allowlists]]
-description = "Fixed test tokens in backend unit tests (generic-api-key only)"
+# REVIEW_WEB_INFRA L11: was "every generic-api-key finding in any backend/tests/test_*.py" — a real key pasted into a
+# test passed. Now the FINDING itself must look like a fixture value (AND with the path): it names itself as a
+# test/fake/dummy/example/fixture/placeholder value, or is one repeated character (0/1/a/x/k). Anything else in a test file fails.
+description = "Obviously fake tokens in backend unit tests (generic-api-key only)"
 targetRules = ["generic-api-key"]
+condition = "AND"
 paths = ['''^backend/tests/test_[a-z_]+\.py$''']
+regexTarget = "secret"
+regexes = [
+  '''(?i)(test|tst|fake|dummy|example|fixture|placeholder|attacker|not[-_]?a[-_]?real|ci[-_]only|hook-secret|server-secret|sumsub-secret)''',
+  '''^(?:0{12,}|1{12,}|a{12,}|x{12,}|k{12,}|A{12,}|X{12,})$''',   # RE2: no backreferences
+]
 
 [[allowlists]]
 description = "localStorage / sessionStorage key names in the SPA are not secrets"

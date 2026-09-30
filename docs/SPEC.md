@@ -66,7 +66,10 @@ Region: `asia-southeast1` (Singapore) for everything. Strategies are daily-bar; 
 | `api` | KMS **encrypt** on agent-keys; Cloud SQL client; read its secrets | decrypt agent keys; sign orders |
 | `executor` | KMS **decrypt** on agent-keys; Cloud SQL client | serve public traffic (ingress internal only) |
 | `sandbox` | nothing | network egress, DB, KMS |
-| `deployer` (GitHub Actions via Workload Identity Federation, no JSON keys) | deploy Run/Hosting, run migrations | read secrets values, decrypt |
+| `executor` (attestation) | KMS **sign** with `agent-attest` (EC P-256, HSM): attests each agent address after opening its sealed key (REVIEW_WEB_INFRA H1) | — (no other principal may sign with it) |
+| `builder` (GitHub Actions, environment `production-build`, WIF) | push images to Artifact Registry; sign Binary Authorization attestations | deploy anything; act as any runtime SA |
+| `deployer` (GitHub Actions, environment `production` with required reviewers, WIF, no JSON keys) | update/replace the **named** Cloud Run services `api`/`executor`/`sandbox` and job `migrate` (custom role; no create/delete/IAM/`runWithOverrides`), act as those four runtime SAs, pause/resume/run `tick` + `executor-selftest` | hold any secret-accessor or KMS role; push images; deploy Hosting. **Caveat:** code it deploys runs with the runtime SA's rights (executor = KMS decrypt, api = api secrets), so the deployer is effectively as powerful as executor + api for code that reaches it — bounded by the reviewed `main` commit, the production reviewer and Binary Authorization (only builder-attested images run) |
+| `hosting-deployer` (GitHub Actions, environment `production-hosting`, WIF) | `roles/firebasehosting.admin` only (REST deploy of the credential-free web build) | anything on Cloud Run, KMS, secrets |
 
 The **treasury / builder wallet private key is never on any server.** Builder fees accrue to the builder address on Hyperliquid. Payouts and fee-balance withdrawals are prepared by the server, approved by two different admins (maker-checker), then signed in the admin's browser with a hardware wallet (`usdSend`).
 

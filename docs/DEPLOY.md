@@ -31,7 +31,7 @@ This guide takes an empty Google account (`app.aijalon@gmail.com`) to a running 
 | Tool | Version | Check |
 |---|---|---|
 | Google Cloud CLI (`gcloud`, incl. `beta`) | current (≥ 500) | `gcloud version` |
-| Firebase CLI | 15.32.0 (same as CI) | `npm i -g firebase-tools@15.32.0 && firebase --version` |
+| Firebase CLI | 15.32.0 | `npm i -g firebase-tools@15.32.0 && firebase --version` (local bootstrap `firebase` step only; CI deploys Hosting through the REST API — no firebase-tools with credentials, REVIEW_WEB_INFRA H2) |
 | Node.js | 22 | `node -v` |
 | TypeScript | 6.0.2 (same as CI) | `npm i -g typescript@6.0.2` |
 | Python | 3.12 | `python3.12 -V` |
@@ -86,6 +86,9 @@ git diff       # review: new lock files; Dockerfile/env.sh/ci.yml now carry @sha
 - The deploy workflow **refuses** to run without `backend/requirements.lock` or with any `sha256:PIN_ME` placeholder left. CI only warns, so development is not blocked.
 - Done 2026-09-30: `backend/Dockerfile`, `sandbox/Dockerfile`, the Cloud SQL proxy image (`infra/gcp/env.sh`) and the CI `postgres:16` service are pinned by digest (`make pin-check` clean). Re-run `make pin` when bumping a base image.
 
+- **Firebase SDK integrity (REVIEW_WEB_INFRA M2).** `make sri` (needs network; the authoring sandbox has none, the owner's local session does) downloads the pinned SDK modules from `https://www.gstatic.com/firebasejs/<firebaseSdkVersion>/`, follows their imports and writes `web/sri.json`; review the diff, then `make csp-sync` (the import map's hash is part of the CSP) and commit both. Production builds (`APP_CONFIG=… node web/build.mjs`, i.e. deploy) **fail** without `web/sri.json`; CI runs `make sri-check` against the live files. Bumping `firebaseSdkVersion` = `make sri && make csp-sync` in the same PR (the CSP pins the version path too).
+- **Actions added offline (REVIEW_WEB_INFRA round):** `actions/upload-artifact`, `actions/download-artifact`, `github/codeql-action` carry a SHA written without network. Run `python3 infra/pin.py actions` once (it re-resolves every SHA from its tag comment) and commit the result before the first deploy.
+
 Commit (`chore: lock dependencies and pin images`) and push to a branch; open a PR; CI must be green.
 
 ## 4. Google Cloud bootstrap
@@ -103,16 +106,19 @@ BILLING_ACCOUNT=XXXXXX-XXXXXX-XXXXXX GITHUB_REPO_ID=$(gh api repos/joztern755/qu
 | `firebase` | adds Firebase to the project, creates the web app `aijalon-web`, writes its public `apiKey`/`appId` to `~/.aijalon-deploy/<project>/firebase.env` |
 | `audit` | Data Access audit logs (read + write) for KMS, Secret Manager, Cloud SQL admin, IAM — every agent-key decrypt is logged |
 | `network` | `aijalon-vpc` + subnet `aijalon-run` (Private Google Access, flow logs), Private Service Access for Cloud SQL, Cloud Router + Cloud NAT with a **static egress IP**, egress firewall (443 anywhere, 5432/3307 to the SQL range only, deny the rest); `aijalon-sandbox-vpc` with **no NAT, no Private Google Access, the internet route deleted, deny-all egress/ingress** |
-| `kms` | keyring `aijalon`; key `agent-keys` (ENCRYPT_DECRYPT, **HSM**, rotation 90 d, destroy delay 90 d); key `cloudsql` (HSM, CMEK for the database disk) + grant to the Cloud SQL service agent |
+| `kms` | keyring `aijalon`; key `agent-keys` (ENCRYPT_DECRYPT, **HSM**, rotation 90 d, destroy delay 90 d); key `cloudsql` (HSM, CMEK for the database disk) + grant to the Cloud SQL service agent; **`agent-attest`** (ASYMMETRIC_SIGN, `EC_SIGN_P256_SHA256`, HSM — the executor signs agent attestations with it; REVIEW_WEB_INFRA H1); **`binauthz-attestor`** (ASYMMETRIC_SIGN, P-256, HSM — the CI builder signs image attestations) |
 | `registry` | Artifact Registry `aijalon` (immutable tags; vulnerability scanning) |
-| `sa` | service accounts and least-privilege bindings (table in ARCHITECTURE §3) |
-| `secrets` | the secret **names** (user-managed replication in `asia-southeast1`), per-secret accessor bindings (`SECRETS_SPEC` in `infra/gcp/env.sh`); generates random values for `AUDIT_PEPPER`, `EDGE_AUTH_SECRET`, `TELEGRAM_WEBHOOK_SECRET`, `DB_MIGRATOR_PASSWORD`, `SANDBOX_SHARED_SECRET`, `CLOID_SECRET` (never printed); seeds `ALLOWLIST_EMAILS` and `OPS_EMAILS` with the owner e-mail; creates the optional `KYC_APP_TOKEN`, `KYC_SECRET_KEY`, `KYC_WEBHOOK_SECRET` without a value (used only with `KYC_PROVIDER=sumsub`) |
+| `sa` | service accounts and least-privilege bindings (table in ARCHITECTURE §3 / SPEC §2.1). REVIEW_WEB_INFRA H2: executor = `cloudkms.signer` on `agent-attest` (nobody else); CI identities `aijalon-builder` (Artifact Registry writer), `aijalon-deployer` (custom role `aijalonRunDeployer` on the **named** services `api`/`executor`/`sandbox` + job `migrate` via an IAM condition — no create/delete/IAM/`runWithOverrides`; actAs only the four runtime SAs; custom role `aijalonSchedulerOperator` = get/pause/resume/run on `tick` + `executor-selftest` only), `aijalon-hosting-deployer` (`roles/firebasehosting.admin` only); removes the legacy project-wide `run.developer`, Hosting and AR-writer grants from the deployer. `DEPLOYER_RUN_CONDITIONS=0` / `DEPLOYER_SCHED_CONDITIONS=0` bind the custom roles without the resource conditions if IAM refuses them [VERIFY §16] |
+| `secrets` | the secret **names** (user-managed replication in `asia-southeast1`), per-secret accessor bindings (`SECRETS_SPEC` in `infra/gcp/env.sh`); generates random values for `AUDIT_PEPPER`, `EDGE_AUTH_SECRET`, `TELEGRAM_WEBHOOK_SECRET`, `DB_MIGRATOR_PASSWORD`, `SANDBOX_SHARED_SECRET`, `CLOID_SECRET` (never printed); seeds `ALLOWLIST_EMAILS`, `OPS_EMAILS` and `ADMIN_EMAILS` with the owner e-mail; creates the optional `KYC_APP_TOKEN`, `KYC_SECRET_KEY`, `KYC_WEBHOOK_SECRET` without a value (used only with `KYC_PROVIDER=sumsub`) |
 | `sql` | Cloud SQL `aijalon-pg`: Postgres 16, Enterprise edition, sized by `SQL_TIER` / `SQL_AVAILABILITY` in `infra/gcp/env.sh` — **internal phase (owner, cost): `db-custom-1-3840` ZONAL, 20 GB**; before Gate C (public): `db-custom-2-8192` **REGIONAL HA** (`gcloud sql instances patch aijalon-pg --availability-type=REGIONAL --tier=db-custom-2-8192` in the maintenance window, then set both defaults back), private IP only, `ENCRYPTED_ONLY`, CMEK, PITR (7 days of WAL), 30 automated daily backups, deletion protection, maintenance Sun 19:00 UTC, flags `cloudsql.iam_authentication=on`, `max_connections=200`, pgaudit (DDL + ROLE), connection/lock/slow-query logging; the built-in `postgres` password is set to a random value and discarded. On re-runs it only **verifies** these settings |
-| `run` | placeholder revisions of `api` (ingress internal-and-cloud-load-balancing), `executor` and `sandbox` (ingress internal); invoker IAM (api: allUsers — the LB/Armor/app gate it; executor: scheduler SA only; sandbox: api + executor SAs only) |
-| `lb` | global external HTTPS LB → serverless NEG(api); Cloud Armor: default deny, allow Cloudflare IPv4 ranges only, deny when `X-Edge-Auth` is wrong; Certificate Manager cert for `api.aijalon.trade` via DNS authorization; TLS ≥ 1.2 MODERN |
-| `scheduler` | 14 OIDC jobs → `POST <executor URL>/v1/internal/<route>`, **created PAUSED** (`SCHEDULER_SPEC` in `infra/gcp/env.sh`; table in §14.1). Re-runs update schedule/deadline/retries of existing jobs but never resume or pause them — a job **added after go-live** is created paused: resume it by name |
-| `wif` | pool `github`, provider `github-oidc` accepting only repo `joztern755/quantscriptmarket` (+ repo id), `refs/heads/main`, environment `production`, workflow `deploy.yml` → deployer SA |
-| `monitoring` | e-mail channel; alerts: agent-keys decrypt by anyone but executor (CRITICAL), encrypt by anyone but api, KMS admin changes, unexpected secret reads, secret changes, IAM changes, Cloud SQL admin ops, app CRITICAL logs, executor errors, Scheduler failures, sandbox egress attempts, api 5xx, SQL CPU/disk/connections; uptime checks on `https://api.aijalon.trade/healthz` and `https://aijalon.trade/` |
+| `sqlca` | the Cloud SQL server CA bundle → secret `CLOUDSQL_SERVER_CA` (migrator only): the migrate job verifies the server certificate (`verify-ca` on the private IP, or `verify-full` when the GitHub variable `DB_TLS_HOST` is the instance DNS name) — REVIEW_WEB_INFRA L6. Re-run after a server-CA rotation |
+| `run` | placeholder revisions of `api` (ingress internal-and-cloud-load-balancing), `executor` and `sandbox` (ingress internal); a placeholder `migrate` job (the deployer may update jobs but never create them); invoker IAM (api: allUsers — the LB/Armor/app gate it; executor: scheduler SA only; sandbox: api + executor SAs only) |
+| `lb` | global external HTTPS LB → serverless NEG(api); Cloud Armor: default deny, allow Cloudflare IPv4 ranges only, deny when `X-Edge-Auth` is wrong (the rule is written through the Compute REST API with the secret on stdin — never in argv / `ps` / gcloud's command log; REVIEW_WEB_INFRA M3); Certificate Manager cert for `api.aijalon.trade` via DNS authorization; TLS ≥ 1.2 MODERN |
+| `aop` | **Authenticated Origin Pulls with our own zone client CA** (REVIEW_WEB_INFRA M3): P-256 CA + Cloudflare client certificate → owner-only secrets `CF_AOP_*`; Certificate Manager TrustConfig `api-aop-trust` (our CA only) + ServerTlsPolicy `api-aop-mtls` (REJECT_INVALID). Attached to the HTTPS proxy only with `AOP_ATTACH=1`, **after** `AOP=1 make dns` (§8) — the other order takes the API offline |
+| `scheduler` | the OIDC jobs of `SCHEDULER_SPEC` (now incl. `attest-agents` and `agent-substitution-scan`) plus the deploy probe `executor-selftest` (URI = the executor's `candidate---` tag URL, always PAUSED, never resumed by go-live) → `POST <executor URL>/v1/internal/<route>`, **created PAUSED** (`SCHEDULER_SPEC` in `infra/gcp/env.sh`; table in §14.1). Re-runs update schedule/deadline/retries of existing jobs but never resume or pause them — a job **added after go-live** is created paused: resume it by name |
+| `wif` | pool `github`, provider `github-oidc` accepting only repo `joztern755/quantscriptmarket` (+ repo id), `refs/heads/main`, workflow `deploy.yml`, **GitHub-hosted runners, `push`/`workflow_dispatch` events** (REVIEW_WEB_INFRA L12) and environments `production` / `production-build` / `production-hosting`; each environment may impersonate ONLY its own SA (deployer / builder / hosting deployer; principalSet on `attribute.environment`) |
+| `binauthz` | Binary Authorization (REVIEW_WEB_INFRA H2): Container Analysis note + attestor `aijalon-ci` on the `binauthz-attestor` key (signer = builder only), project policy REQUIRE_ATTESTATION with `BINAUTHZ_ENFORCE=0` → **dry-run** (audit log + alert) until a clean deploy, then `BINAUTHZ_ENFORCE=1 ./infra/gcp/bootstrap.sh binauthz` → block. Allowlisted: the digest-pinned Cloud SQL proxy and Google's placeholder images |
+| `monitoring` | e-mail channel; alerts: agent-keys decrypt by anyone but executor (CRITICAL), **agent-keys decrypt rate** (log metric, default > 600 / 10 min, `DECRYPT_ALERT_PER_10MIN`), encrypt by anyone but api, **agent-attest / binauthz-attestor key used by anyone but executor / builder**, KMS admin changes, unexpected secret reads (sandbox SA excluded — it reads its shared secret on every cold start), secret changes, IAM changes, **Cloud Run executor changed (CRITICAL) / other Run services or jobs changed**, **Cloud Scheduler job created/updated/deleted (CRITICAL)** and paused/resumed, **Binary Authorization violation/breakglass**, **Hosting release by anyone but the hosting deployer**, **CSP/Trusted-Types violation reports**, Cloud SQL admin ops, app CRITICAL logs, executor errors, Scheduler failures, sandbox egress attempts, api 5xx, SQL CPU/disk/connections; uptime checks on `https://api.aijalon.trade/healthz` and `https://aijalon.trade/` |
 | `budget` | budget alert (default 400 USD/month; 50/90/100 % actual, 120 % forecast) |
 | `harden` | removes Editor from the default compute SA; essential contact |
 | `outputs` | `~/.aijalon-deploy/<project>/outputs.env` + the exact `gh variable set` commands for step 6 |
@@ -148,6 +154,9 @@ add_secret STRIPE_SECRET_KEY
 | `CLOID_SECRET` | **generated**; HMAC key of our order cloids (REVIEW_MONEY H2: users must not be able to compute them); never rotate while orders are unresolved | — | executor |
 | `ALLOWLIST_EMAILS` | comma-separated e-mails allowed to sign up while `LAUNCH_PHASE=internal` (lower-cased by the app). **Seeded** with the owner e-mail; replace with the team list. Personal data → secret, not a GitHub variable. The app refuses to start in the internal phase when it is empty | owner | api, executor |
 | `OPS_EMAILS` | comma-separated ops alert recipients (e-mail leg of ops alerts). **Seeded** with the owner e-mail | owner | api, executor |
+| `ADMIN_EMAILS` | comma-separated e-mails that may hold the admin role (the role in the DB AND a listed, verified e-mail are both required). **Seeded** with the owner e-mail; the prod api refuses to start without it | owner | api |
+| `CLOUDSQL_SERVER_CA` | the Cloud SQL instance's server CA certificate(s) (public; written by bootstrap `sqlca`) — the migrate job verifies the database's TLS certificate against it | bootstrap | migrator |
+| `CF_AOP_CA_CERT`, `CF_AOP_CA_KEY`, `CF_AOP_CLIENT_CERT`, `CF_AOP_CLIENT_KEY` | the Authenticated-Origin-Pulls client CA and the certificate Cloudflare presents to our LB (bootstrap `aop`; `make dns` with `AOP=1` uploads the client pair to the zone). **No service account can read them** | bootstrap | owner only |
 | `KYC_APP_TOKEN`, `KYC_SECRET_KEY`, `KYC_WEBHOOK_SECRET` | **optional** — only when `KYC_PROVIDER=sumsub` (§5.4): Sumsub app token, secret key, webhook secret. Left without a version while KYC is `manual`; the api template references them only for `sumsub` | Sumsub dashboard | api |
 
 `BUILDER_ADDRESS` / `TREASURY_ADDRESS` are not secret, but keeping them in Secret Manager means changing them is an audited, alerted event ("SEC: Secret added/destroyed/IAM changed"). Enter them only while a second person reads the address off the hardware wallet screen.
@@ -157,6 +166,7 @@ After adding a version, the running services keep the old value until the next r
 ```bash
 add_secret ALLOWLIST_EMAILS      # e.g. app.aijalon@gmail.com,tester1@example.com   (no spaces needed; case ignored)
 add_secret OPS_EMAILS            # e.g. app.aijalon@gmail.com
+add_secret ADMIN_EMAILS          # e.g. app.aijalon@gmail.com,second.admin@example.com (who may hold the admin role)
 ```
 
 ### 5.1 Telegram bot (user + ops alerts) — HUMAN + session
@@ -223,6 +233,9 @@ Plain values are rendered into `infra/gcp/run/*.yaml` at deploy time (`infra/gcp
 | `SANDBOX_SHARED_SECRET` | api, executor, sandbox | secret | generated | bootstrap |
 | `CLOID_SECRET` | executor | secret | generated | bootstrap |
 | `SANDBOX_MAX_CONCURRENT` | sandbox | plain | `4` (read by `app/sandbox/service.py`, not config.py) | template |
+| `AGENT_ATTEST_KEY_VERSION` | executor | plain | `projects/…/cryptoKeys/agent-attest/cryptoKeyVersions/<KMS_ATTEST_KEY_VERSION>` — the key the executor signs agent attestations with (read by `app/security/kms.py`; the public key is pinned in `web/public/app-config.json`) | template (`env.sh`) |
+| `ADMIN_EMAILS` | api | secret (personal data) | seeded with the owner e-mail | owner |
+| `BINAUTHZ_ANNOTATE`, `DB_TLS_HOST` | deploy only | GitHub var | `1` (templates carry `run.googleapis.com/binary-authorization: default`); empty (migrate verifies the DB certificate with `verify-ca` on the IP; set the instance DNS name for `verify-full`) | owner → GitHub var |
 
 The api no longer carries `SCHEDULER_SA_EMAIL` / `INTERNAL_AUDIENCE`: every `/v1/internal/*` route is mounted only by `create_executor_app`.
 
@@ -242,7 +255,22 @@ gh api -X PUT repos/$R/environments/production --input - <<EOF
 {"reviewers":[{"type":"User","id":$(gh api users/joztern755 --jq .id)}],
  "deployment_branch_policy":{"protected_branches":true,"custom_branch_policies":false}}
 EOF
-# 2) variables (NOT secrets — none of these is sensitive). Run the lines printed by bootstrap 'outputs', i.e.:
+# 1b) REVIEW_WEB_INFRA H2: two more environments, each bound to its own service account by WIF (bootstrap `wif`).
+#     No reviewers (they run only after CI on main; production-hosting runs only after the approved production job),
+#     deployment branches: main only.
+for e in production-build production-hosting; do
+gh api -X PUT repos/$R/environments/$e --input - <<EOF
+{"deployment_branch_policy":{"protected_branches":true,"custom_branch_policies":false}}
+EOF
+done
+for v in GCP_PROJECT_ID GCP_REGION WIF_PROVIDER; do
+  gh variable set "$v" --env production-build -R "$R" --body "${!v}"
+  gh variable set "$v" --env production-hosting -R "$R" --body "${!v}"; done
+gh variable set BUILDER_SA --env production-build -R "$R" --body "$BUILDER_SA"
+gh variable set FIREBASE_WEB_API_KEY --env production-build -R "$R" --body "$FIREBASE_WEB_API_KEY"   # web build (no creds)
+gh variable set FIREBASE_APP_ID --env production-build -R "$R" --body "$FIREBASE_APP_ID"
+gh variable set HOSTING_SA --env production-hosting -R "$R" --body "$HOSTING_SA"
+# 2) variables of "production" (NOT secrets — none of these is sensitive). Run the lines printed by bootstrap 'outputs', i.e.:
 source ~/.aijalon-deploy/aijalon-trade-prod/outputs.env
 source ~/.aijalon-deploy/aijalon-trade-prod/firebase.env
 for v in GCP_PROJECT_ID GCP_REGION WIF_PROVIDER DEPLOYER_SA DB_PRIVATE_IP FIREBASE_WEB_API_KEY FIREBASE_APP_ID; do
@@ -254,8 +282,10 @@ gh variable set PAYOUTS_ENABLED --env production -R "$R" --body false
 gh variable set KYC_PROVIDER --env production -R "$R" --body manual
 # optional (defaults in infra/gcp/deploy.sh; full list §5.3): STRIPE_API_VERSION, STRIPE_FEE_ESTIMATE_BPS,
 # STRIPE_FEE_ESTIMATE_FIXED_USD, STRIPE_MAX_TOPUP_USD, KYC_LEVEL_NAME. No MAX_* caps (owner: no caps).
-# ALLOWLIST_EMAILS / OPS_EMAILS are secrets (§5), not variables.
+# ALLOWLIST_EMAILS / OPS_EMAILS / ADMIN_EMAILS are secrets (§5), not variables.
 gh variable set SMOKE_SKIP_PUBLIC --env production -R "$R" --body true   # until DNS + certs work (step 8); then delete
+gh variable set SMOKE_SKIP_PUBLIC --env production-hosting -R "$R" --body true   # (web smoke) — delete with the one above
+# preflight REFUSES SMOKE_SKIP_PUBLIC=true once LAUNCH_PHASE=public; the executor canary selftest is never skipped
 # 3) branch protection on main: PR required, CI checks required, no force-push/deletion, linear history
 gh api -X PUT repos/$R/branches/main/protection --input - <<'EOF'
 {"required_status_checks":{"strict":true,"contexts":["pinning, CSP, script syntax","gitleaks (full history)",
@@ -292,7 +322,8 @@ With one human, `required_approving_review_count: 1` blocks self-merges; either 
    `GOOGLE_OAUTH_CLIENT_ID=… GOOGLE_OAUTH_CLIENT_SECRET=… ./infra/gcp/firebase_auth.sh google` (read the secret with `read -rs`).
 3. **Apple provider** (HUMAN, Apple Developer): Certificates, IDs & Profiles → Identifiers → an App ID with "Sign in with Apple" → a **Services ID** (e.g. `trade.aijalon.web`) with Sign in with Apple configured for domain `aijalon.trade` and return URL `https://aijalon.trade/__/auth/handler` → Keys → a key with Sign in with Apple (download the `.p8` once; note the Key ID) → note the Team ID. Then Firebase console → Sign-in method → Apple (Services ID, Team ID, Key ID, private key), or
    `APPLE_SERVICES_ID=… APPLE_TEAM_ID=… APPLE_KEY_ID=… APPLE_PRIVATE_KEY_FILE=AuthKey_XXXX.p8 ./infra/gcp/firebase_auth.sh apple`, then store the `.p8` offline (password manager) and delete the file.
-4. `authDomain` is `aijalon.trade` (web/public/app-config.json): Firebase Hosting serves `/__/auth/*` on our domain, which avoids third-party-storage problems in Safari/Chrome. The hosting headers exclude `/__/*` from our CSP/X-Frame-Options so the auth iframe keeps working.
+3b. **API key + domains (REVIEW_WEB_INFRA L5):** `./infra/gcp/firebase_auth.sh apikey` restricts the public Web API key to the referrer `https://aijalon.trade/*` and to the Identity Toolkit + Secure Token APIs. After G9 passes, re-run `AUTH_DROP_FIREBASEAPP_DOMAIN=1 make auth-config` (authorised domains = `aijalon.trade` only) and repeat the G9 sign-in tests; if redirect sign-in breaks, re-run without it. The SPA itself refuses to run on `<project>.web.app` / `.firebaseapp.com` and redirects to `https://aijalon.trade`.
+4. `authDomain` is `aijalon.trade` (web/public/app-config.json): Firebase Hosting serves `/__/auth/*` on our domain, which avoids third-party-storage problems in Safari/Chrome. The hosting headers exclude only `/__/auth/*` (Firebase's handler and auth iframe) from our CSP/X-Frame-Options; every other path — including `/__x`-style paths the old regex missed (REVIEW_WEB_INFRA M1) — carries them.
 
 ## 8. Cloudflare and custom domains
 
@@ -313,6 +344,8 @@ With one human, `required_approving_review_count: 1` blocks self-merges; either 
    `EMAIL_DNS_RECORDS=$'TXT|resend._domainkey.aijalon.trade|p=MIGf...\nMX|send.aijalon.trade|10 feedback-smtp.<region>.amazonses.com\nTXT|send.aijalon.trade|v=spf1 include:amazonses.com ~all'`
    The apex keeps `v=spf1 -all`; DMARC `p=reject; adkim=s; aspf=r` passes through Resend's aligned DKIM. API key → `EMAIL_PROVIDER_API_KEY` (§5.2).
 7. Telegram webhook: Cloudflare only admits `/v1/webhooks/telegram` from Telegram's published ranges (149.154.160.0/20, 91.108.4.0/22 — re-check https://core.telegram.org/bots/webhooks) and exempts it from geo-blocking and the per-IP rate limit. Registration: §10.1.
+8. **Authenticated Origin Pulls (REVIEW_WEB_INFRA M3, gate G19):** after `./infra/gcp/bootstrap.sh aop` created the zone client CA/certificate: `AOP=1 make dns` (uploads OUR client certificate to the zone — not Cloudflare's shared AOP CA, which any Cloudflare customer could present — and enables zone AOP), check `https://api.aijalon.trade/healthz`, then `AOP_ATTACH=1 ./infra/gcp/bootstrap.sh aop` (the LB now rejects TLS clients without that certificate). The `X-Edge-Auth` header stays as defence in depth.
+9. **DNSSEC / CT (L13):** `make dns` prints the DS record Cloudflare wants and warns while the registrar does not publish it (**HUMAN:** add it at the registrar). Subscribe the ops mailbox to a Certificate Transparency monitor for `aijalon.trade` (Cert Spotter or crt.sh RSS); any certificate not issued by Let's Encrypt (Firebase), Google Trust Services (LB) or Cloudflare is an incident. Consider CAA `accounturi` once the ACME account ids are known.
 
 Why the API is not on a Cloud Run domain mapping or a Cloudflare Worker: see ARCHITECTURE §4.
 
@@ -327,9 +360,9 @@ make db-bootstrap        # = ./infra/gcp/db_bootstrap.sh  (asks before adding th
 3. `sql/00_pre_migrate.sql`: extensions (pgcrypto, pgaudit), `REVOKE ALL ON DATABASE … FROM PUBLIC`, UTC, and the PG16 fix that lets a non-superuser migrator own the schema (`createrole_self_grant`, pre-created `app_migrator` with CREATE on `public`) — without it `0002_roles.sql` fails on Cloud SQL, where no user is a superuser;
 4. `python backend/scripts/migrate.py` (psycopg if installed, else the `psql` CLI);
 5. `sql/10_grants.sql`: `GRANT app_api` / `app_executor` to the IAM users (per-login timeouts are also passed in `DATABASE_URL`);
-6. `sql/20_verify.sql`: **fails** unless api cannot read `agent_keys.key_ciphertext`, neither login can UPDATE/DELETE/TRUNCATE ledger, audit or consents, neither can CREATE in `public`, and neither is superuser/CREATEROLE/CREATEDB/BYPASSRLS.
+6. `sql/20_verify.sql`: **fails** unless api cannot read `agent_keys.key_ciphertext` or `strategy_versions.code_ciphertext`, api cannot write agent attestations, neither runtime login is a member of `cloudsqlsuperuser` / `app_migrator` / `pg_read_all_data` / `pg_write_all_data` / the server-file roles (REVIEW_WEB_INFRA L7), neither login can UPDATE/DELETE/TRUNCATE ledger, audit or consents, neither can CREATE in `public`, and neither is superuser/CREATEROLE/CREATEDB/BYPASSRLS.
 
-Later migrations run automatically in every deploy (Cloud Run Job `migrate`, before traffic moves). The same fix/grant/verify SQL runs in CI against Postgres 16 as a non-superuser, so a migration that breaks the privilege model fails the PR.
+Later migrations run automatically in every deploy (Cloud Run Job `migrate`, before traffic moves; it verifies the server certificate against `CLOUDSQL_SERVER_CA` — bootstrap `sqlca` — with `sslmode=verify-ca`, or `verify-full` when the GitHub variable `DB_TLS_HOST` holds the instance DNS name and that name resolves in the VPC). The same fix/grant/verify SQL runs in CI against Postgres 16 as a non-superuser, so a migration that breaks the privilege model fails the PR.
 
 ## 10. First deploy
 
@@ -338,7 +371,11 @@ git checkout main && git pull   # the lock/pin PR from step 3 merged
 make deploy                     # gh workflow run deploy.yml --ref main  (or merge any PR to main)
 ```
 
-**HUMAN:** open the run in GitHub → "Review deployments" → approve `production`. The job: preflight (locks, digests, CSP, variables) → WIF auth → build + push images (by digest) → **migrate job** → sandbox → executor → api (`gcloud run services replace` with the rendered `infra/gcp/run/*.yaml`) → API smoke (health; `/v1/internal/*` blocked at the edge; `*.run.app` origins of api **and** executor not publicly reachable) → automatic rollback of api/executor on failure → web build with the production `app-config.json` → CSP of the build must equal `infra/csp.txt` and `firebase.json` → `firebase deploy --only hosting` (WIF credentials, no key) → web smoke (served CSP/HSTS, the new build id live, `app-config` project, Apple Pay file).
+**HUMAN:** open the run in GitHub → "Review deployments" → approve `production`. Jobs (REVIEW_WEB_INFRA H2 — each credentialed job impersonates one narrowly-scoped SA, and npm never runs next to credentials):
+1. `build-web` (environment `production-build`, **no** `id-token`): TypeScript + `web/build.mjs` with the production `app-config.json` (fails without `web/sri.json`; trust anchors must be the committed ones) → CSP of the build == `infra/csp.txt` == `firebase.json` → header emulation test → artifact `web-dist`.
+2. `build-images` (`production-build`, builder SA): build + push images by digest → **Binary Authorization attestation** (builder-only KMS key) → artifact `deploy-state` (+ image package inventory).
+3. `deploy-run` (`production`, **approval**, deployer SA): preflight (locks, digests, CSP, SRI, trust anchors, smoke policy) → **migrate job** (verified TLS) → sandbox → **executor canary**: `tick` paused (only if it was running), new revision at 0 % under the `candidate` tag, the paused Scheduler job `executor-selftest` calls `/v1/internal/selftest` on the candidate (OIDC; DB, flags, signals, due subscriptions, Hyperliquid, one KMS agent-key open, the attestation key — **no order**), pass → 100 %, fail → traffic untouched + deploy fails; `tick` restored → api → API smoke (health; `/v1/internal/*` blocked at the edge; `*.run.app` origins of api/executor and the candidate tag URL not publicly reachable) → automatic rollback of api/executor/sandbox on failure.
+4. `deploy-hosting` (`production-hosting`, hosting SA, **access token only**): `infra/hosting/deploy_hosting.py` (Firebase Hosting REST API, stdlib Python — no firebase-tools) → web smoke (served CSP/XFO/Reporting-Endpoints on `/`, `/__x`, `/__`, `/_x`, `/s/x`, `/index.html`, HSTS, the new build id live, `app-config` project, Apple Pay file).
 
 If the build's CSP changed (e.g. new Firebase SDK hash, new origin), the deploy stops at the CSP step: run `make csp-sync`, review `git diff infra/csp.txt firebase.json`, commit through a PR.
 
@@ -381,6 +418,8 @@ unset TOKEN SECRET
 2. The builder address needs **≥ 100 USDC perps account value** on Hyperliquid before users can approve its builder fee (SPEC §6): deposit USDC to Hyperliquid from the builder wallet and keep it in the perps account.
 3. Record both addresses (lower-case) in `BUILDER_ADDRESS` / `TREASURY_ADDRESS` (step 5) with a second person verifying on the device screen. No private key ever touches a server; payouts are signed in the admin's browser with the hardware wallet after maker-checker approval.
 4. Evaluate Hyperliquid native multi-sig for the treasury [VERIFY current Hyperliquid docs] and record the decision.
+5. **Pin the signing trust anchors (REVIEW_WEB_INFRA H1)** — the web app signs NOTHING (agent, builder fee, deposit, payout) until this is done. In one PR (reviewed by a second person reading the addresses off the device screens), set in `web/public/app-config.json` → `trust`: `builderAddress`, `treasuryAddress` (the same values as the two secrets above), `agentAttestPublicKeySpki` (= `AGENT_ATTEST_PUBLIC_KEY_SPKI` from `~/.aijalon-deploy/<project>/outputs.env`, written by bootstrap `outputs`; base64 DER SPKI of `agent-attest` version `KMS_ATTEST_KEY_VERSION`), keep `hlChain: "Mainnet"`, `agentName: "aijalon"`, `maxBuilderFeeTenthsBp: 100`, `kycRedirectHosts: ["in.sumsub.com"]` (only the KYC provider's own host). The browser refuses to sign whenever `/v1/public/config` disagrees with these values. Changing any of them later = the same reviewed PR (a new attestation key version also needs `KMS_ATTEST_KEY_VERSION` in `infra/gcp/env.sh`, redeploy, and every existing agent keeps its old attestation → re-attest by clearing `attestation_*` in a migration).
+6. Resume `attest-agents` right after the first deploy (like `candles-sync`, §10.1): `gcloud scheduler jobs resume attest-agents --location=asia-southeast1`. Without it the subscribe wizard waits forever for the attestation. `agent-substitution-scan` may be resumed early too (read-only).
 
 **Signals keypair and the terminal** (`integrations/terminal/README.md` has the full procedure):
 1. In a clean checkout of `joztern755/terminal.aijalon`: `…/quantscriptmarket/integrations/terminal/install.sh .` (copies `market_signals/`, applies `build-deploy.patch`: one new step `node market_signals/emit.js --terminal . --out-dir public` before the Hosting deploy, and no-cache headers for `/signals.json` + `/signals.sig`).
@@ -414,6 +453,10 @@ Business, legal and security gates are in `docs/GO_LIVE_CHECKLIST.md` (Gate A/B/
 - **G12** GitHub: production environment reviewers set; branch protection on; "require SHA-pinned actions" on.
 - **G13** Cloudflare Pro (managed WAF) — required for Gate C (public), optional for Gate B (internal).
 - **G14** HSTS preload submitted (Gate C only).
+- **G17** (REVIEW_WEB_INFRA H1) `web/public/app-config.json` trust anchors pinned (no `REPLACE_ME`; deploy preflight refuses `LAUNCH_PHASE=public` otherwise); a test user completed agent approval (attestation verified), builder approval and a USDC deposit on mainnet; `attest-agents` and `agent-substitution-scan` running; an admin payout dry-run showed "Wallet proof OK".
+- **G18** (M2) `web/sri.json` committed and `make sri-check` clean; served CSP has the version-pinned gstatic path and `require-trusted-types-for 'script'`; no CSP-violation alert after a full manual click-through (sign-in with Google and Apple popups, Stripe test payment incl. 3-D Secure, wallet flows) — if Stripe/gapi need more, widen the policy through a reviewed `make csp-sync`.
+- **G19** (M3) Authenticated Origin Pulls attached (`AOP=1 make dns`, then `AOP_ATTACH=1 ./infra/gcp/bootstrap.sh aop`): `curl https://<LB IP>/healthz -k -H 'Host: api.aijalon.trade'` now fails the TLS handshake; `https://api.aijalon.trade/healthz` still OK. Required for Gate C.
+- **G20** (H2) Three GitHub environments configured; bootstrap `sa`/`wif` re-run (legacy deployer grants removed); `BINAUTHZ_ENFORCE=1` after one clean dry-run deploy (Gate C); DNSSEC DS published at the registrar (`make dns` warns otherwise) and a CT monitor (e.g. Cert Spotter / crt.sh alert on `aijalon.trade`) sending to the ops mailbox.
 
 Then (HUMAN decision):
 
@@ -440,6 +483,9 @@ make go-live      # resumes every Cloud Scheduler job (SCHEDULER_SPEC in infra/g
 | `referral-tiers` | 01:15 | `referral-tiers` | 900 s / 3 | after settlement on purpose: the next settlement uses the new tier |
 | `verify-chain` | 03:40 | `verify-chain` | 900 s / 3 | verifies every hash chain + running balances + earlier anchors, then anchors today's heads (DB + ops Telegram/email) — REVIEW_MONEY M7 |
 | `agent-expiry-scan` | 00:13, 06:13, 12:13, 18:13 | `agent-expiry-scan` | 300 s / 1 | `extraAgents` → expiring (14/7/3/1 d) / expired / revoked alerts |
+| `attest-agents` | every minute | `attest-agents` | 120 s / 0 | executor opens each new sealed agent key, checks it derives the stored address, KMS-signs `aijalon-agent-v1\|user\|agent` (REVIEW_WEB_INFRA H1). A key that does not open → `attestation_failed_at` + CRITICAL ops alert. **Resume early** (§12 step 6) |
+| `agent-substitution-scan` | :03, :13, … :53 | `agent-substitution-scan` | 300 s / 0 | `extraAgents` of every live account: a foreign agent named `aijalon…` → CRITICAL ops alert + the user's mandatory `agent_revoked` alert |
+| `executor-selftest` (probe) | never (PAUSED) | `selftest` on the `candidate---` tag URL | 300 s / 0 | run only by `deploy.sh services` during an executor rollout; not in `SCHEDULER_SPEC`, never resumed by `make go-live` |
 
 Data jobs stop themselves after 240 s and resume from `job_cursors`, so a deadline miss only delays work. Every job is idempotent; overlapping runs are safe. Run one by hand: `gcloud scheduler jobs run <job> --location=asia-southeast1` [VERIFY that a PAUSED job runs this way; if not: `resume` → `run` → `pause`].
 
@@ -451,9 +497,12 @@ Emergency stop of all scheduled work: `make pause-all` (the app's kill switches 
 |---|---|
 | Deploy | merge to `main` → approve `production` |
 | Change a secret | `add_secret NAME` (step 5) → redeploy; disable the old version after the new revision is healthy: `gcloud secrets versions disable <n> --secret NAME` |
-| Rotate `EDGE_AUTH_SECRET` | low-traffic window: add new version → `./infra/gcp/bootstrap.sh lb` (Cloud Armor) → `make dns` (Cloudflare) → redeploy api. Requests fail with 403 between the Cloudflare update and the new api revision (seconds–minutes); for zero-downtime, have the app accept a comma-separated old,new list first |
+| Rotate `EDGE_AUTH_SECRET` | low-traffic window: add new version → `./infra/gcp/bootstrap.sh lb` (Cloud Armor, REST — the value never appears in argv) → `make dns` (Cloudflare) → redeploy api. Requests fail with 403 between the Cloudflare update and the new api revision (seconds–minutes); for zero-downtime, have the app accept a comma-separated old,new list first. With AOP attached the header is defence in depth |
+| Rotate the AOP client certificate | `AOP_ROTATE=1 ./infra/gcp/bootstrap.sh aop` (new client cert, same CA) → `AOP=1 make dns` (uploads it; Cloudflare switches) → delete the old zone certificate in the dashboard. New CA = add it to the TrustConfig first (two anchors), then switch |
+| Rotate the agent-attestation key | `gcloud kms keys versions create --key=agent-attest …` → bump `KMS_ATTEST_KEY_VERSION` in `env.sh` and `trust.agentAttestPublicKeySpki` in `app-config.json` in ONE reviewed PR → deploy; clear `agent_keys.attestation_*` of live agents in a migration so the job re-attests them |
+| Binary Authorization breakglass | only for an outage with a broken builder: deploy with the `run.googleapis.com/binauthz-breakglass` annotation (alerts CRITICAL), then fix the builder and redeploy normally |
 | Rotate `TELEGRAM_WEBHOOK_SECRET` | add version → `setWebhook` with the new value (§10.1) → redeploy api immediately (updates are refused between the two steps; Telegram retries them) |
-| Change the allowlist / ops recipients | `add_secret ALLOWLIST_EMAILS` / `add_secret OPS_EMAILS` → redeploy (api + executor read them at revision start) |
+| Change the allowlist / ops recipients / admins | `add_secret ALLOWLIST_EMAILS` / `add_secret OPS_EMAILS` / `add_secret ADMIN_EMAILS` (api only) → redeploy (api + executor read them at revision start) |
 | Rotate `DB_MIGRATOR_PASSWORD` | add version → `./infra/gcp/db_bootstrap.sh users` (sets it on the DB) — the next migrate job uses it |
 | KMS `agent-keys` | rotates automatically every 90 days; old versions stay enabled for decrypt; never destroy a version while any `agent_keys.kms_key_version` references it |
 | Cloudflare IP ranges change | `./infra/gcp/bootstrap.sh lb` (re-reads https://api.cloudflare.com/client/v4/ips) |
@@ -472,9 +521,14 @@ The authoring environment had no access to Google Cloud, Cloudflare, PyPI or Doc
 | Direct VPC egress with the gen1 (gVisor) sandbox | `services replace` rejects the sandbox spec | `SANDBOX_EGRESS_MODE=connector ./infra/gcp/bootstrap.sh network` then deploy (connector inside the isolated VPC, same deny-all firewall) |
 | IAM conditions on `roles/cloudsql.client` / `instanceUser` | proxy sidecar logs 403 | `SQL_IAM_CONDITIONS=0 ./infra/gcp/bootstrap.sh sa` |
 | `gcloud run services replace` with sidecars / Direct VPC annotations needing `launch-stage: BETA` | replace error mentions launch stage | add `run.googleapis.com/launch-stage: BETA` under `metadata.annotations` of the template |
-| firebase-tools with WIF `external_account` credentials | Hosting deploy auth error | upgrade firebase-tools; or deploy Hosting through the Firebase Hosting REST API (`sites.versions` / `releases`) with the WIF access token (`token_format: access_token` in the auth step). Never fall back to a JSON key |
-| `firebase.viewer` needed by `firebase deploy` | permission error on project get | keep it; otherwise remove it from bootstrap `sa` step |
-| Firebase applies custom headers to `/__/auth/*` | irrelevant — our document headers are scoped by the regex `^/([^_].*|_([^_].*)?)?$`, which excludes `/__/` | — |
+| Hosting REST deploy (`infra/hosting/deploy_hosting.py`: versions.create → populateFiles → upload → finalize → releases.create) | `deploy-hosting` fails with an HTTP error naming the call | the script prints the API message; fix the payload (tested only against a fake server). Emergency fallback: the owner deploys locally with `firebase deploy --only hosting` (never from CI with credentials) |
+| IAM conditions on the custom Run / Scheduler roles (`resource.type in [...]`, `resource.name` of services, jobs and scheduler jobs) | bootstrap `sa` refuses the condition, or the deploy gets 403 on `services replace` / `jobs execute` / `scheduler jobs pause` | `DEPLOYER_RUN_CONDITIONS=0` / `DEPLOYER_SCHED_CONDITIONS=0 ./infra/gcp/bootstrap.sh sa` (custom roles still exclude create/delete/IAM/overrides) |
+| Cloud Scheduler `run` on a PAUSED job; OIDC audience = tag URL accepted by Cloud Run for `candidate---` | executor canary times out | the deploy resumes → runs → pauses the probe job already; if the audience is refused set `SELFTEST` job audience to the service URL (the executor accepts both) |
+| Trusted Types + Firebase (gapi) / Stripe.js | CSP-violation alert, sign-in popup or Payment Element broken | the default policy passes HTML through and only restricts script URLs / eval; widen `PREFIXES` in `web/public/boot-guard.js` or the CSP through a reviewed change |
+| gapi script paths `https://apis.google.com/js/` + `/_/scs/` | Google sign-in popup fails (CSP report `script-src-elem` for another apis.google.com path) | add that path (never the whole host without review) via `web/build.mjs` + `make csp-sync` |
+| Certificate Manager TrustConfig / ServerTlsPolicy YAML (`bootstrap aop`) and Cloudflare zone-level AOP API | `aop` step or `AOP=1 make dns` fails | configure the same in the consoles (Certificate Manager → Trust configs; Network Security → Server TLS policies; Cloudflare → SSL/TLS → Origin Server → Authenticated Origin Pulls, zone-level certificate) |
+| Binary Authorization audit-log shapes for Cloud Run dry-run violations | "SEC: Binary Authorization violation" never / always fires | adjust the filter in `infra/gcp/monitoring.py` after the first dry-run deploy |
+| Firebase applies custom headers to `/__/auth/*` | irrelevant — our document headers are scoped by a regex that excludes exactly `/__/auth/` (emulated in `web/tests/headers.test.mjs`) | — |
 | Cloudflare managed ruleset ids (Pro) | PUT error | select "Cloudflare Managed Ruleset" / "OWASP Core Ruleset" in the dashboard and copy their ids into `dns.sh` |
 | Apple provider REST payload shape | 400 from `firebase_auth.sh apple` | use the Firebase console |
 | Python package versions (`# verify`) | `make lock` resolution error | nearest release |

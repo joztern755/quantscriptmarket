@@ -1,0 +1,22 @@
+# CODEOWNERS (REVIEW_WEB_INFRA L10). Branch protection requires a code-owner review once a second reviewer exists
+# ("require_code_owner_reviews": true in docs/DEPLOY.md §6). Until then the production environment approval is the
+# human gate. Paths below are the ones where a malicious or careless change moves money or keys.
+*                                   @joztern755
+
+# signing trust anchors pinned for the browser (builder / treasury / agent attestation key) — change = key ceremony
+/web/public/app-config.json         @joztern755
+/web/sri.json                       @joztern755
+/web/src/core/                      @joztern755
+/firebase.json                      @joztern755
+/infra/                             @joztern755
+/.github/                           @joztern755
+/backend/migrations/                @joztern755
+/backend/app/security/              @joztern755
+/backend/app/execution/             @joztern755
+/backend/app/hl/                    @joztern755
+/backend/app/payments/              @joztern755
+/backend/app/ledger/                @joztern755
+/backend/requirements*.txt          @joztern755
+/backend/requirements*.lock         @joztern755
+/backend/Dockerfile                 @joztern755
+/sandbox/                           @joztern755
