@@ -50,6 +50,7 @@ jobs:
       LAUNCH_PHASE: ${{ vars.LAUNCH_PHASE || 'internal' }}
       ALLOWLIST_EMAILS: ${{ vars.ALLOWLIST_EMAILS || 'app.aijalon@gmail.com' }}
       PAYOUTS_ENABLED: ${{ vars.PAYOUTS_ENABLED || 'false' }}
+      STRIPE_PUBLISHABLE_KEY: ${{ vars.STRIPE_PUBLISHABLE_KEY }}
       GIT_SHA: ${{ github.sha }}
       TYPESCRIPT_VERSION: "6.0.2"
       FIREBASE_TOOLS_VERSION: "15.32.0"
@@ -61,7 +62,7 @@ jobs:
       - name: Required GitHub environment variables
         run: |
           set -e
-          for v in GCP_PROJECT_ID GCP_REGION WIF_PROVIDER DEPLOYER_SA DB_PRIVATE_IP FIREBASE_WEB_API_KEY FIREBASE_APP_ID; do
+          for v in GCP_PROJECT_ID GCP_REGION WIF_PROVIDER DEPLOYER_SA DB_PRIVATE_IP FIREBASE_WEB_API_KEY FIREBASE_APP_ID STRIPE_PUBLISHABLE_KEY; do
             eval "val=\${VARS_$v:-}"
             [ -n "$val" ] || { echo "::error::GitHub environment variable $v is not set (docs/DEPLOY.md §6)"; exit 1; }
           done
@@ -73,6 +74,7 @@ jobs:
           VARS_DB_PRIVATE_IP: ${{ vars.DB_PRIVATE_IP }}
           VARS_FIREBASE_WEB_API_KEY: ${{ vars.FIREBASE_WEB_API_KEY }}
           VARS_FIREBASE_APP_ID: ${{ vars.FIREBASE_APP_ID }}
+          VARS_STRIPE_PUBLISHABLE_KEY: ${{ vars.STRIPE_PUBLISHABLE_KEY }}
 
       - name: Preflight (lock files, image digests, CSP)
         run: ./infra/gcp/deploy.sh preflight

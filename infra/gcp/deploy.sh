@@ -43,7 +43,7 @@ export_render_env() {
   export PROJECT_ID REGION GIT_SHA_SHORT VPC RUN_SUBNET RUN_NET_TAG SANDBOX_VPC SANDBOX_SUBNET SANDBOX_NET_TAG \
     SANDBOX_EXEC_ENV SANDBOX_CONNECTOR SA_API SA_EXECUTOR SA_SANDBOX SA_SCHEDULER SA_MIGRATOR KMS_KEY_NAME DB_NAME \
     WEB_DOMAIN API_DOMAIN SQL_CONNECTION_NAME CLOUDSQL_PROXY_IMAGE DB_MIGRATOR_USER MIGRATE_CMD \
-    LAUNCH_PHASE ALLOWLIST_EMAILS PAYOUTS_ENABLED
+    LAUNCH_PHASE ALLOWLIST_EMAILS PAYOUTS_ENABLED STRIPE_PUBLISHABLE_KEY
   DB_IAM_USER_API_URLENC="$(urlenc_at "${DB_IAM_USER_API}")"
   DB_IAM_USER_EXECUTOR_URLENC="$(urlenc_at "${DB_IAM_USER_EXECUTOR}")"
   BACKEND_IMAGE="$(state_get BACKEND_IMAGE)"
@@ -63,6 +63,7 @@ cmd_preflight() {
     warn "image digests not pinned (PIN_ME) in backend/Dockerfile or infra/gcp/env.sh (make pin)"; bad=1
   fi
   [[ -n "${DB_PRIVATE_IP:-}" ]] || { warn "DB_PRIVATE_IP (GitHub variable) is empty"; bad=1; }
+  [[ "${STRIPE_PUBLISHABLE_KEY:-}" =~ ^pk_(live|test)_ ]] || { warn "STRIPE_PUBLISHABLE_KEY (GitHub variable) missing"; bad=1; }
   python3 "${REPO_ROOT}/infra/csp_sync.py" check >/dev/null || { warn "firebase.json CSP != infra/csp.txt"; bad=1; }
   ((bad == 0)) || die "preflight failed"
   log "preflight ok"

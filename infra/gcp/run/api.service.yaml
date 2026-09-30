@@ -56,6 +56,7 @@ spec:
             - {name: HL_IS_MAINNET, value: "true"}
             - {name: AGENT_NAME, value: aijalon}
             - {name: SANDBOX_URL, value: "${SANDBOX_URL}"}
+            - {name: STRIPE_PUBLISHABLE_KEY, value: "${STRIPE_PUBLISHABLE_KEY}"}   # public by design (Stripe.js)
             - {name: FEATURE_CREATOR_UPLOADS, value: "true"}
             - {name: IN_HOUSE_LISTED, value: silver}
             # launch guard rails (app/api/deps.py LaunchConfig): internal phase = allow-listed users only

@@ -213,10 +213,10 @@ class AgentKeyPort(Protocol):
 
 
 class TypedDataPort(Protocol):
-    """Each returns {"typed_data": <EIP-712 for eth_signTypedData_v4>, "action": <exact /exchange action>}."""
+    """Each returns {"typed_data": <EIP-712 for eth_signTypedData_v4>, "action": <exact /exchange action>, "nonce"}."""
     def approve_agent(self, *, agent_address: str, agent_name: str, nonce: int,
                       signature_chain_id: str) -> dict[str, Any]: ...
-    def approve_builder_fee(self, *, builder: str, max_fee_rate: str, nonce: int,
+    def approve_builder_fee(self, *, builder: str, max_fee_tenths_bp: int, nonce: int,
                             signature_chain_id: str) -> dict[str, Any]: ...
     def usd_send(self, *, destination: str, amount: str, time_ms: int,
                  signature_chain_id: str) -> dict[str, Any]: ...
@@ -225,10 +225,10 @@ class TypedDataPort(Protocol):
 class HlInfoPort(Protocol):
     def extra_agents(self, user: str) -> list[dict[str, Any]]: ...
     def max_builder_fee(self, user: str, builder: str) -> int: ...  # tenths of a bp
-    def clearinghouse_state(self, user: str) -> dict[str, Any]: ...
-    def sub_accounts(self, user: str) -> list[str]: ...
+    def clearinghouse_state(self, user: str, dex: str = "") -> dict[str, Any]: ...
+    def master_of(self, address: str) -> Optional[str]: ...        # master of a sub-account, else None
     def find_usd_send(self, *, sender: str, destination: str, amount_micro: int, tx_hash: str) -> bool: ...
-    def known_coins(self) -> set[str]: ...
+    def unknown_coins(self, coins: list[str]) -> list[str]: ...
 
 
 class StripePort(Protocol):
@@ -240,7 +240,7 @@ class StripePort(Protocol):
 class UsdcPort(Protocol):
     def build_topup(self, *, master_address: str, amount_micro: int, signature_chain_id: str,
                     time_ms: int) -> dict[str, Any]: ...                       # {typed_data, action, nonce, ...}
-    def detect(self, *, sender: str, since_ms: Optional[int]) -> list[Any]: ...  # on-chain transfers to treasury
+    def detect(self, *, senders: list[str], since_ms: Optional[int]) -> list[Any]: ...  # treasury inflows
     def credit_from_detection(self, detection: Any,
                               user_for_address: Callable[[str], Optional[str]]) -> Any: ...  # usdc.UsdcOutcome
 
