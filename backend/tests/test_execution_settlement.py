@@ -3,6 +3,7 @@ builder-fee revenue recognition. Uses the real domain adapters from app.executio
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -20,7 +21,7 @@ from test_execution_fakes import (  # noqa: E402
     usd,
 )
 
-from app.execution.ports import BuilderFeeFill, LedgerLine, PlanAccount, SettlementSubscription  # noqa: E402
+from app.execution.ports import BuilderFeeFill, DataCoverage, LedgerLine, PlanAccount, SettlementSubscription  # noqa: E402
 from app.execution.settlement import Settlement, profit_share_key  # noqa: E402
 from app.execution.wiring import DomainBilling, DomainFees, DomainProfitShare  # noqa: E402
 
@@ -34,7 +35,7 @@ def sub(**kw) -> SettlementSubscription:
     base = dict(id="sub1", user_id="user1", strategy_id="s1", creator_user_id="creator1", in_house=False,
                 status="active", profit_share_bps=1000, price_monthly_micro=0, cum_pnl_micro=0, hwm_micro=0,
                 pnl_cursor=None, current_period_end=datetime(2026, 11, 1, 12, 0, tzinfo=UTC), past_due_since=None,
-                created_at=CREATED)
+                created_at=CREATED, trading_address="0x" + "ab" * 20)
     base.update(kw)
     return SettlementSubscription(**base)
 
@@ -255,6 +256,124 @@ class UserEventsTest(unittest.TestCase):
         e.repo.add_pnl("sub1", datetime(2026, 10, 1, 12, tzinfo=UTC), usd(1000))
         r = e.run(NOW)
         self.assertEqual((r.errors, r.profit_share_charged_micro), ([], usd(115)))
+
+
+class DataCoverageGuardTest(unittest.TestCase):
+    """settle-daily must not settle a (subscription, day) before fills-ingest AND funding-scan have synced the
+    subscription's trading address past the cut-off (+ margin): deferred → no ledger post, no cursor move, no renewal,
+    one ``settlement_deferred`` ops event per date; the next run (retry slot) settles it."""
+
+    ADDR = "0x" + "ab" * 20
+    CUT = datetime(2026, 10, 2, tzinfo=UTC)
+
+    def ms(self, dt: datetime) -> int:
+        return int(dt.timestamp() * 1000)
+
+    def env(self, events=True):
+        from app.execution.ports import DataCoverage
+
+        e = Env(events=FakeEvents() if events else None)
+        e.repo.coverage_default = None                                   # nothing synced unless a test says so
+        e.cov = lambda fills, funding: e.repo.coverage.__setitem__(
+            self.ADDR, DataCoverage(fills_ms=None if fills is None else self.ms(fills),
+                                    funding_ms=None if funding is None else self.ms(funding)))
+        e.repo.subs["sub1"] = sub(price_monthly_micro=usd(10), current_period_end=datetime(2026, 10, 1, 12, tzinfo=UTC))
+        e.ledger.top_up("user1", usd(500))
+        e.repo.add_pnl("sub1", datetime(2026, 10, 1, 12, tzinfo=UTC), usd(1000))
+        return e
+
+    def test_fills_behind_defers_everything_then_retry_settles(self):
+        e = self.env()
+        e.cov(self.CUT - timedelta(minutes=5), self.CUT + timedelta(minutes=7))
+        before = dict(e.ledger.balances)
+        r = e.run(NOW)
+        self.assertEqual((r.profit_share_deferred, r.profit_share_settled, r.renewals_charged), (1, 0, 0))
+        self.assertEqual(r.deferred[0]["missing"], ["fills_ingest"])
+        self.assertEqual(r.deferred[0]["needed_until"], self.CUT.isoformat())
+        self.assertNotIn(profit_share_key("sub1", D1), e.ledger.txs)
+        self.assertFalse(any(k.startswith("sub:") for k in e.ledger.txs))      # renewal not charged on top
+        self.assertEqual(e.ledger.balances, before)
+        self.assertIsNone(e.repo.subs["sub1"].pnl_cursor)
+        self.assertEqual(e.repo.subs["sub1"].status, "active")
+        ev = e.events.of("settlement_deferred")
+        self.assertEqual(len(ev), 1)
+        self.assertIsNone(ev[0]["user_id"])                                 # ops event
+        self.assertEqual((ev[0]["severity"], ev[0]["payload"]["deferred"], ev[0]["payload"]["subscriptions"]),
+                         ("warn", 1, ["sub1"]))
+        self.assertIn(f"settlement_deferred:{D1.isoformat()}", e.events.events)
+        # 02:30 retry: still behind → still deferred, NO second event for the same date
+        r = e.run(NOW + timedelta(hours=2))
+        self.assertEqual(r.profit_share_deferred, 1)
+        self.assertEqual(len(e.events.of("settlement_deferred")), 1)
+        # fills-ingest caught up → 06:30 retry settles day + renewal exactly once
+        e.cov(self.CUT + timedelta(minutes=25), self.CUT + timedelta(minutes=7))
+        r = e.run(NOW + timedelta(hours=6))
+        self.assertEqual((r.profit_share_deferred, r.profit_share_settled, r.renewals_charged), (0, 1, 1))
+        self.assertIn(profit_share_key("sub1", D1), e.ledger.txs)
+        self.assertEqual(e.repo.subs["sub1"].pnl_cursor, self.CUT)
+        self.assertEqual(r.errors, [])
+        e.assert_ledger_balanced(self)
+
+    def test_funding_behind_defers(self):
+        e = self.env()
+        e.cov(self.CUT + timedelta(minutes=25), self.CUT - timedelta(minutes=53))
+        r = e.run(NOW)
+        self.assertEqual([d["missing"] for d in r.deferred], [["funding_scan"]])
+        self.assertNotIn(profit_share_key("sub1", D1), e.ledger.txs)
+
+    def test_never_synced_or_no_address_defers(self):
+        e = self.env()
+        r = e.run(NOW)                                                     # no job_cursors row at all
+        self.assertEqual(r.deferred[0]["missing"], ["fills_ingest", "funding_scan"])
+        e2 = self.env()
+        e2.repo.coverage_default = DataCoverage(fills_ms=2**62, funding_ms=2**62)
+        e2.repo.subs["sub1"] = replace(e2.repo.subs["sub1"], trading_address=None)
+        r2 = e2.run(NOW)
+        self.assertEqual(r2.profit_share_deferred, 1)                      # fail closed
+
+    def test_margin_after_cutoff(self):
+        e = self.env()
+        e.cov(self.CUT, self.CUT)                                         # exactly at the cut-off: not enough
+        self.assertEqual(e.run(NOW).profit_share_deferred, 1)
+        e.cov(self.CUT + timedelta(minutes=2), self.CUT + timedelta(minutes=2))
+        self.assertEqual(e.run(NOW + timedelta(minutes=1)).profit_share_settled, 1)
+
+    def test_cancelled_needs_coverage_only_until_cancellation(self):
+        e = self.env()
+        cancelled = datetime(2026, 10, 1, 15, tzinfo=UTC)
+        e.repo.subs["sub1"] = replace(e.repo.subs["sub1"], status="cancelled", cancelled_at=cancelled)
+        e.cov(cancelled + timedelta(minutes=10), cancelled + timedelta(minutes=10))  # stopped being tracked later
+        r = e.run(NOW)
+        self.assertEqual((r.profit_share_deferred, r.profit_share_settled), (0, 1))
+
+    def test_created_after_cutoff_is_not_deferred(self):
+        e = self.env()
+        e.repo.subs["sub1"] = replace(e.repo.subs["sub1"], created_at=self.CUT + timedelta(minutes=20))
+        r = e.run(NOW)
+        self.assertEqual(r.profit_share_deferred, 0)
+
+    def test_without_event_sink_uses_alert_sink_with_date_dedup(self):
+        e = self.env(events=False)
+        e.cov(None, None)
+        e.run(NOW)
+        a = [x for x in e.alerts.items if x.kind == "settlement_deferred"]
+        self.assertEqual(len(a), 1)
+        self.assertEqual((a[0].severity, a[0].dedup_key), ("warn", f"settlement_deferred:{D1.isoformat()}"))
+
+    def test_coverage_read_failure_fails_closed(self):
+        e = self.env()
+
+        def boom(_addrs):
+            raise RuntimeError("db down")
+        e.repo.data_coverage = boom
+        r = e.run(NOW)
+        self.assertEqual(r.profit_share_deferred, 1)
+        self.assertIn("data_coverage:RuntimeError", r.errors)
+
+    def test_guard_can_be_disabled(self):
+        e = self.env()
+        e.s.require_data_coverage = False
+        self.assertEqual(e.run(NOW).profit_share_settled, 1)
 
 
 class RenewalStatusTest(unittest.TestCase):

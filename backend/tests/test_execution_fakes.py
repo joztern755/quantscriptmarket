@@ -18,6 +18,7 @@ from app.execution.ports import (  # noqa: E402
     AlertEvent,
     BarSignal,
     BuilderFeeFill,
+    DataCoverage,
     ExpectedPosition,
     Flags,
     LedgerLine,
@@ -420,6 +421,19 @@ class FakeSettlementRepo:
         self.fills: dict[str, BuilderFeeFill] = {}
         self.recognised: dict[tuple[str, str], str] = {}   # (trading_address, tid) -> ledger tx id
         self.plans: dict[str, PlanAccount] = {}
+        # data-jobs coverage per trading address (settlement guard); default: fully synced far into the future
+        self.coverage: dict[str, DataCoverage] = {}
+        self.coverage_default: DataCoverage | None = DataCoverage(fills_ms=2**62, funding_ms=2**62)
+        self.coverage_calls = 0
+
+    def data_coverage(self, trading_addresses: Sequence[str]) -> dict[str, DataCoverage]:
+        self.coverage_calls += 1
+        out = {}
+        for a in trading_addresses:
+            c = self.coverage.get(a, self.coverage_default)
+            if c is not None:
+                out[a] = c
+        return out
 
     def add_pnl(self, sub_id: str, when: datetime, micro: int) -> None:
         self.pnl.setdefault(sub_id, []).append((when, micro))

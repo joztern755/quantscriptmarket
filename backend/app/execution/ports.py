@@ -214,6 +214,18 @@ class SettlementSubscription:
     current_period_end: datetime | None
     past_due_since: datetime | None
     created_at: datetime
+    trading_address: str | None = None   # the account whose fills/funding feed this subscription's PnL
+    cancelled_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class DataCoverage:
+    """How far the data jobs have COMPLETELY synced one trading address (ms since epoch, None = never).
+
+    ``fills_ms`` / ``funding_ms``: the newest time up to which ``fills-ingest`` / ``funding-scan`` have fetched
+    everything for the address (a complete run → its run time; an incomplete one → its monotonic cursor)."""
+    fills_ms: int | None
+    funding_ms: int | None
 
 
 @dataclass(frozen=True)
@@ -455,6 +467,11 @@ class SettlementRepo(Protocol):
 
     def pnl_since(self, subscription_id: str, since: datetime | None, until: datetime) -> PnlDelta:
         """Attributed fills (closedPnl − fee) + funding in (since, until]."""
+
+    def data_coverage(self, trading_addresses: Sequence[str]) -> Mapping[str, DataCoverage]:
+        """Per trading address: how far fills-ingest and funding-scan have completely synced (job_cursors).
+        Addresses never synced are absent (or carry None). Settlement defers a subscription until both have
+        passed its PnL cut-off (SPEC §1.1: a fill stored after its day was settled is never counted)."""
 
     def save_profit_share(self, subscription_id: str, settle_date: date, *, cum_pnl_micro: int, hwm_micro: int,
                           pnl_cursor: datetime, ledger_tx_id: str | None) -> None: ...

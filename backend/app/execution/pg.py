@@ -38,6 +38,7 @@ from .ports import (
     TRADABLE_STATUSES,
     BarSignal,
     BuilderFeeFill,
+    DataCoverage,
     ExpectedPosition,
     Flags,
     OrderRecord,
@@ -597,7 +598,8 @@ class PgSettlementRepo:
                    st.owner_user_id::text AS creator_user_id, st.in_house, s.status::text AS status,
                    coalesce(st.profit_share_bps, 0) AS profit_share_bps,
                    coalesce(st.price_monthly_micro, 0) AS price_monthly_micro, s.cum_pnl_micro, s.hwm_micro,
-                   s.pnl_cursor, s.current_period_end, s.past_due_since, s.created_at
+                   s.pnl_cursor, s.current_period_end, s.past_due_since, s.created_at, s.trading_address,
+                   s.cancelled_at
               FROM subscriptions s JOIN strategies st ON st.id = s.strategy_id
              WHERE s.status IN ('active', 'past_due', 'reduce_only', 'paused_user', 'closing')
                 OR (s.status = 'cancelled' AND s.cancelled_at IS NOT NULL
@@ -609,7 +611,32 @@ class PgSettlementRepo:
             price_monthly_micro=int(r["price_monthly_micro"]), cum_pnl_micro=int(r["cum_pnl_micro"]),
             hwm_micro=int(r["hwm_micro"]), pnl_cursor=as_datetime(r["pnl_cursor"]),
             current_period_end=as_datetime(r["current_period_end"]), past_due_since=as_datetime(r["past_due_since"]),
-            created_at=as_datetime(r["created_at"])) for r in rows]
+            created_at=as_datetime(r["created_at"]),
+            trading_address=str(r["trading_address"]).lower() if r.get("trading_address") else None,
+            cancelled_at=as_datetime(r.get("cancelled_at"))) for r in rows]
+
+    def data_coverage(self, trading_addresses: Sequence[str]) -> dict[str, DataCoverage]:
+        """``job_cursors`` of fills-ingest (job ``fills``) and funding-scan (job ``funding``), key = trading address.
+        Coverage = the run time of the last run when it was COMPLETE (``state.complete`` / ``state.last_run_ms``: the
+        job fetched everything up to then), else the monotonic cursor (what it has stored so far). Before 0006 (no
+        job_cursors) every address is uncovered."""
+        addrs = sorted({str(a).lower() for a in trading_addresses if a})
+        if not addrs or not self.db.table_exists("job_cursors"):
+            return {}
+        rows = self.db.all("""
+            SELECT job, key, cursor_ms, state::text AS state FROM job_cursors
+             WHERE job IN ('fills', 'funding')
+               AND key IN (SELECT jsonb_array_elements_text(CAST(:a AS jsonb)))""", a=json_dumps(addrs))
+        got: dict[str, dict[str, int | None]] = {}
+        for r in rows:
+            st = _json(r.get("state")) or {}
+            cur = r.get("cursor_ms")
+            cov = int(cur) if cur is not None else None
+            last = st.get("last_run_ms") if isinstance(st, dict) else None
+            if isinstance(st, dict) and st.get("complete") is True and isinstance(last, int) and not isinstance(last, bool):
+                cov = max(cov or 0, last)
+            got.setdefault(str(r["key"]).lower(), {})[str(r["job"])] = cov
+        return {a: DataCoverage(fills_ms=v.get("fills"), funding_ms=v.get("funding")) for a, v in got.items()}
 
     def is_settled(self, subscription_id: str, settle_date: date) -> bool:
         return self.db.one("""SELECT 1 AS x FROM profit_share_settlements

@@ -539,6 +539,18 @@ class ExecIntegrationDbTest(unittest.TestCase):
                 ON CONFLICT (trading_address, tid) DO NOTHING RETURNING id""", params))
         return n
 
+    def sync_cursors(self, address: str, *, fills_at: datetime, funding_at: datetime) -> None:
+        """What complete fills-ingest / funding-scan runs leave in job_cursors (0006) for ``address``."""
+        if "0006_data.sql" not in self.db_.applied:
+            return
+        for job, at in (("fills", fills_at), ("funding", funding_at)):
+            ms = int(at.timestamp() * 1000)
+            self.admin.fetchall("""
+                INSERT INTO job_cursors (job, key, cursor_ms, state) VALUES (:j, :k, :c, CAST(:s AS jsonb))
+                ON CONFLICT (job, key) DO UPDATE SET cursor_ms = EXCLUDED.cursor_ms, state = EXCLUDED.state
+                RETURNING job""", {"j": job, "k": address.lower(), "c": ms - 600_000,
+                                    "s": json.dumps({"last_run_ms": ms, "complete": True})})
+
     def ledger_ok(self) -> None:
         total = self.admin.fetchall("SELECT coalesce(sum(amount_micro), 0)::bigint AS s FROM ledger_entries")[0]["s"]
         self.assertEqual(total, 0)
@@ -646,12 +658,36 @@ class ExecIntegrationDbTest(unittest.TestCase):
         self.assertGreater(builder_total, 0)
         self.assertGreater(realized, 0)
         settle_now = datetime.combine(self.now.date() + timedelta(days=1), datetime.min.time(), UTC) + timedelta(minutes=30)
+        # data-completeness guard: fills-ingest / funding-scan have not synced this address past the cut-off yet
+        # → deferred (nothing posted), one ops event per date even across retries
+        cut = settle_now.replace(minute=0)
+        self.sync_cursors(master, fills_at=cut - timedelta(minutes=3), funding_at=cut + timedelta(minutes=7))
+        recognised = 0
+        for k in range(2):
+            rep0 = jobs.settle_daily(db=self.exe, now=settle_now + timedelta(minutes=k), settle_date=self.now.date(),
+                                     runtime=rt)
+            self.assertEqual(rep0["errors"], [], rep0)
+            self.assertIn(sub, [d["subscription_id"] for d in rep0["deferred"]])
+            self.assertEqual(rep0["profit_share_charged_micro"], 0)
+            recognised += rep0["builder_fills_recognised"]   # builder-fee revenue is per fill: not deferred
+        self.assertEqual(self.admin.fetchall(
+            "SELECT 1 FROM ledger_transactions WHERE idempotency_key = :k", {"k": f"ps:{sub}:{settle_now.date()}"}), [])
+        self.assertIsNone(self.sub_row(sub)["pnl_cursor"])
+        if "0006_data.sql" in self.db_.applied:
+            ev = self.admin.fetchall("""SELECT user_id, severity::text AS severity, payload FROM events_outbox
+                                         WHERE kind = 'settlement_deferred' AND dedup_key = :d""",
+                                     {"d": f"settlement_deferred:{settle_now.date()}"})
+            self.assertEqual(len(ev), 1)
+            self.assertEqual((ev[0]["user_id"], ev[0]["severity"]), (None, "warn"))
+            self.assertIn(sub, ev[0]["payload"]["subscriptions"])
+        self.sync_cursors(master, fills_at=cut + timedelta(minutes=25), funding_at=cut + timedelta(minutes=7))
         rep = jobs.settle_daily(db=self.exe, now=settle_now, settle_date=self.now.date(), runtime=rt)
         self.assertEqual(rep["errors"], [], rep)
+        self.assertNotIn(sub, [d["subscription_id"] for d in rep["deferred"]])
         self.assertEqual(rep["cutoff"], settle_now.replace(minute=0).isoformat())
         charge = realized * 150 // 10_000                                  # SILVER: 0% creator + 1.5% platform on top
         self.assertEqual(rep["profit_share_charged_micro"], charge)
-        self.assertGreaterEqual(rep["builder_fills_recognised"], 2)
+        self.assertGreaterEqual(recognised + rep["builder_fills_recognised"], 2)
         s = self.sub_row(sub)
         self.assertEqual((s["cum_pnl_micro"], s["hwm_micro"]), (realized, realized))
         from app.ledger.service import get_balance

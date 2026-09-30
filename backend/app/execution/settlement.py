@@ -26,6 +26,18 @@ User events (``UserEventSink``, same DB transaction as the posting they describe
 - ``profit_share_charged`` per charge (amount, profit above the HWM, rate, strategy, settled period), dedup
   ``profit_share_charged:{ledger key}``; ``subscription_renewed`` per paid renewal, dedup ``subscription_renewed:{key}``.
 
+Data-completeness guard (SPEC §1.1; RUNBOOK §13.4): a (subscription, day) is settled only when BOTH data jobs have
+completely synced the subscription's trading address past the PnL cut-off + ``coverage_margin`` — ``fills-ingest``
+(fills → realized PnL) and ``funding-scan`` (funding → attributed PnL), read through ``repo.data_coverage``
+(``job_cursors``: a complete run counts up to its run time, an incomplete one up to its monotonic cursor). Otherwise
+the subscription is DEFERRED: no ledger post, no cursor move, no renewal/status change on top (retried by the next
+run — the ``settle-daily-retry`` Scheduler slots at 02:30 and 06:30 UTC, then the next day's run, which settles the
+missed day together with the new one because PnL is summed from the subscription's own ``pnl_cursor``). One ops warn
+event ``settlement_deferred`` per settle date (dedup ``settlement_deferred:{date}``). Needed coverage is
+``min(cut-off, cancelled_at)`` (nothing is attributed to a cancelled subscription after it ended); a subscription
+created after that point has nothing to settle and is never deferred. A subscription without a trading address, or
+an address never synced, is deferred (fail closed).
+
 Policy notes:
 - Profit share is charged in full even if it drives the fee balance negative (it is owed on profit already
   realised in the user's own account); the subscription then moves to past_due. Renewals are prepaid: they
@@ -47,6 +59,7 @@ from .ports import (
     BillingPolicy,
     BuilderFeeFill,
     Clock,
+    DataCoverage,
     FeeSplitter,
     LedgerLine,
     LedgerPoster,
@@ -114,6 +127,8 @@ class SettlementReport:
     subscriptions_seen: int = 0
     profit_share_settled: int = 0
     profit_share_skipped: int = 0
+    profit_share_deferred: int = 0
+    deferred: list[dict[str, Any]] = field(default_factory=list)   # [{subscription_id, missing, needed_until}]
     profit_share_charged_micro: int = 0
     renewals_charged: int = 0
     renewals_charged_micro: int = 0
@@ -134,7 +149,8 @@ class Settlement:
     def __init__(self, *, repo: SettlementRepo, ledger: LedgerPoster, uow: UnitOfWork,
                  profit_share: ProfitShareCalculator, fees: FeeSplitter, billing: BillingPolicy,
                  referrals: ReferralLookup, alerts: AlertSink, clock: Clock, builder_page_size: int = 1000,
-                 created_by: str = "system:settlement", events: UserEventSink | None = None) -> None:
+                 created_by: str = "system:settlement", events: UserEventSink | None = None,
+                 require_data_coverage: bool = True, coverage_margin: timedelta = timedelta(minutes=2)) -> None:
         self.repo = repo
         self.ledger = ledger
         self.uow = uow
@@ -147,6 +163,8 @@ class Settlement:
         self.page = builder_page_size
         self.created_by = created_by
         self.events = events
+        self.require_data_coverage = require_data_coverage
+        self.coverage_margin = coverage_margin
 
     # --------------------------------------------------------------------------------------------------------- entry
 
@@ -160,8 +178,16 @@ class Settlement:
             raise ValueError("cannot settle a day that has not started")
         report = SettlementReport(settle_date=settle_date.isoformat())
 
-        for sub in self.repo.subscriptions_to_settle():
+        subs = list(self.repo.subscriptions_to_settle())
+        coverage = self._coverage(subs, report)
+        for sub in subs:
             report.subscriptions_seen += 1
+            missing = self._missing_data(sub, settle_date, cutoff, coverage)
+            if missing is not None:
+                report.profit_share_deferred += 1
+                report.deferred.append(missing)
+                log.warning("settlement_deferred", extra={"fields": missing})
+                continue  # no ledger post, no renewal / status change on top; retried by the next run
             try:
                 self._settle_profit_share(sub, settle_date, cutoff, report)
             except Exception as exc:
@@ -183,8 +209,55 @@ class Settlement:
         except Exception as exc:
             self._fail(report, "builder_fees", exc)
 
+        if report.deferred:
+            self._ops_event("warn", "settlement_deferred", {
+                "settle_date": settle_date.isoformat(), "cutoff": cutoff.isoformat(),
+                "deferred": len(report.deferred), "subscriptions": [d["subscription_id"] for d in report.deferred[:20]],
+                "missing": sorted({m for d in report.deferred for m in d["missing"]})},
+                dedup=f"settlement_deferred:{settle_date.isoformat()}")
+
         log.info("settlement_done", extra={"fields": report.as_dict()})
         return report
+
+    # ------------------------------------------------------------------------------------------- data-completeness guard
+
+    def _coverage(self, subs: list[SettlementSubscription], report: SettlementReport) -> dict[str, DataCoverage]:
+        if not self.require_data_coverage:
+            return {}
+        addrs = sorted({s.trading_address.lower() for s in subs if s.trading_address})
+        if not addrs:
+            return {}
+        try:
+            return {str(k).lower(): v for k, v in dict(self.repo.data_coverage(addrs)).items()}
+        except Exception as exc:   # unknown coverage → every subscription defers (fail closed)
+            self._fail(report, "data_coverage", exc)
+            return {}
+
+    def _missing_data(self, sub: SettlementSubscription, settle_date: date, cutoff: datetime,
+                      coverage: dict[str, DataCoverage]) -> dict[str, Any] | None:
+        """None when the subscription may be settled for this cut-off, else a description of what is missing."""
+        if not self.require_data_coverage:
+            return None
+        if self.repo.is_settled(sub.id, settle_date) or (sub.pnl_cursor is not None and sub.pnl_cursor >= cutoff):
+            return None                                      # already settled: nothing will be posted anyway
+        needed = cutoff
+        if sub.cancelled_at is not None and sub.cancelled_at < needed:
+            needed = sub.cancelled_at
+        if sub.pnl_cursor is not None and sub.pnl_cursor >= needed:
+            return None                                      # nothing attributable after the cursor
+        if sub.created_at is not None and sub.created_at >= needed:
+            return None                                      # started after the needed point: nothing to settle
+        need_ms = int((needed + self.coverage_margin).timestamp() * 1000)
+        cov = coverage.get((sub.trading_address or "").lower()) if sub.trading_address else None
+        missing = []
+        if cov is None or cov.fills_ms is None or cov.fills_ms < need_ms:
+            missing.append("fills_ingest")
+        if cov is None or cov.funding_ms is None or cov.funding_ms < need_ms:
+            missing.append("funding_scan")
+        if not missing:
+            return None
+        return {"subscription_id": sub.id, "missing": missing, "needed_until": needed.isoformat(),
+                "fills_ms": cov.fills_ms if cov else None, "funding_ms": cov.funding_ms if cov else None}
 
     # ------------------------------------------------------------------------------------------------- profit share
 
@@ -400,6 +473,18 @@ class Settlement:
         on_top = getattr(econ, "platform_profit_share_mode", "on_top") == "on_top"
         creator = int(sub.profit_share_bps)
         return creator + platform if on_top else creator
+
+    def _ops_event(self, severity: str, kind: str, payload: dict[str, Any], *, dedup: str) -> None:
+        """Ops event (user_id NULL) through the events outbox when available — its dedup key is permanent, so the
+        retry runs of the same date add nothing — else through the alert sink."""
+        if self.events is not None:
+            try:
+                self.events.emit(user_id=None, kind=kind, severity=severity, payload=payload,  # type: ignore[arg-type]
+                                 dedup_key=dedup)
+                return
+            except Exception:
+                log.error("ops_event_failed", exc_info=True, extra={"fields": {"kind": kind}})
+        self._alert(severity, kind, payload, dedup=dedup)
 
     def _fail(self, report: SettlementReport, what: str, exc: Exception, *, user_id: str | None = None) -> None:
         report.errors.append(f"{what}:{type(exc).__name__}")
