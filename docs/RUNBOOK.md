@@ -143,7 +143,11 @@ Corrections are **new ledger transactions** (never edits), with memo and approve
 
 ### 7.1 Single user (user-initiated or support-assisted)
 
-The user chooses "Rotate agent" (step-up). The API generates a new key and encrypts it with KMS. The user signs `approveAgent` with the same name `aijalon`, which should replace the old agent [VERIFY on mainnet]. The server confirms on-chain via `extraAgents` and marks the old key `rotated`. If the old agent is still listed, ask the user to revoke it.
+The user chooses "Rotate agent" (step-up). The API only files an agent REQUEST; the EXECUTOR generates the new key, seals it with KMS and attests it within about a minute (migrations/0016; the web shows "Preparing your agent…"). The user signs `approveAgent` with the same name `aijalon`, which should replace the old agent [VERIFY on mainnet]. The server confirms on-chain via `extraAgents` and marks the old key `rotated`. If the old agent is still listed, ask the user to revoke it.
+
+**Keys generated before migration 0016** (by the api; `agent_keys.keygen_at IS NULL`): the migration revoked the pending ones; the ACTIVE ones keep trading but were known to the api process at generation. Ask those users to rotate (`SELECT user_id, master_address FROM agent_keys WHERE status = 'active' AND keygen_at IS NULL;`) before public launch.
+
+**`agent_keygen_failed` (CRITICAL):** a key the executor just sealed did not re-open to its address — KMS / `KMS_KEY_NAME` misconfiguration of the executor (or tampering). No key was stored; requests stay `requested` and are retried every minute once fixed. The alert "agent-keys ENCRYPT by anyone but executor" means someone else is sealing agent keys: treat as 7.2.
 
 ### 7.2 Suspected mass compromise of agent keys
 
