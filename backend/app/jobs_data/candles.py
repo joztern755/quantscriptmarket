@@ -318,7 +318,10 @@ def _store_series(db: Any, coin: str, interval: str, raw: Any, cur: Optional[int
         if newest is None:
             _db.set_cursor(conn, JOB, key, None, {"next_due_ms": now_ms + step, "empty": True}, monotonic=True)
         else:
-            _db.set_cursor(conn, JOB, key, newest, {"next_due_ms": newest + 2 * step + grace_ms}, monotonic=True)
+            due_next = newest + 2 * step + grace_ms
+            if cur is not None and newest <= cur:            # no new candle (halted market?): back off a bit
+                due_next = max(due_next, now_ms + step // 4)
+            _db.set_cursor(conn, JOB, key, newest, {"next_due_ms": due_next}, monotonic=True)
 
 
 # --------------------------------------------------------------------------------------------------- read side

@@ -50,7 +50,7 @@ def account_spec(code: str) -> tuple[str, bool, Optional[str]]:
         return "revenue", False, None
     if code in (ACC_TREASURY, ACC_STRIPE_CLEARING, "builder:hl_receivable"):
         return "asset", False, None
-    if code in (ACC_WITHDRAWALS_PENDING, ACC_PAYOUTS_PENDING, "suspense:usdc_unmatched"):
+    if code in (ACC_WITHDRAWALS_PENDING, ACC_PAYOUTS_PENDING, "suspense:usdc_unattributed"):
         return "liability", False, None
     raise ValueError(f"unknown ledger account shape: {code}")
 

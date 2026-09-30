@@ -294,6 +294,10 @@ class PgSubscriptionRepo:
              WHERE s.strategy_version_id = CAST(:v AS uuid)
                AND s.status IN {_TRADABLE_SQL}
                AND s.master_address IS NOT NULL
+               -- an expired/revoked agent cannot place any order (not even exits): skip until re-approved
+               AND EXISTS (SELECT 1 FROM agent_keys k
+                            WHERE k.user_id = s.user_id AND k.master_address = s.master_address
+                              AND k.status = 'active' AND (k.valid_until IS NULL OR k.valid_until > now()))
                AND NOT EXISTS (SELECT 1 FROM subscription_bar_runs r
                                 WHERE r.subscription_id = s.id AND r.bar_close = CAST(:bar AS timestamptz))
              ORDER BY s.id

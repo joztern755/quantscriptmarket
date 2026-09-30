@@ -51,7 +51,7 @@ __all__ = [
     "ContactsRequired", "AlertsUnavailable", "ContactStatus", "TelegramBlocked", "TelegramBotApi", "BLOCK_GRACE",
     "contact_status", "require_alert_contacts", "entries_allowed", "confirm_account_email",
     "start_email_verification", "verify_email_code", "EmailVerifyResult", "normalize_email",
-    "mark_telegram_blocked", "email_provider", "telegram_api", "EMAIL_CODE_TTL", "EMAIL_CODE_MAX_ATTEMPTS",
+    "mark_telegram_blocked", "email_provider", "telegram_api", "NoUserEmailContacts", "EMAIL_CODE_TTL", "EMAIL_CODE_MAX_ATTEMPTS",
 ]
 
 BLOCK_GRACE = timedelta(hours=24)         # after the Telegram link lapses, new entries pause after this
@@ -390,6 +390,16 @@ def queue_unreachable_alert(conn: Any, *, user_id: str, now: datetime, reason: s
                       ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING RETURNING id""",
              u=user_id, now=now, k=f"telegram_unreachable:{user_id}:{now.isoformat()}",
              p=_db.jdump({"reason": reason, "pause_at": pause.strftime("%Y-%m-%d %H:%M UTC"), "grace_hours": 24}))
+
+
+class NoUserEmailContacts:
+    """``app.alerts.notifier.ContactDirectory`` for the generic Notifier (executor / settlement): returns no user
+    address, so the Notifier only emails OPS. User Telegram/email is delivered by app.alerts.delivery.deliver_outbox
+    from the `alerts` rows (email policy, mutes, confirmed address, idempotency) — giving the Notifier a user
+    directory would email users twice and bypass the email volume policy."""
+
+    def email_for(self, user_id: str, alert: Any) -> Optional[str]:
+        return None
 
 
 # ============================================================================================ factories

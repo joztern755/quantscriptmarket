@@ -450,9 +450,21 @@ class NotifierAdapter:
 # Sandbox (validation is static & local; execution only in the sandbox service)
 # =============================================================================================================
 class SandboxAdapter:
-    def __init__(self, settings: Settings, cfg: ApiConfig) -> None:
+    def __init__(self, settings: Settings, cfg: ApiConfig, db: Any = None) -> None:
         self._s = settings
         self._cfg = cfg
+        self._db = db  # DatabasePort: stored candles (SPEC §12 own candle history) are read before the API
+
+    def _fetcher(self) -> Any:
+        bt = _require("app.sandbox.backtest")
+        api = bt.HyperliquidInfoFetcher(self._s.hl_api_url)
+        if self._db is None:
+            return api
+        try:
+            store = importlib.import_module("app.jobs_data.candles").DbCandleSource(self._db)
+        except ImportError:
+            return api
+        return bt.StoredFirstFetcher(store, api)
 
     @property
     def _max_lev(self) -> float:
@@ -473,7 +485,7 @@ class SandboxAdapter:
         bt, vm = _require("app.sandbox.backtest"), _require("app.sandbox.validate")
         smeta = vm.StrategyMeta(markets=tuple(meta["markets"]), timeframe=meta["timeframe"],
                                 lookback=int(meta["lookback"]), max_leverage=float(meta["max_leverage"]))
-        data = bt.fetch_market_data(smeta, bt.HyperliquidInfoFetcher(self._s.hl_api_url))  # trusted side has egress
+        data = bt.fetch_market_data(smeta, self._fetcher())  # trusted side has egress; stored candles first
         if self._cfg.sandbox_url:
             return self._remote(code, data.to_json())
         if self._s.env in ("dev", "test"):
@@ -537,6 +549,10 @@ JOB_ENTRYPOINTS: dict[str, tuple[tuple[str, str], ...]] = {
     "reconcile": (("app.execution.jobs", "reconcile"), ("app.execution.reconcile", "run")),
     "deposits-scan": (("app.hl.deposits", "scan"), ("app.execution.jobs", "deposits_scan")),
     "referral-tiers": (("app.execution.jobs", "referral_tiers"), ("app.domain.referrals_job", "run")),
+    "candles-sync": (("app.jobs_data", "candles_sync"),),
+    "fills-ingest": (("app.jobs_data", "fills_ingest"),),
+    "funding-scan": (("app.jobs_data", "funding_scan"),),
+    "agent-expiry-scan": (("app.jobs_data", "agent_expiry_scan"),),
 }
 
 
@@ -703,9 +719,10 @@ def build_services(settings: Optional[Settings] = None) -> Services:
     store = SqlStore()
     enc = _Encryptor(s)
     hl = HlInfoAdapter(s)
+    db = SqlDatabase(s)
     return Services(
         settings=s,
-        db=SqlDatabase(s),
+        db=db,
         store=store,
         auth=FirebaseAuthAdapter(s),
         audit=SqlAuditAdapter(store),
@@ -716,7 +733,7 @@ def build_services(settings: Optional[Settings] = None) -> Services:
         stripe=StripeAdapter(s),
         usdc=UsdcAdapter(s, hl),
         notifier=NotifierAdapter(s, store),
-        sandbox=SandboxAdapter(s, cfg),
+        sandbox=SandboxAdapter(s, cfg, db),
         code_vault=CodeVaultAdapter(enc),
         kyc=KycAdapter(),
         jobs=JobsAdapter(),

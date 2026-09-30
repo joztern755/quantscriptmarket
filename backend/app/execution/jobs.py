@@ -52,7 +52,6 @@ from app.money import BPS, parse_decimal, to_micro
 from .executor import Executor, ExecutorConfig
 from .pg import (
     PgAlertRepo,
-    PgContactDirectory,
     PgCreatorSignalRepo,
     PgDatabase,
     PgFlagRepo,
@@ -265,10 +264,13 @@ def _shared_dedupe() -> Any:
 
 
 def build_notifier(settings: Any, db: PgDatabase, *, dedupe_store: Any = None) -> Any:
-    """Notifier for the executor service: in-app rows (alerts table), email (Resend) to the user and ops for
-    warn/critical, Telegram ops page for critical, auto-pause (new_entries_paused:{coin}) for critical market alerts.
-    The dedupe store is per process; alert ROWS are additionally deduped across instances (PgAlertRepo)."""
+    """Notifier for the executor service: in-app rows (alerts table), email (Resend) to OPS for warn/critical,
+    Telegram ops page for critical, auto-pause (new_entries_paused:{coin}) for critical market alerts.
+    The dedupe store is per process; alert ROWS are additionally deduped across instances (PgAlertRepo).
+    User Telegram/email is NOT sent here: app.alerts.delivery.deliver_outbox (/v1/internal/deliver-alerts, every
+    minute) delivers every user `alerts` row per the email policy, mutes and confirmed contacts (0007)."""
     from app.alerts import notifier as n
+    from app.alerts.user_sinks import NoUserEmailContacts
 
     email = None
     if getattr(settings, "email_provider_api_key", ""):
@@ -277,7 +279,7 @@ def build_notifier(settings: Any, db: PgDatabase, *, dedupe_store: Any = None) -
     if getattr(settings, "telegram_bot_token", "") and getattr(settings, "telegram_ops_chat_id", ""):
         telegram = n.TelegramSink(settings.telegram_bot_token, settings.telegram_ops_chat_id)
     return n.Notifier(in_app=n.InAppSink(PgAlertRepo(db)), email=email, telegram=telegram,
-                      contacts=PgContactDirectory(db), ops_emails=getattr(settings, "ops_emails", ()),
+                      contacts=NoUserEmailContacts(), ops_emails=getattr(settings, "ops_emails", ()),
                       flags=PgMarketPauseFlags(db), dedupe_store=dedupe_store or _shared_dedupe())
 
 

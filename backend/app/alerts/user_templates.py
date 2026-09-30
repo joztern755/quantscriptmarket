@@ -324,9 +324,10 @@ USER_TEMPLATES: dict[str, Tmpl] = {
     "strategy_paused": lambda p, o: ("Strategy paused",
                                      f"{p.s('strategy')} is paused: it will not open new positions until it resumes. "
                                      "Exits still run."),
-    "signal_stale": lambda p, o: ("Strategy signal stale",
-                                  f"The latest signal for {p.s('strategy', 'your strategy')} is late, so no new "
-                                  "entries are placed until a fresh signal arrives."),
+    "signal_stale": lambda p, o: ("Strategy signal stale" + (f" ({p.s('coin')})" if p.d.get("coin") else ""),
+                                  f"The latest signal for {p.s('strategy', 'your strategy')} is late or was rejected, "
+                                  "so no new entries are placed until a fresh, verified signal arrives. Exits still "
+                                  "run."),
     "telegram_unreachable": _unreachable,
     "test_alert": _simple("Test alert",
                           "This is a test alert from aijalon.trade. If you can read it, this channel works."),
@@ -336,6 +337,9 @@ USER_TEMPLATES: dict[str, Tmpl] = {
 def render_user_alert(kind: str, severity: str, payload: Mapping[str, Any], *, web_origin: str) -> tuple[str, str]:
     """(title, body) — plain text, sanitised."""
     p = P(payload)
+    # rows written by notifier.InAppSink (executor / settlement) carry already-rendered, sanitised text only
+    if isinstance(p.d.get("title"), str) and isinstance(p.d.get("body"), str) and set(p.d) <= {"title", "body", "coin", "key"}:
+        return sanitize_text(p.d["title"]), sanitize_text(p.d["body"])[:3000]
     fn = USER_TEMPLATES.get(kind)
     if fn is not None:
         try:

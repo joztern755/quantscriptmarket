@@ -64,7 +64,7 @@ class UserAlertsHttpTest(unittest.TestCase):
 
     def test_prefs_refuse_mandatory(self) -> None:
         T = self.T
-        T._user_with_wallet(self.world, balance=0) if hasattr(T, "_user_with_wallet") else self.world.add_user("fb-user")
+        self.world.add_user("fb-user")
         h = T.login(self.svc, self.world)
         r = self.c.patch("/v1/alerts/prefs", headers=h, json={"muted": {"agent_expired": True}})
         self.assertEqual(r.status_code, 422)

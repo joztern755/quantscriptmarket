@@ -38,7 +38,7 @@ gh repo clone joztern755/quantscriptmarket && cd quantscriptmarket && git checko
 1. Ask me to open Telegram → @BotFather → `/newbot` → name "aijalon alerts", username e.g. `aijalon_alerts_bot` → BotFather gives a token. I paste the token into the `read -rs` prompt you give me; you pipe it into Secret Manager `TELEGRAM_BOT_TOKEN`. Set `TELEGRAM_BOT_USERNAME` (not secret) on the api service.
 2. In BotFather: `/setdescription`, `/setabouttext`, `/setuserpic` (logo from `web/public/brand/`), `/setjoingroups` → Disable, `/setprivacy` → Enable.
 3. Register the webhook with the secret token (already generated in Secret Manager as `TELEGRAM_WEBHOOK_SECRET`):
-   `curl -s "https://api.telegram.org/bot$TOKEN/setWebhook" -d url=https://api.aijalon.trade/v1/webhooks/telegram -d secret_token=$SECRET -d allowed_updates='["message"]' -d drop_pending_updates=true` (read both values from Secret Manager into shell variables; never echo them). Then `getWebhookInfo` must show the URL and no errors.
+   `curl -s "https://api.telegram.org/bot$TOKEN/setWebhook" -d url=https://api.aijalon.trade/v1/webhooks/telegram -d secret_token=$SECRET -d allowed_updates='["message","my_chat_member"]' -d drop_pending_updates=true` (read both values from Secret Manager into shell variables; never echo them). Then `getWebhookInfo` must show the URL and no errors.
 4. Ops channel: ask me to create a private Telegram group "aijalon ops", add the bot, send a message; get the chat id via `getUpdates` (before setting the webhook, or temporarily) and store it as `TELEGRAM_OPS_CHAT_ID`.
 5. Test: link my own account from the site's **#/alerts** page and press "Send test alert".
 
