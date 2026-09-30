@@ -18,7 +18,7 @@ pydantic-settings==2.15.0
 sqlalchemy==2.0.54  # (2.0 LTS line; 2.1 exists — upgrade deliberately)
 psycopg[binary]==3.3.6
 hyperliquid-python-sdk==0.24.0  # (requires eth-account >=0.10,<0.14)
-eth-account==0.13.7  # (latest 0.13.x: the SDK caps eth-account below 0.14)
+eth-account==0.14.0  # (latest 0.13.x: the SDK caps eth-account below 0.14)
 firebase-admin==7.7.0
 google-auth==2.48.0
 google-cloud-kms==3.17.0
