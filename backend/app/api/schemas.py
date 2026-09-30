@@ -838,6 +838,11 @@ class AdminStrategyOut(Out):
     versions: list[CreatorVersionOut] = Field(default_factory=list)
 
 
+class KycDecisionIn(In):
+    decision: Literal["approved", "rejected"]
+    reason: Reason
+
+
 class StrategyListIn(In):
     version_id: UUID
     reason: Reason

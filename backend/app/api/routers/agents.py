@@ -95,10 +95,7 @@ def confirm_agent(agent_id: UUID, ctx: AuthCtx = Depends(step_up_user),
         return _agent_out(agent)
     if agent["status"] != "pending_approval":
         raise Conflict("this agent was replaced or revoked; create a new one")
-    try:
-        on_chain = svc.hl.extra_agents(agent["master_address"])
-    except ExternalServiceError:
-        raise
+    on_chain = svc.hl.extra_agents(agent["master_address"])   # agents live on the MASTER account
     now_ms = int(svc.now().timestamp() * 1000)
     match = next((a for a in on_chain if a["address"] == agent["agent_address"]), None)
     if match is None:

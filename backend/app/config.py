@@ -124,6 +124,11 @@ class Settings:
     telegram_bot_username: str                      # for t.me/<bot>?start=<token> link
     sandbox_url: str                                # Cloud Run sandbox service URL
     sandbox_shared_secret: str                      # X-Sandbox-Secret (plus Cloud Run IAM)
+    scheduler_sa_email: str                         # Cloud Scheduler OIDC service account (internal routes)
+    internal_audience: str                          # OIDC audience for internal routes (executor service URL)
+    stripe_publishable_key: str
+    legal_versions: dict                            # {doc: version} — filled from legal/*.md "Version:" lines at build
+    legal_doc_hashes: dict                          # {doc: sha256 of the exact served text}
     economics: Economics = field(default_factory=Economics)
     risk: RiskLimits = field(default_factory=RiskLimits)
 
@@ -138,6 +143,27 @@ def _b(name: str, default: str) -> bool:
 
 # DRAFT list for counsel review (legal/jurisdiction.md). ISO 3166-1 alpha-2.
 DEFAULT_RESTRICTED = ("US", "CU", "IR", "KP", "SY", "RU", "BY", "MM")
+
+
+@lru_cache(maxsize=1)
+def _legal_meta() -> tuple[dict, dict]:
+    """Versions and sha256 of legal/*.md (the exact files the web serves under /legal/). LEGAL_DIR overrides."""
+    import hashlib
+    import re
+    from pathlib import Path
+
+    root = Path(os.environ.get("LEGAL_DIR", Path(__file__).resolve().parents[2] / "legal"))
+    versions: dict = {}
+    hashes: dict = {}
+    if root.is_dir():
+        for f in sorted(root.glob("*.md")):
+            if f.stem.upper() == "README":
+                continue
+            raw = f.read_bytes()
+            m = re.search(rb"^\**Version:?\**:?\s*([0-9A-Za-z._-]+)", raw, re.M)
+            versions[f.stem] = m.group(1).decode() if m else "unversioned"
+            hashes[f.stem] = hashlib.sha256(raw).hexdigest()
+    return versions, hashes
 
 
 @lru_cache(maxsize=1)
@@ -190,12 +216,20 @@ def get_settings() -> Settings:
         telegram_bot_username=os.environ.get("TELEGRAM_BOT_USERNAME", ""),
         sandbox_url=os.environ.get("SANDBOX_URL", ""),
         sandbox_shared_secret=os.environ.get("SANDBOX_SHARED_SECRET", ""),
+        scheduler_sa_email=os.environ.get("SCHEDULER_SA_EMAIL", ""),
+        internal_audience=os.environ.get("INTERNAL_AUDIENCE", ""),
+        stripe_publishable_key=os.environ.get("STRIPE_PUBLISHABLE_KEY", ""),
+        legal_versions=_legal_meta()[0],
+        legal_doc_hashes=_legal_meta()[1],
     )
     if s.is_prod:
         required = ["builder_address", "treasury_address", "kms_key_name", "firebase_project_id", "signals_pubkey_b64",
                     "audit_pepper_b64", "service_role"]
         if s.service_role == "api":
-            required += ["edge_auth_secret", "telegram_webhook_secret", "sandbox_url", "sandbox_shared_secret"]
+            required += ["edge_auth_secret", "telegram_webhook_secret", "sandbox_url", "sandbox_shared_secret",
+                         "stripe_publishable_key"]
+        if s.service_role == "executor":
+            required += ["scheduler_sa_email", "internal_audience"]
         if s.service_role == "executor":
             required += ["sandbox_url", "sandbox_shared_secret"]
         missing = [k for k in required if not getattr(s, k)]

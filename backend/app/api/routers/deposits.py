@@ -28,7 +28,6 @@ from app.api.deps import (
     run_idempotent,
     user_limit,
 )
-from app.api.validation import micro_to_usd_string  # noqa: F401  (re-exported for clients' tests)
 from app.errors import Forbidden, ValidationFailed
 
 router = APIRouter(prefix="/deposits", tags=["deposits"])

@@ -21,7 +21,8 @@ router = APIRouter(prefix="/internal", tags=["internal"], dependencies=[Depends(
 def _run(svc: Services, job: str, params: dict[str, Any]) -> S.JobOut:
     now = svc.now()
     result = svc.jobs.run(job, db=svc.db, now=now, params=params)
-    summary = {k: result[k] for k in list(result)[:20]}  # bounded audit payload
+    # bounded, canonical-JSON-safe audit payload (the audit chain refuses floats)
+    summary = {str(k): str(result[k])[:200] for k in list(result)[:20]}
     with svc.db.begin() as conn:
         svc.audit.write(conn, actor="system:scheduler", action=f"job.{job}", target="",
                         payload={"params": {k: str(val) for k, val in params.items()}, "result": summary},

@@ -25,6 +25,7 @@ import time
 from collections import OrderedDict
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from functools import cached_property
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable, Iterable, Optional, Protocol
@@ -323,8 +324,9 @@ class Services:
     domain: DomainPort
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(timezone.utc))
 
-    @property
+    @cached_property
     def config(self) -> ApiConfig:
+        """Derived once per Services instance (settings are immutable)."""
         return api_config(self.settings)
 
     def now(self) -> datetime:

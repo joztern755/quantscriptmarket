@@ -309,6 +309,8 @@ class ApiStoreDbTest(unittest.TestCase):
         self.assertTrue(s.active_subscribers_by_strategy(db, str(self.a["id"])))
         s.upsert_kyc_pending(db, user_id=str(self.a["id"]), provider="test", provider_ref="ref-" + self.tag)
         self.assertEqual(s.get_kyc(db, str(self.a["id"]))["status"], "pending")
+        self.assertEqual(s.set_kyc_status(db, str(self.a["id"]), "approved"), 1)
+        self.assertEqual(s.get_kyc(db, str(self.a["id"]))["status"], "approved")
 
     # ------------------------------------------------------------------------------------------------ subscriptions
     def test_subscription_lifecycle(self) -> None:

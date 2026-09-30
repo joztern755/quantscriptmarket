@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 import time
 import uuid
 from typing import Any, Awaitable, Callable
@@ -32,6 +33,8 @@ from app.api import validation as v
 from app.logging import get_logger
 
 log = get_logger("app.api.access")
+
+_CF_COUNTRY_RE = re.compile(r"^[A-Z][A-Z0-9]$")
 
 ASGIApp = Callable[[dict, Callable[[], Awaitable[dict]], Callable[[dict], Awaitable[None]]], Awaitable[None]]
 
@@ -192,7 +195,7 @@ class EdgeGuardMiddleware:
         country = None
         if trusted:
             c = headers.get("cf-ipcountry", "").strip().upper()
-            if v.COUNTRY_RE.match(c):
+            if _CF_COUNTRY_RE.match(c):      # ISO alpha-2, plus Cloudflare's "T1" (Tor) and "XX" (unknown)
                 country = c
         state["edge_trusted"] = trusted
         state["edge_country"] = country

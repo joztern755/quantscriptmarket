@@ -8,7 +8,7 @@
 --                         or error leaves no claim behind and a concurrent duplicate waits on the unique key.
 --   admin_changes         maker-checker queue for permissive admin actions other than system flags
 --                         (system_flags.pending_* is used for kill switches): strategy_list, strategy_price,
---                         user_unsuspend. checker ≠ maker enforced here too; decided rows are immutable.
+--                         user_unsuspend, kyc_approve. checker ≠ maker enforced here too; decided rows immutable.
 --   user_login_countries  first/last seen country per user (CF-IPCountry, only when the edge is authenticated)
 --                         → "login from new country" alert (SPEC §5.5).
 --   wallet_nonces         single-use nonces (10 min) for SIWE-style wallet ownership proofs.
@@ -49,7 +49,7 @@ CREATE TRIGGER api_idempotency_guard BEFORE UPDATE ON api_idempotency
 CREATE TABLE admin_changes (
     id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     created_at       timestamptz NOT NULL DEFAULT now(),
-    kind             text NOT NULL CHECK (kind IN ('strategy_list', 'strategy_price', 'user_unsuspend')),
+    kind             text NOT NULL CHECK (kind IN ('strategy_list', 'strategy_price', 'user_unsuspend', 'kyc_approve')),
     target           text NOT NULL CHECK (target ~ '^(strategy|user):[0-9a-f-]{36}$'),
     payload          jsonb NOT NULL DEFAULT '{}'::jsonb,
     reason           text NOT NULL CHECK (length(reason) BETWEEN 5 AND 500),

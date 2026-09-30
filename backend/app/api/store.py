@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 from contextlib import nullcontext
 
@@ -845,6 +845,10 @@ class SqlStore:
     def get_kyc(self, conn: Any, user_id: str) -> Optional[dict]:
         return self._one(conn, """SELECT provider, provider_ref, status::text AS status FROM kyc_creators
                                   WHERE user_id = CAST(:u AS uuid)""", u=user_id)
+
+    def set_kyc_status(self, conn: Any, user_id: str, status: str) -> int:
+        return self._exec(conn, """UPDATE kyc_creators SET status = CAST(:s AS kyc_status)
+                                   WHERE user_id = CAST(:u AS uuid) RETURNING id""", s=status, u=user_id)
 
     def upsert_kyc_pending(self, conn: Any, *, user_id: str, provider: str, provider_ref: str) -> None:
         self._exec(conn, """
