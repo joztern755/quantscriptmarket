@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_execution_fakes import (  # noqa: E402
     BAR,
     SILVER,
+    TRUSTED_DEXES,
     Const,
     FakeAlerts,
     FakeClock,
@@ -137,7 +138,7 @@ class WiringTest(unittest.TestCase):
         clock = FakeClock(BAR)
         market = FakeMarket(clock)
         base = dict(subscription=make_sub(), coin=SILVER, weight_bps=10_000, position=Position.flat(SILVER),
-                    snapshot=market.snapshot(SILVER), flags=Flags(), reduce_only_mode=False, now=BAR)
+                    snapshot=market.snapshot(SILVER), flags=Flags(trusted_dexes=TRUSTED_DEXES), reduce_only_mode=False, now=BAR)
         base.update(kw)
         return PlanInput(**base), market
 

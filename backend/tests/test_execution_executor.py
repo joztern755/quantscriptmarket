@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_execution_fakes import BAR, SILVER, FakeJitter, World, make_signal, make_sub, usd  # noqa: E402
+from test_execution_fakes import BAR, SILVER, TRUSTED_DEXES, FakeJitter, World, make_signal, make_sub, usd  # noqa: E402
 
 from app.errors import ExternalServiceError  # noqa: E402
 from app.execution.executor import CLOID_PREFIX, is_our_cloid, make_cloid  # noqa: E402
@@ -168,25 +168,25 @@ class JitterTest(unittest.TestCase):
 class KillSwitchTest(unittest.TestCase):
     def test_global_kill_switch_places_nothing(self):
         w = World()
-        w.flags.value = Flags(kill_switch_global=True)
+        w.flags.value = Flags(trusted_dexes=TRUSTED_DEXES, kill_switch_global=True)
         r = w.tick()
         self.assertTrue(r.kill_switch_global)
         self.assertEqual((w.ex.placed, w.keys.opened), ([], 0))
 
     def test_market_kill_switch_blocks_coin_until_lifted(self):
         w = World()
-        w.flags.value = Flags(killed_markets=frozenset({SILVER}))
+        w.flags.value = Flags(trusted_dexes=TRUSTED_DEXES, killed_markets=frozenset({SILVER}))
         r = w.tick()
         self.assertEqual((r.market_killed, len(w.ex.placed)), (1, 0))
         self.assertNotIn(("sub1", BAR), w.subs.done)
-        w.flags.value = Flags()
+        w.flags.value = Flags(trusted_dexes=TRUSTED_DEXES)
         w.tick()
         self.assertEqual(len(w.ex.placed), 1)
 
     def test_new_entries_paused_allows_exit_only(self):
         w = World(signals=[make_signal(weight=2)])
         w.ex.set_position("0xmaster1", SILVER, "100")
-        w.flags.value = Flags(new_entries_paused=True)
+        w.flags.value = Flags(trusted_dexes=TRUSTED_DEXES, new_entries_paused=True)
         w.tick()
         self.assertEqual(w.ex.placed, [])
         self.assertIn(("sub1", BAR), w.subs.done)
@@ -262,7 +262,7 @@ class ReduceOnlyTest(unittest.TestCase):
             sub = make_sub(1, entries_allowed=allowed)
             try:
                 plan = planner.plan(PlanInput(subscription=sub, coin=SILVER, weight_bps=10_000,
-                                              position=Position.flat(SILVER), snapshot=snap, flags=Flags(),
+                                              position=Position.flat(SILVER), snapshot=snap, flags=Flags(trusted_dexes=TRUSTED_DEXES),
                                               reduce_only_mode=False, now=w.clock.now()))
                 legs = len(plan.legs)
             except Exception:  # noqa: BLE001 - a guard rejection also means "nothing opened"

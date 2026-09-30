@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_execution_fakes import BAR, SILVER, World, make_signal, make_sub  # noqa: E402
+from test_execution_fakes import BAR, SILVER, TRUSTED_DEXES, World, make_signal, make_sub  # noqa: E402
 
 from app.errors import ExternalServiceError, ValidationFailed  # noqa: E402
 from app.execution import executor as ex_mod  # noqa: E402
@@ -77,10 +77,10 @@ class ClosingFlowTest(unittest.TestCase):
 
     def test_market_kill_switch_and_global_kill_stop_closing_too(self):
         w = closing_world()
-        w.flags.value = Flags(kill_switch_global=True)
+        w.flags.value = Flags(trusted_dexes=TRUSTED_DEXES, kill_switch_global=True)
         w.tick()
         self.assertEqual(w.ex.placed, [])
-        w.flags.value = Flags(killed_markets=frozenset({SILVER}))
+        w.flags.value = Flags(trusted_dexes=TRUSTED_DEXES, killed_markets=frozenset({SILVER}))
         r = w.tick()
         self.assertEqual((w.ex.placed, r.market_killed), ([], 1))
         self.assertEqual(w.subs.subs["sub1"].status, "closing")
@@ -175,10 +175,10 @@ class SnapshotMappingTest(unittest.TestCase):
         sub = make_sub(1, status="closing")
         pos = Position(SILVER, Decimal("10"), 300_000_000)
         plan = RiskPlanner().plan(PlanInput(subscription=sub, coin=SILVER, weight_bps=20_000, position=pos,
-                                            snapshot=snap, flags=Flags(), reduce_only_mode=True, now=BAR))
+                                            snapshot=snap, flags=Flags(trusted_dexes=TRUSTED_DEXES), reduce_only_mode=True, now=BAR))
         self.assertTrue(all(leg.reduce_only or not leg.is_buy for leg in plan.legs))
         plan0 = RiskPlanner().plan(PlanInput(subscription=sub, coin=SILVER, weight_bps=0, position=pos, snapshot=snap,
-                                             flags=Flags(), reduce_only_mode=True, now=BAR))
+                                             flags=Flags(trusted_dexes=TRUSTED_DEXES), reduce_only_mode=True, now=BAR))
         self.assertEqual(len(plan0.legs), 1)
         self.assertTrue(plan0.legs[0].reduce_only and plan0.legs[0].close_position and not plan0.legs[0].is_buy)
 

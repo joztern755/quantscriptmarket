@@ -40,6 +40,8 @@ logging.getLogger("app.execution").setLevel(logging.CRITICAL)  # keep test outpu
 UTC = timezone.utc
 BAR = datetime(2026, 10, 1, 0, 0, tzinfo=UTC)
 SILVER = "xyz:SILVER"
+# SPEC §12 trusted builder dexes: Flags() alone means "allowlist not loaded" → fail closed (validator perps only)
+TRUSTED_DEXES = frozenset({"", "xyz"})
 
 
 def usd(x: int | str) -> int:
@@ -286,7 +288,7 @@ class FakeLocks:
 
 class FakeFlags:
     def __init__(self) -> None:
-        self.value = Flags()
+        self.value = Flags(trusted_dexes=TRUSTED_DEXES)
 
     def flags(self) -> Flags:
         return self.value
