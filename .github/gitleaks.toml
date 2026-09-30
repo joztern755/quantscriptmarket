@@ -28,6 +28,16 @@ regexes = [
 ]
 
 [[allowlists]]
+# Exact fixture only (local run 30 Sep 2026): the fixed fake idempotency token of the Stripe intent unit test, present in
+# history since d2c74fa; it matches neither rule above. One file, one rule, one exact value — anything else still fails.
+description = "Fixed fake idempotency token in test_payments_stripe_intent.py (exact value)"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^backend/tests/test_payments_stripe_intent\.py$''']
+regexTarget = "secret"
+regexes = ['''^3f2b7c1d9e8a4b6c$''']
+
+[[allowlists]]
 description = "localStorage / sessionStorage key names in the SPA are not secrets"
 condition = "AND"
 paths = ['''^web/(src|dist)/''']

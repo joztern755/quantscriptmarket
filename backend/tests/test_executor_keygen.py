@@ -522,7 +522,7 @@ class ExecutorKeygenDbTest(unittest.TestCase):
         self.assertEqual(ok.returncode, 0, ok.stderr)
         # a column grant that would let the api write key material is caught (never committed: the session stops on
         # the error inside the open transaction and disconnects → rollback)
-        script = f"BEGIN;\nGRANT UPDATE (key_ciphertext) ON agent_keys TO app_api;\n\\i {verify}\nROLLBACK;\n"
+        script = f"BEGIN;\nGRANT UPDATE (key_ciphertext) ON agent_keys TO app_api;\n\\i '{verify}'\nROLLBACK;\n"   # quoted: the path may contain spaces
         bad = subprocess.run([*args, "-f", "-"], input=script, capture_output=True, text=True)
         self.assertNotEqual(bad.returncode, 0)
         self.assertIn("api can write agent_keys.key_ciphertext", bad.stderr)

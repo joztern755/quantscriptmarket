@@ -309,6 +309,7 @@ class Runtime:
         self.creator_signal_budget_seconds = creator_signal_budget_seconds
         self._traded_coins: tuple[str, ...] = ()
         self._agent_decryptor: Any = None
+        self._agent_encryptor: Any = None   # agent-key sealing (executor keygen, migrations/0016)
         self._lock = threading.RLock()
         self._rate_budget: Any = None
         self._anchor_publisher = anchor_publisher
@@ -879,7 +880,7 @@ def _agent_decryptor(rt: Runtime) -> Any:
 def _agent_encryptor(rt: Runtime) -> Any:
     """Agent-key SEALING (executor only, migrations/0016): ``make_encryptor`` refuses every other service role."""
     with rt._lock:
-        if getattr(rt, "_agent_encryptor", None) is None:
+        if rt._agent_encryptor is None:
             from app.security.kms import make_encryptor
 
             rt._agent_encryptor = make_encryptor(rt.settings)
