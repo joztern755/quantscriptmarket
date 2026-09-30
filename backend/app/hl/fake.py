@@ -22,7 +22,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable
 
 from app.errors import ExternalServiceError, NotFound, ValidationFailed
 from app.hl.client import BuilderCode, LeverageResult, OrderResult, is_platform_cloid, normalize_order_response
@@ -30,7 +30,7 @@ from app.hl.info import normalize_address
 from app.hl.markets import MarketCatalog, canonical, is_valid_px, is_valid_sz
 
 __all__ = ["FIXTURES_DIR", "load_fixture", "FakeHyperliquid", "FakeExchangeGateway", "FakeGatewayFactory",
-           "FakeInfo", "FakeTransportError"]
+           "FakeInfo", "FakeTransportError", "seed_approvals"]
 
 FIXTURES_DIR = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "hl"
 _Q6 = Decimal("0.000001")
@@ -450,9 +450,3 @@ def seed_approvals(hl: FakeHyperliquid, *, master: str, agent: str, builder: str
     for s in sub_accounts:
         hl.roles[s.lower()] = {"role": "subAccount", "data": {"master": m}}
 
-
-__all__.append("seed_approvals")
-
-
-def _unused(_: Mapping[str, Any]) -> None:  # pragma: no cover
-    return None

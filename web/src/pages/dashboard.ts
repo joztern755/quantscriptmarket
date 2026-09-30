@@ -4,7 +4,7 @@ import type { PageContext } from "../core/router.js";
 import { h, mount, skeleton, errorState, emptyState, note, stat, kv, table, tabs, button, toast, confirmDialog, modal, field, badge, subStatusBadge, type Column } from "../core/ui.js";
 import { api, publicConfig, newIdempotencyKey, type PublicConfig } from "../core/api.js";
 import { appConfig } from "../core/config.js";
-import { loadStripe } from "../core/stripe.js";
+import { loadStripe, stripeFeeNotice } from "../core/stripe.js";
 import { connectWallet, getConnectedWallet } from "../core/wallet.js";
 import { usdSend } from "../core/hl.js";
 import { fmtUsd, fmtLeverage, fmtDate, fmtDateTime, fmtRelative, fmtNum, shortAddr } from "../core/format.js";
@@ -365,19 +365,10 @@ function depositPanel(ctx: PageContext, cfg: PublicConfig, onDone: () => void): 
   const usdcStatus = h("p", { class: "status", "aria-live": "polite" });
   const updateFee = (): void => {
     const m = amount.micro();
-    const est = cfg.stripe_fee_estimate;
-    if (m === null) {
-      feeLine.textContent = "";
-      return;
-    }
-    if (est) {
-      const fee = Math.floor((m * est.pct_bps) / 10000) + est.fixed_micro;
-      feeLine.textContent = `Card / wallet payments: processor fee of about ${fmtUsd(fee)} is deducted, so about ${fmtUsd(Math.max(0, m - fee))} is credited (exact amount after payment). USDC deposits have no processor fee.`;
-    } else {
-      feeLine.textContent = "Card / wallet payments: the processor's fee is deducted from the amount credited (shown on the receipt). USDC deposits have no processor fee.";
-    }
+    feeLine.textContent = `${stripeFeeNotice(cfg, m ?? undefined)} USDC deposits have no processor fee.`;
   };
   amount.el.addEventListener("input", updateFee);
+  updateFee();
 
   const valid = (): number | null => {
     const m = amount.micro();

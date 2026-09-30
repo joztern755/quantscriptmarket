@@ -66,7 +66,7 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
 async function fetchDoc(doc: string, signal: AbortSignal): Promise<string> {
   let lastErr: unknown = null;
   for (const name of FILES[doc] ?? [doc]) {
-    const res = await fetch(`/legal/${name}.md`, { signal, credentials: "omit", cache: "no-cache" });
+    const res = await fetch(new URL(`legal/${name}.md`, document.baseURI).href, { signal, credentials: "omit", cache: "no-cache" });
     if (res.ok) {
       const ct = res.headers.get("content-type") ?? "";
       // SPA hosts often rewrite unknown paths to index.html — never render that as a document.

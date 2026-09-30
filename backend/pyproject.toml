@@ -6,7 +6,6 @@ name = "aijalon-backend"
 version = "0.1.0"
 description = "aijalon.trade — strategy marketplace on Hyperliquid (API, executor, sandbox)"
 requires-python = ">=3.12,<3.13"
-readme = "../docs/SPEC.md"
 license = { text = "Proprietary" }
 
 [tool.pytest.ini_options]

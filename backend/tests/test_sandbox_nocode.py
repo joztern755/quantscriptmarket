@@ -143,7 +143,7 @@ class IndicatorMathTests(unittest.TestCase):
 class ExecutionTests(unittest.TestCase):
     def test_trend_rule_runs_in_sandbox(self):
         src = compile_spec(BASE)
-        self.assertEqual(run_signal(src, series([float(i) for i in range(80)])).weights, {"BTC": 1.5})
+        self.assertEqual(run_signal(src, series([10.0 + i for i in range(80)])).weights, {"BTC": 1.5})
         self.assertEqual(run_signal(src, series([float(100 - i) for i in range(80)])).weights, {"BTC": -0.5})
 
     def test_first_matching_rule_wins_and_price_operand(self):
