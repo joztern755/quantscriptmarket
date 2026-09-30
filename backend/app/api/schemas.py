@@ -109,12 +109,12 @@ class Page(BaseModel, Generic[T]):
 class ErrorBody(BaseModel):
     code: str
     message: str
-    request_id: Optional[str] = None
     details: Optional[dict[str, Any]] = None
 
 
 class ErrorResponse(BaseModel):
     error: ErrorBody
+    request_id: Optional[str] = None
 
 
 class Ok(Out):
@@ -196,7 +196,7 @@ class PlanOut(Out):
     features: list[str]
 
 
-class FeesOut(Out):
+class EconomicsOut(Out):
     builder_fee_tenths_bp: int
     builder_split_creator_bps: int
     builder_split_platform_bps: int
@@ -209,6 +209,7 @@ class FeesOut(Out):
     post_min_price_micro: int
     min_topup_micro: int
     past_due_grace_hours: int
+    stripe_fee_absorbed: bool
 
 
 class ReferralTierOut(Out):
@@ -218,18 +219,27 @@ class ReferralTierOut(Out):
     share_of_pool_bps: int
 
 
+class StripeFeeEstimateOut(Out):
+    pct_bps: int
+    fixed_micro: int
+
+
 class PublicConfigOut(Out):
-    fees: FeesOut
+    builder_address: str
+    treasury_address: str
+    agent_name: str
+    hl_chain: Literal["Mainnet", "Testnet"]
+    stripe_publishable_key: Optional[str] = None
+    stripe_fee_estimate: Optional[StripeFeeEstimateOut] = None
+    restricted_jurisdictions: list[str]
+    legal_versions: dict[str, str]
+    economics: EconomicsOut
     plans: list[PlanOut]
     referral_tiers: list[ReferralTierOut]
-    restricted_countries: list[str]
-    legal_versions: dict[str, str]
     features: dict[str, bool]
-    builder_address: str
-    agent_name: str
-    hyperliquid_chain: str
     platform_max_leverage: int
     min_allocation_micro: int
+    launch_phase: str
 
 
 class ShowcaseWalletOut(Out):
@@ -269,6 +279,13 @@ class MeOut(Out):
 
 class MePatchIn(In):
     display_name: Optional[DisplayName] = None
+    referral_code_used: Optional[Annotated[str, StringConstraints(min_length=4, max_length=32)]] = None
+
+    @model_validator(mode="after")
+    def _something(self) -> "MePatchIn":
+        if self.display_name is None and self.referral_code_used is None:
+            raise ValueError("nothing to change")
+        return self
 
 
 class PlanChangeIn(In):
@@ -283,32 +300,45 @@ class PlanChangeOut(Out):
 
 
 Sha256Hex = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+ConsentDoc = Literal["terms", "risk", "privacy", "jurisdiction", "waiver", "creator_agreement", "subscription_ack"]
+SITE_DOC_NAMES = ("terms", "risk", "privacy", "jurisdiction", "waiver")
 
 
 class ConsentItem(In):
-    doc: LegalDoc
-    version: DocVersion
-    doc_text_sha256: Sha256Hex                  # sha256 of the exact rendered text the user saw
-    country: Optional[Country] = None           # required when doc == "jurisdiction"
+    doc: ConsentDoc
+    doc_version: DocVersion
+    context: Literal["site_entry", "subscribe", "creator"]
+    strategy_id: Optional[UUID] = None
+    accepted_at: Optional[Annotated[str, StringConstraints(max_length=40)]] = None   # client clock; audit only
+    doc_text_sha256: Optional[Sha256Hex] = None     # sha256 of the exact rendered text the user saw
+    country: Optional[Country] = None               # optional residence attestation (jurisdiction doc only)
 
     @model_validator(mode="after")
-    def _country_for_jurisdiction(self) -> "ConsentItem":
-        if self.doc == "jurisdiction" and not self.country:
-            raise ValueError("country is required for the jurisdiction attestation")
-        if self.doc != "jurisdiction" and self.country:
+    def _shape(self) -> "ConsentItem":
+        if self.doc == "subscription_ack":
+            if self.context != "subscribe" or self.strategy_id is None:
+                raise ValueError("subscription_ack needs context 'subscribe' and a strategy_id")
+        elif self.doc == "creator_agreement":
+            if self.context != "creator" or self.strategy_id is not None:
+                raise ValueError("creator_agreement needs context 'creator' and no strategy_id")
+        else:
+            if self.context == "creator":
+                raise ValueError("site documents use context 'site_entry' or 'subscribe'")
+            if self.context == "site_entry" and self.strategy_id is not None:
+                raise ValueError("strategy_id is only allowed with context 'subscribe'")
+        if self.country and self.doc != "jurisdiction":
             raise ValueError("country is only accepted with the jurisdiction attestation")
         return self
 
 
 class ConsentBatchIn(In):
-    context: Literal["site_entry", "creator"] = "site_entry"
-    items: list[ConsentItem] = Field(min_length=1, max_length=8)
+    consents: list[ConsentItem] = Field(min_length=1, max_length=10)
 
-    @field_validator("items")
+    @field_validator("consents")
     @classmethod
     def _unique_docs(cls, items: list[ConsentItem]) -> list[ConsentItem]:
-        docs = [i.doc for i in items]
-        if len(docs) != len(set(docs)):
+        keys = [(i.doc, i.strategy_id) for i in items]
+        if len(keys) != len(set(keys)):
             raise ValueError("duplicate doc in batch")
         return items
 
@@ -321,15 +351,14 @@ class ConsentStatusOut(Out):
 
 
 # ---------------------------------------------------------------------------------------------------- wallets / agents
-class WalletChallengeOut(Out):
-    address: str
-    issued_at: str
-    message: str
+class WalletNonceOut(Out):
+    nonce: str
+    expires_at: datetime
 
 
 class WalletVerifyIn(In):
     address: Address
-    issued_at: Annotated[str, StringConstraints(min_length=10, max_length=40)]
+    message: Annotated[str, StringConstraints(min_length=40, max_length=2000)]   # EIP-4361 (SIWE) text
     signature: Signature
 
 
@@ -390,7 +419,11 @@ class SubscriptionCreateIn(In):
     allocation_micro: Optional[Micro] = None
     allocation: Optional[UsdString] = None
     max_leverage_x100: Annotated[StrictInt, Field(ge=100, le=2000)]
-    ack: SubscriptionAck
+    # Either an inline ack, or a subscription_ack consent for this strategy recorded via POST /consents in the
+    # last 30 minutes (the web subscribe gate does the latter). expected_* guard against terms changing mid-flow.
+    ack: Optional[SubscriptionAck] = None
+    expected_price_monthly_micro: Optional[MicroOrZero] = None
+    expected_profit_share_bps: Optional[Annotated[StrictInt, Field(ge=0, le=10_000)]] = None
 
     @model_validator(mode="after")
     def _amount(self) -> "SubscriptionCreateIn":
@@ -419,6 +452,10 @@ class SubscriptionPatchIn(In):
         if micro is None and self.max_leverage_x100 is None and self.paused is None:
             raise ValueError("nothing to change")
         return self
+
+
+class SubscriptionCancelIn(In):
+    positions: Literal["close", "leave"]        # required, no default (SPEC §12)
 
 
 class SubscriptionOut(Out):
@@ -482,6 +519,7 @@ class StripeDepositOut(Out):
 
 
 class UsdcTypedDataIn(AmountIn):
+    from_address: Address                       # a verified wallet of the user (the expected signer)
     signature_chain_id: ChainIdHex
 
 
@@ -495,6 +533,7 @@ class UsdcTypedDataOut(Out):
 
 
 class UsdcConfirmIn(In):
+    from_address: Optional[Address] = None      # default: all verified wallets of the user
     time_ms: Optional[Annotated[StrictInt, Field(ge=1_600_000_000_000, le=4_000_000_000_000)]] = None
 
 

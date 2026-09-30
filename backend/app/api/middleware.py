@@ -62,7 +62,7 @@ def security_headers(*, cacheable_public: bool) -> dict[str, str]:
 
 async def send_json_error(send: Callable[[dict], Awaitable[None]], status: int, code: str, message: str,
                           request_id: str = "", extra_headers: dict[str, str] | None = None) -> None:
-    body = json.dumps({"error": {"code": code, "message": message, "request_id": request_id or None}}).encode()
+    body = json.dumps({"error": {"code": code, "message": message}, "request_id": request_id or None}).encode()
     headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]
     for k, val in (extra_headers or {}).items():
         headers.append((k.lower().encode(), val.encode()))

@@ -50,10 +50,11 @@ def _public_details(exc: AppError) -> Optional[dict[str, Any]]:
 
 def _error(status: int, code: str, message: str, request: Request, details: Optional[dict] = None,
            headers: Optional[dict[str, str]] = None) -> JSONResponse:
-    body: dict[str, Any] = {"code": code, "message": message, "request_id": _request_id(request)}
+    body: dict[str, Any] = {"code": code, "message": message}
     if details:
         body["details"] = details
-    return JSONResponse(status_code=status, content={"error": body}, headers=headers)
+    return JSONResponse(status_code=status, content={"error": body, "request_id": _request_id(request)},
+                        headers=headers)
 
 
 def _install_error_handlers(app: FastAPI) -> None:

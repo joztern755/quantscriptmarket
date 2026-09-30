@@ -234,7 +234,7 @@ done
 expect_ok "audit_log + consents inserts" <<SQL
 INSERT INTO audit_log (actor, action, target, payload) VALUES ('system:test', 'test.one', '', '{"n": 1}');
 INSERT INTO audit_log (actor, action, target, payload, ip_hash) VALUES ('admin:$A1', 'flag.set', 'flag:kill_switch_global', '{"v": true, "s": "é\n"}', 'abc');
-INSERT INTO consents (user_id, doc, doc_version, context) VALUES ('$U1', 'terms', '2026-09-30', 'site_entry');
+INSERT INTO consents (user_id, doc, doc_version, doc_text_sha256, context) VALUES ('$U1', 'terms', '2026-09-30', repeat('a', 64), 'site_entry');
 SQL
 for stmt in "UPDATE audit_log SET action = 'x'" "DELETE FROM audit_log" "TRUNCATE audit_log" \
             "UPDATE consents SET doc_version = 'x'" "DELETE FROM consents" "TRUNCATE consents"; do
@@ -384,7 +384,7 @@ expect_err "app_api: TRUNCATE ledger_entries -> 42501" 42501 "$DB" "$API_USER" <
 expect_eq "app_api: can post via ledger_post" "t" "$DB" "$API_USER" <<<"$(post api:1 deposit '[{"account":"treasury:hl_usdc","amount_micro":1000000},{"account":"'$FEE1'","amount_micro":-1000000}]')"
 expect_ok "app_api: can append audit_log and consents" "$DB" "$API_USER" <<SQL
 INSERT INTO audit_log (actor, action, target, payload) VALUES ('user:$U1', 'consent.accept', '', '{}');
-INSERT INTO consents (user_id, doc, doc_version, context) VALUES ('$U1', 'risk', '2026-09-30', 'site_entry');
+INSERT INTO consents (user_id, doc, doc_version, doc_text_sha256, context) VALUES ('$U1', 'risk', '2026-09-30', repeat('b', 64), 'site_entry');
 SQL
 expect_eq "app_api: can run verify_chain()" "0" "$DB" "$API_USER" <<<"SELECT count(*) FROM verify_chain();"
 expect_err "app_api: cannot write orders -> 42501" 42501 "$DB" "$API_USER" <<SQL
@@ -392,7 +392,7 @@ INSERT INTO orders (subscription_id, cloid, coin, side, sz, limit_px) SELECT id,
 SQL
 expect_eq "app_executor: can read key_ciphertext" "\\x00ff" "$DB" "$EXEC_USER" <<<"SELECT key_ciphertext FROM agent_keys;"
 expect_err "app_executor: cannot write consents -> 42501" 42501 "$DB" "$EXEC_USER" <<SQL
-INSERT INTO consents (user_id, doc, doc_version, context) VALUES ('$U1', 'risk', 'x', 'site_entry');
+INSERT INTO consents (user_id, doc, doc_version, doc_text_sha256, context) VALUES ('$U1', 'risk', 'x', repeat('c', 64), 'site_entry');
 SQL
 expect_err "app_executor: UPDATE ledger -> 42501" 42501 "$DB" "$EXEC_USER" <<<"UPDATE ledger_entries SET amount_micro = 1;"
 

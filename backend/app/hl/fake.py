@@ -186,7 +186,7 @@ class FakeHyperliquid:
         mid = self.mids.get(coin) or acct.positions[coin].entry_px
         ev = {"time": time_ms or self.now_ms, "hash": "0x" + "0" * 64,
               "delta": {"type": "funding", "coin": coin, "usdc": _s(_q6(-szi * mid * rate)), "szi": _s(szi),
-                        "fundingRate": _s(rate), "nSamples": 60}}
+                        "fundingRate": _s(rate), "nSamples": None}}
         acct.funding.append(ev)
         return ev
 

@@ -12,7 +12,7 @@ import { backtestPanel } from "./_shared/backtest.js";
 import { noCodeBuilder } from "./_shared/nocode-ui.js";
 import { precheckPython, PYTHON_TEMPLATE } from "./_shared/nocode.js";
 import { renderMarkdown } from "./_shared/markdown.js";
-import { ensurePageCss, listOf, isAbortError, errCode, errMessage, pageHead, panel, usdInput, pctToBps, bpsToPctInput, isRec, BACKTEST_WARNING } from "./_shared/util.js";
+import { ensurePageCss, listOf, isAbortError, errCode, errMessage, pageHead, panel, usdInput, pctToBps, bpsToPctInput, isRec, kvWide, BACKTEST_WARNING } from "./_shared/util.js";
 
 export const title = "Creator Studio";
 
@@ -203,7 +203,7 @@ async function newStrategyTab(body: HTMLElement, ctx: PageContext, cfg: PublicCo
       prev,
       h("b", null, "What a subscriber pays and what you receive"),
       bps === null || bps > cap ? h("p", { class: "neg" }, `Profit share must be 0–${fmtBps(cap)}.`) : null,
-      kv([
+      kvWide([
         ["Subscription (per month)", `Subscriber pays ${fmtUsd(p)} → you receive ${fmtUsd(sub.creatorMicro)} (platform ${fmtBps(e.subscription_platform_bps)} = ${fmtUsd(sub.platformMicro)})`],
         [
           "Profit share on $1,000 new profit",

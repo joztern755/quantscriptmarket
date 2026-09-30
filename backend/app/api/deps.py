@@ -70,6 +70,11 @@ class JurisdictionBlocked(Forbidden):
     http_status, code = 451, "jurisdiction_restricted"
 
 
+class MfaRequired(Unauthorized):
+    """Token has no TOTP second factor → the web client sends the user to sign-in / MFA enrolment."""
+    code = "mfa_required"
+
+
 class ServiceUnavailable(AppError):
     http_status, code = 503, "service_unavailable"
 
@@ -382,7 +387,7 @@ def check_mfa_claims(claims: dict[str, Any]) -> None:
     """Defence in depth (also enforced by app.security.auth): TOTP second factor + Google/Apple provider."""
     fb = claims.get("firebase") or {}
     if fb.get("sign_in_second_factor") != "totp":
-        raise Unauthorized("TOTP multi-factor sign-in required", mfa_required=True)
+        raise MfaRequired("TOTP multi-factor sign-in required")
     if fb.get("sign_in_provider") not in ALLOWED_SIGN_IN_PROVIDERS:
         raise Unauthorized("unsupported sign-in provider")
 
@@ -476,7 +481,12 @@ def require_payouts_enabled(svc: "Services") -> None:
 def current_user(request: Request, svc: Services = Depends(get_services)) -> AuthCtx:
     token = _bearer(request)
     claims = svc.auth.verify(token)
-    svc.auth.require_mfa(claims)
+    try:
+        svc.auth.require_mfa(claims)
+    except StepUpRequired:
+        raise
+    except Unauthorized as e:
+        raise MfaRequired(e.message) from None
     check_mfa_claims(claims)
     uid = claims.get("uid") or claims.get("user_id") or claims.get("sub")
     if not uid:
@@ -519,8 +529,10 @@ def consented_user(ctx: AuthCtx = Depends(current_user), svc: Services = Depends
         missing = missing_consents(conn, svc, ctx.user_id)
     if missing:
         raise ConsentRequired("accept the current legal documents first", missing=missing)
+    # The jurisdiction attestation itself is a required consent (above). A residence country, when the user
+    # stated one, must not be restricted; the network-level CF-IPCountry check runs in EdgeGuardMiddleware.
     attested = ctx.user.get("country_attested")
-    if not attested or attested in svc.settings.restricted_countries:
+    if attested and attested in svc.settings.restricted_countries:
         raise JurisdictionBlocked("service not available in your jurisdiction")
     return ctx
 

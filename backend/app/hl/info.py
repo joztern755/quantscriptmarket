@@ -233,7 +233,9 @@ class InfoClient:
 
     def user_funding(self, user: str, start_ms: int, end_ms: int | None = None) -> list[dict]:
         """``[{"time","hash"(zero),"delta":{"type":"funding","coin","usdc","szi","fundingRate","nSamples"}}]``,
-        oldest first. ``usdc`` > 0 = received by the user."""
+        oldest first. ``usdc`` > 0 = received by the user. Entries older than ~8 days come back as DAILY aggregates
+        (time = UTC midnight, ``nSamples`` = payments merged, szi/fundingRate averaged); recent ones are hourly
+        (``nSamples`` null) — scan at least daily."""
         body: dict[str, Any] = {"type": "userFunding", "user": normalize_address(user, "user"),
                                 "startTime": _ms(start_ms, "start")}
         if end_ms is not None:

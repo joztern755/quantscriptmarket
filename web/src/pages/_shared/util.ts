@@ -231,3 +231,8 @@ export function inlineMd(tag: "p" | "span" | "div", text: string, cls?: string):
   renderInline(el, text.replace(/\s+/g, " "));
   return el;
 }
+
+/** Label/value list with room for sentence-length values (core `.kv.fees` layout, stacks on phones). */
+export function kvWide(pairs: [string, Child][]): HTMLDListElement {
+  return h("dl", { class: "kv fees" }, pairs.flatMap(([k, v]) => [h("dt", null, k), h("dd", null, v)]));
+}

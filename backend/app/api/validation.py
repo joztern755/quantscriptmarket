@@ -145,27 +145,50 @@ def request_fingerprint(method: str, path: str, body: bytes) -> str:
     return h.hexdigest()
 
 
-# ------------------------------------------------------------------------------------------------ wallet verify
-WALLET_MESSAGE_PREFIX = "aijalon.trade wallet verification"
+# ------------------------------------------------------------------------------------------------ wallet verify (SIWE)
+SIWE_SUFFIX = " wants you to sign in with your Ethereum account:"
+_SIWE_FIELDS = {"URI", "Version", "Chain ID", "Nonce", "Issued At", "Expiration Time", "Not Before", "Request ID"}
+NONCE_RE = re.compile(r"^[A-Za-z0-9]{8,64}$")
 
 
-def wallet_verification_message(user_id: str, address: str, issued_at: str) -> str:
-    """Canonical EIP-191 message the user signs to prove wallet ownership. Binding user id + address + time
-    means a captured signature cannot link the wallet to a different account and expires quickly."""
-    return (
-        f"{WALLET_MESSAGE_PREFIX}\n"
-        f"Account: {user_id}\n"
-        f"Wallet: {address.lower()}\n"
-        f"Issued at: {issued_at}\n"
-        "This signature proves you control this wallet. It does not authorize any transaction."
-    )
+def parse_siwe(message: str) -> dict[str, str]:
+    """Parse an EIP-4361 message into {domain, address, URI, Version, Chain ID, Nonce, Issued At, …}.
+    Strict: LF line endings only, each field at most once, required fields present. Statement is ignored."""
+    if not isinstance(message, str) or "\r" in message or len(message) > 2000:
+        raise InputError("malformed sign-in message")
+    lines = message.split("\n")
+    if len(lines) < 7 or not lines[0].endswith(SIWE_SUFFIX):
+        raise InputError("not an EIP-4361 sign-in message")
+    out: dict[str, str] = {"domain": lines[0][: -len(SIWE_SUFFIX)], "address": lines[1].strip()}
+    if not ADDRESS_RE.match(out["address"]):
+        raise InputError("sign-in message has no valid address")
+    in_resources = False
+    for line in lines[2:]:
+        if in_resources:
+            if line.startswith("- "):
+                continue
+            in_resources = False
+        if line == "Resources:":
+            in_resources = True
+            continue
+        key, sep, value = line.partition(": ")
+        if sep and key in _SIWE_FIELDS:
+            if key in out:
+                raise InputError(f"duplicate field {key}")
+            out[key] = value.strip()
+    for req in ("URI", "Version", "Chain ID", "Nonce", "Issued At"):
+        if req not in out:
+            raise InputError(f"sign-in message missing {req}")
+    if out["Version"] != "1" or not out["Chain ID"].isdigit() or not NONCE_RE.match(out["Nonce"]):
+        raise InputError("unsupported sign-in message fields")
+    return out
 
 
 def parse_issued_at(value: str) -> datetime:
     try:
         ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (ValueError, AttributeError) as e:
-        raise InputError("invalid issued_at") from e
+        raise InputError("invalid timestamp") from e
     if ts.tzinfo is None:
-        raise InputError("issued_at must include a timezone")
+        raise InputError("timestamp must include a timezone")
     return ts.astimezone(timezone.utc)

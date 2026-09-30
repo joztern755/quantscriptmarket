@@ -188,6 +188,7 @@ CREATE TABLE consents (                                       -- append-only
     user_id          uuid NOT NULL REFERENCES users(id),
     doc              consent_doc NOT NULL,
     doc_version      text NOT NULL CHECK (length(doc_version) BETWEEN 1 AND 64),
+    doc_text_sha256  text NOT NULL CHECK (doc_text_sha256 ~ '^[0-9a-f]{64}$'),   -- exact text accepted (evidence)
     context          consent_context NOT NULL,
     strategy_id      uuid,                                    -- FK added after strategies
     ip_hash          text,

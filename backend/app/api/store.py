@@ -168,12 +168,22 @@ class SqlStore:
             ORDER BY doc, accepted_at DESC""", u=user_id)
         return {r["doc"]: r["doc_version"] for r in rows}
 
-    def insert_consent(self, conn: Any, *, user_id: str, doc: str, version: str, context: str,
+    def insert_consent(self, conn: Any, *, user_id: str, doc: str, version: str, doc_text_sha256: str, context: str,
                        strategy_id: Optional[str], ip_hash: Optional[str], ua_hash: Optional[str]) -> None:
         self._exec(conn, """
-            INSERT INTO consents (user_id, doc, doc_version, context, strategy_id, ip_hash, user_agent_hash)
-            VALUES (CAST(:u AS uuid), :doc, :ver, :ctx, CAST(:sid AS uuid), :ip, :ua)""",
-                   u=user_id, doc=doc, ver=version, ctx=context, sid=strategy_id, ip=ip_hash, ua=ua_hash)
+            INSERT INTO consents (user_id, doc, doc_version, doc_text_sha256, context, strategy_id, ip_hash,
+                                  user_agent_hash)
+            VALUES (CAST(:u AS uuid), :doc, :ver, :h, :ctx, CAST(:sid AS uuid), :ip, :ua)""",
+                   u=user_id, doc=doc, ver=version, h=doc_text_sha256, ctx=context, sid=strategy_id, ip=ip_hash,
+                   ua=ua_hash)
+
+    def recent_subscription_ack(self, conn: Any, *, user_id: str, strategy_id: str, version: str,
+                                since: datetime) -> Optional[dict]:
+        return self._one(conn, """
+            SELECT doc_version, doc_text_sha256, accepted_at FROM consents
+             WHERE user_id = CAST(:u AS uuid) AND doc = 'subscription_ack' AND strategy_id = CAST(:s AS uuid)
+               AND doc_version = :v AND accepted_at >= :since
+             ORDER BY accepted_at DESC LIMIT 1""", u=user_id, s=strategy_id, v=version, since=since)
 
     # ------------------------------------------------------------------------------------------ wallets
     def list_wallets(self, conn: Any, user_id: str) -> list[dict]:
@@ -205,6 +215,24 @@ class SqlStore:
         row = self._one(conn, """SELECT user_id FROM wallets WHERE master_address = :a AND verified_at IS NOT NULL""",
                         a=address)
         return str(row["user_id"]) if row else None
+
+    def create_wallet_nonce(self, conn: Any, *, user_id: str, nonce: str, expires_at: datetime) -> None:
+        self._exec(conn, """INSERT INTO wallet_nonces (nonce, user_id, expires_at)
+                            VALUES (:n, CAST(:u AS uuid), :e)""", n=nonce, u=user_id, e=expires_at)
+
+    def consume_wallet_nonce(self, conn: Any, *, user_id: str, nonce: str, now: datetime) -> bool:
+        """Single use: marks the nonce used iff it belongs to the user, is unused and unexpired."""
+        row = self._one(conn, """UPDATE wallet_nonces SET used_at = :t
+                                 WHERE nonce = :n AND user_id = CAST(:u AS uuid) AND used_at IS NULL AND expires_at > :t
+                                 RETURNING nonce""", t=now, n=nonce, u=user_id)
+        return row is not None
+
+    def bind_referrer(self, conn: Any, *, user_id: str, referrer_id: str) -> bool:
+        """First and only binding (the DB trigger also makes referred_by immutable once set)."""
+        row = self._one(conn, """UPDATE users SET referred_by = CAST(:r AS uuid)
+                                 WHERE id = CAST(:u AS uuid) AND referred_by IS NULL AND id <> CAST(:r AS uuid)
+                                 RETURNING id""", r=referrer_id, u=user_id)
+        return row is not None
 
     # ------------------------------------------------------------------------------------------ agents / builder
     def list_agents(self, conn: Any, user_id: str) -> list[dict]:
@@ -375,6 +403,16 @@ class SqlStore:
                          u=user_id)
         return [int(r["p"]) for r in rows]
 
+    def total_live_allocation(self, conn: Any, user_id: Optional[str] = None, *,
+                              exclude_subscription_id: Optional[str] = None) -> int:
+        """Σ allocation of live subscriptions (one user, or the whole platform) — launch-phase caps."""
+        row = self._one(conn, """
+            SELECT coalesce(sum(allocation_micro), 0)::bigint AS s FROM subscriptions
+             WHERE status::text IN ('pending', 'active', 'past_due', 'reduce_only', 'paused_user', 'closing')
+               AND (CAST(:u AS uuid) IS NULL OR user_id = CAST(:u AS uuid))
+               AND (CAST(:x AS uuid) IS NULL OR id <> CAST(:x AS uuid))""", u=user_id, x=exclude_subscription_id)
+        return int(row["s"]) if row else 0
+
     def live_subscription_on_address(self, conn: Any, address: str) -> Optional[dict]:
         return self._one(conn, f"""SELECT {_SUB_COLS} FROM subscriptions s WHERE s.trading_address = :a
                                    AND s.status::text IN ('pending', 'active', 'past_due', 'reduce_only', 'closing')""", a=address)
@@ -419,7 +457,7 @@ class SqlStore:
         """status 'cancelled' (leave positions) or 'closing' (executor flattens, then cancels)."""
         self._exec(conn, """UPDATE subscriptions SET status = CAST(:s AS subscription_status), status_changed_at = :t,
                                    cancelled_at = CASE WHEN :s2 = 'cancelled' THEN CAST(:t AS timestamptz) ELSE cancelled_at END
-                            WHERE id = CAST(:id AS uuid) AND status::text NOT IN ('cancelled', 'closing')""",
+                            WHERE id = CAST(:id AS uuid) AND status::text <> 'cancelled'""",
                    s=status, s2=status, t=now, id=sub_id)
 
     def list_subscriptions(self, conn: Any, user_id: str, limit: int, cursor: Cursor) -> list[dict]:

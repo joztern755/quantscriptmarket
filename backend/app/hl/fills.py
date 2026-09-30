@@ -13,8 +13,12 @@ Field semantics VERIFIED on mainnet fills (2026-09-30, 2000+ fills of an agent-t
 - Fills sharing one timestamp are NOT ordered by ``tid``; the ``startPosition`` chain gives the true order. Our
   position timeline therefore aggregates per millisecond.
 - Funding: ``delta.usdc`` > 0 = paid TO the user (272/272 entries have sign(usdc) = −sign(szi × fundingRate));
-  ``szi`` is the account's signed position at that funding; hash is all zeros (idempotency key must be
-  (trading_address, coin, time), as SPEC §4 says). Funding times sit on the hour ± a few ms.
+  hash is all zeros (idempotency key must be (trading_address, coin, time), as SPEC §4 says).
+- Funding GRANULARITY depends on age (VERIFIED): the last ~8 days come back HOURLY (``nSamples: null``, time =
+  the hour + a few ms, ``szi`` = position at that payment). Older funding comes back as DAILY AGGREGATES
+  (time = UTC midnight, ``nSamples`` = hourly payments merged — the bucket at T holds the payments at T+0h … T+23h
+  — and ``szi``/``fundingRate`` are averages over those samples). ⇒ scan and store funding at least daily (the
+  00:30 UTC settlement does); aggregated buckets are only estimated (see ``attribute_funding``).
 
 Rounding (documented contract): all Hyperliquid perp USDC amounts observed have ≤ 6 decimals, so conversion to
 micro is exact. Where it is not (funding pro-rata), values are FLOORED toward −∞: attributed PnL is never
@@ -229,6 +233,11 @@ class FundingEvent:
     szi: Decimal              # account's signed position at the funding
     funding_rate: Decimal
     hash: str
+    n_samples: int | None = None   # None = one hourly payment; int = daily aggregate of that many payments
+
+    @property
+    def is_aggregate(self) -> bool:
+        return self.n_samples is not None
 
     @staticmethod
     def parse(raw: Mapping[str, Any]) -> "FundingEvent":
@@ -242,7 +251,8 @@ def parse_funding(raw: Mapping[str, Any]) -> FundingEvent:
             raise ValueError("not a funding delta")
         return FundingEvent(time_ms=int(raw["time"]), coin=str(d["coin"]), usdc=parse_decimal(d["usdc"]),
                             szi=parse_decimal(d["szi"]), funding_rate=parse_decimal(d["fundingRate"]),
-                            hash=str(raw.get("hash", "")))
+                            hash=str(raw.get("hash", "")),
+                            n_samples=int(d["nSamples"]) if d.get("nSamples") is not None else None)
     except (KeyError, TypeError, ValueError) as e:
         raise ValidationFailed("unparseable funding", error=str(e)) from e
 
@@ -255,6 +265,7 @@ class AttributedFunding:
     usdc_micro: int           # attributed amount (floored toward −∞)
     share: Decimal            # our position / account position (0..1)
     event: FundingEvent
+    estimated: bool = False   # from a daily aggregate (see attribute_funding)
 
 
 @dataclass
@@ -269,13 +280,21 @@ class FundingAttribution:
 
 def attribute_funding(raw_funding: Iterable[Mapping[str, Any]], *, subscription_id: str,
                       fills: Iterable[Fill], coins: Iterable[str], start_ms: int, end_ms: int | None = None,
-                      start_positions: Mapping[str, Decimal] | None = None) -> FundingAttribution:
+                      start_positions: Mapping[str, Decimal] | None = None,
+                      aggregate_income: str = "drop") -> FundingAttribution:
     """Funding on the strategy's coins while the SUBSCRIPTION held a position (per its own fills).
 
-    share = our_position / account_szi, clamped to [0, 1]: if the user also trades the same coin by hand only our
-    part of the funding is attributed; if our position exceeds the account's (user reduced it manually) all of the
-    account's funding is attributed. Opposite signs or a flat account while we think we hold a position are
-    anomalies (share 0, reported)."""
+    Hourly entries: share = our position just before the payment / account ``szi``, clamped to [0, 1] (if the
+    user also trades the coin by hand only our part is attributed; if our position exceeds the account's, all of
+    it). A flat or opposite account while we hold a position → anomaly, nothing attributed.
+
+    Daily aggregates (``nSamples`` set): our position is sampled at T+0h … T+23h;
+    share ≈ Σ|our position| / (|avg szi| × nSamples), clamped to [0, 1]. The estimate assumes a stable rate
+    over the day, so by default (``aggregate_income="drop"``) estimated INCOME is not attributed while estimated
+    COSTS are — attributed PnL is never overstated (``"estimate"`` keeps income too). If our sampled positions
+    disagree in sign with the average, only a cost is attributed (in full) and the entry is reported."""
+    if aggregate_income not in ("drop", "estimate"):
+        raise ValidationFailed("aggregate_income must be 'drop' or 'estimate'")
     coins = set(coins)
     fills = [f for f in fills if f.coin in coins]
     starts = dict(start_positions or {})
@@ -289,15 +308,32 @@ def attribute_funding(raw_funding: Iterable[Mapping[str, Any]], *, subscription_
         if (ev.time_ms, ev.coin) in seen:
             continue
         seen.add((ev.time_ms, ev.coin))
-        ours = position_before(timelines[ev.coin], ev.time_ms, starts.get(ev.coin, ZERO))
-        if ours == 0:
+        tl, start_pos = timelines[ev.coin], starts.get(ev.coin, ZERO)
+        if not ev.is_aggregate:
+            ours = position_before(tl, ev.time_ms, start_pos)
+            if ours == 0:
+                continue
+            if ev.szi == 0 or (ours > 0) != (ev.szi > 0):
+                out.anomalies.append((ev, "account position flat or opposite to subscription position"))
+                continue
+            share = min(Decimal(1), abs(ours) / abs(ev.szi))
+            out.attributed.append(AttributedFunding(subscription_id, ev.coin, ev.time_ms,
+                                                    to_micro(ev.usdc * share, ROUND_FLOOR), share, ev))
             continue
-        if ev.szi == 0 or (ours > 0) != (ev.szi > 0):
-            out.anomalies.append((ev, "account position flat or opposite to subscription position"))
+        held = [p for p in (position_before(tl, ev.time_ms + h * 3_600_000, start_pos) for h in range(24)) if p != 0]
+        if not held:
             continue
-        share = min(Decimal(1), abs(ours) / abs(ev.szi))
+        consistent = ev.szi != 0 and ev.n_samples and all((p > 0) == (ev.szi > 0) for p in held)
+        if not consistent:
+            out.anomalies.append((ev, "aggregated funding bucket with mixed/opposite positions; cost-only"))
+            amount, share = min(ZERO, ev.usdc), Decimal(1)
+        else:
+            share = min(Decimal(1), sum((abs(p) for p in held), ZERO) / (abs(ev.szi) * ev.n_samples))
+            amount = ev.usdc * share
+            if amount > 0 and aggregate_income == "drop":
+                amount = ZERO
         out.attributed.append(AttributedFunding(subscription_id, ev.coin, ev.time_ms,
-                                                to_micro(ev.usdc * share, ROUND_FLOOR), share, ev))
+                                                to_micro(amount, ROUND_FLOOR), share, ev, estimated=True))
     out.attributed.sort(key=lambda a: (a.time_ms, a.coin))
     return out
 
