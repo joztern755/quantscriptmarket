@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+web/dist/
+.env
+.env.*
+*.pem
+*.key
+service-account*.json
+.pgdata/
+.pytest_cache/
