@@ -14,12 +14,16 @@ Scheduler cadence (Cloud Scheduler → OIDC → executor service; source of trut
                                            2. the executor tick (signals → jittered, guarded IOC orders; closing
                                               subscriptions flattened; see app.execution.executor).
   /internal/settle-daily    30 0 * * *     ``settle_daily`` — after the fills/funding sync of the previous day.
-                                           Router param ``settle_date`` = the trading day being settled (default
-                                           yesterday); PnL cut-off = settle_date + 1 day 00:00 UTC (never after now).
-  /internal/reconcile       7 * * * *      ``reconcile`` — positions vs targets, builder fees DB vs on-chain, treasury;
-                                           alert dedup keys are per day, every run's report is stored.
-  /internal/referral-tiers  15 1 * * *     ``referral_tiers`` — re-evaluates users.referral_tier (SPEC §1.2); the next
-                                           settlement's builder-fee referral split uses it.
+                            30 2,6 * * *   Router param ``settle_date`` = the trading day being settled (default
+                            (settle-daily-  yesterday); PnL cut-off = settle_date + 1 day 00:00 UTC (never after now).
+                            retry)         A subscription whose trading address fills-ingest / funding-scan have not
+                                           synced past the cut-off is DEFERRED (no posting; ops event
+                                           ``settlement_deferred``); the retry slots settle it (app.execution.settlement).
+  /internal/reconcile       0 * * * *      ``reconcile`` (hourly) — positions vs targets, builder fees DB vs on-chain,
+                                           treasury; alert dedup keys are per day, every run's report is stored.
+  /internal/referral-tiers  15 1 * * *     ``referral_tiers`` — re-evaluates users.referral_tier (SPEC §1.2). Runs
+                                           AFTER the 00:30 settlement on purpose: the NEXT day's settlement uses the
+                                           new tier for its builder-fee referral split.
 All jobs are idempotent (ledger idempotency keys, UNIQUE constraints, cursors); settle/reconcile/referral-tiers take
 a job-level advisory lock and the tick locks per subscription (and per creator version), so Scheduler retries and
 overlapping runs are safe.
@@ -523,8 +527,10 @@ def run_tick(*, db: Any, now: datetime, runtime: Runtime | None = None, creator_
 
 def settle_daily(*, db: Any, now: datetime, settle_date: date | str | None = None,
                  runtime: Runtime | None = None) -> dict[str, Any]:
-    """/internal/settle-daily (00:30 UTC). ``settle_date`` = the trading day to settle (router default: yesterday);
-    its PnL cut-off is the next midnight, clamped to today's midnight. Without it: cut-off = today 00:00 UTC."""
+    """/internal/settle-daily (00:30 UTC; retried by ``settle-daily-retry`` at 02:30 and 06:30). ``settle_date`` = the
+    trading day to settle (router default: yesterday); its PnL cut-off is the next midnight, clamped to today's
+    midnight. Without it: cut-off = today 00:00 UTC. Subscriptions whose data (fills-ingest, funding-scan) is not
+    synced past the cut-off are deferred (``deferred`` in the result); re-running is always safe (idempotent)."""
     rt = runtime or get_runtime()
     now = _aware(now)
     pdb = _db(db)
@@ -543,7 +549,9 @@ def settle_daily(*, db: Any, now: datetime, settle_date: date | str | None = Non
 
 
 def reconcile(*, db: Any, now: datetime, runtime: Runtime | None = None) -> dict[str, Any]:
-    """/internal/reconcile (daily). The report is stored (reconciliation_reports) for the admin console."""
+    """/internal/reconcile (hourly, :00). The report is stored (reconciliation_reports) for the admin console; alert
+    dedup keys are per UTC day, so a persisting mismatch alerts once a day, not every hour. Its Hyperliquid reads are
+    charged to the shared rate budget's JOBS pool (the tick keeps its reserve)."""
     rt = runtime or get_runtime()
     now = _aware(now)
     pdb = _db(db)
@@ -566,8 +574,9 @@ def latest_reconciliation(conn: Any = None, *, db: Any = None, now: datetime | N
 
 
 def referral_tiers(*, db: Any, now: datetime, runtime: Runtime | None = None, window_days: int = 30) -> dict[str, Any]:
-    """/internal/referral-tiers (daily, before settlement): SPEC §1.2 tiers on trailing-30-day stats of each
-    referrer's referred users (active users OR referred notional) → users.referral_tier."""
+    """/internal/referral-tiers (daily 01:15 UTC — AFTER the 00:30 settlement on purpose, so the next day's
+    settlement uses the new tier): SPEC §1.2 tiers on trailing-30-day stats of each referrer's referred users (active
+    users OR referred notional) → users.referral_tier."""
     from app.domain.referrals import evaluate_tier
 
     rt = runtime or get_runtime()
