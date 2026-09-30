@@ -38,6 +38,7 @@ from app.api.deps import (
     user_limit,
 )
 from app.errors import Conflict, Forbidden, NotFound, ValidationFailed
+from app.alerts.user_sinks import require_alert_contacts
 
 router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 
@@ -116,6 +117,7 @@ def create_subscription(body: S.SubscriptionCreateIn, ctx: AuthCtx = Depends(ste
 
     # ---- network checks first (no DB transaction held open during Hyperliquid calls)
     with svc.db.begin() as conn:
+        require_alert_contacts(conn, svc, ctx.user_id)   # SPEC §12: Telegram linked + email confirmed (409 contacts_required)
         master = _resolve_master(conn, svc, ctx.user_id, addr)
     if not s.builder_address:
         raise ValidationFailed("builder address not configured")

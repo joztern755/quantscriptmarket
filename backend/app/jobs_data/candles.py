@@ -86,7 +86,13 @@ def live_perp_markets(info: Any) -> tuple[list[str], list[str]]:
     coins: list[str] = []
     skipped: list[str] = []
     for dex in dict.fromkeys(names):
-        meta = info.meta(dex)
+        try:
+            meta = info.meta(dex)
+        except AppError:
+            if dex == "":
+                raise                                       # the validator dex is required
+            skipped.append(f"dex:{dex}")                    # one broken builder dex must not stop the others
+            continue
         for u in meta.get("universe") or []:
             name = u.get("name")
             if not isinstance(name, str) or u.get("isDelisted"):
@@ -103,17 +109,23 @@ def _universe(db: Any, info: Any, now_ms: int, ttl_ms: int, report: SyncReport,
     with _db.transaction(db) as conn:
         _, state = _db.get_cursor(conn, UNIVERSE_JOB, UNIVERSE_KEY)
     cached = state.get("coins")
-    if isinstance(cached, list) and cached and now_ms - int(state.get("fetched_ms") or 0) < ttl_ms:
+    if isinstance(cached, list) and cached and 0 <= now_ms - int(state.get("fetched_ms") or 0) < ttl_ms:
         return [str(c) for c in cached]
     for _ in range(int(state.get("dex_count") or 12) + 1):   # perpDexs + one meta per dex
         pacer.spend(20)
-    coins, skipped = live_perp_markets(info)
+    try:
+        coins, skipped = live_perp_markets(info)
+    except AppError as e:
+        if isinstance(cached, list) and cached:            # stale universe beats no sync at all
+            report.errors.append(f"universe:{type(e).__name__}")
+            return [str(c) for c in cached]
+        raise
     report.universe_refreshed = True
     report.skipped_coins = skipped
     with _db.transaction(db) as conn:
         _db.set_cursor(conn, UNIVERSE_JOB, UNIVERSE_KEY, now_ms,
-                       {"coins": coins, "fetched_ms": now_ms, "dex_count": len({c.split(":")[0] for c in coins if ":" in c}) + 1,
-                        "skipped": skipped[:50]}, monotonic=False)
+                       {"coins": coins, "fetched_ms": now_ms, "skipped": skipped[:50],
+                        "dex_count": len({c.split(":")[0] for c in coins if ":" in c}) + 1}, monotonic=False)
     return coins
 
 
@@ -331,6 +343,13 @@ class DbCandleSource:
         step = STEP_MS[interval]
         return [{"t": int(r["t"]), "T": int(r["t"]) + step - 1, "s": coin, "i": interval, "o": r["o"], "h": r["h"],
                  "l": r["l"], "c": r["c"], "v": r["v"], "n": r["n"]} for r in rs]
+
+
+    def is_backfilled(self, coin: str, interval: str) -> bool:
+        """True once candles_sync has fetched this series (its first fetch backfills all the API serves)."""
+        with _db.transaction(self.db) as conn:
+            return _db.one(conn, "SELECT 1 AS x FROM job_cursors WHERE job = :j AND key = :k AND cursor_ms IS NOT NULL",
+                           j=JOB, k=series_key(coin, interval)) is not None
 
 
 def _first_traded(rows: Iterable[Mapping[str, Any]]) -> Optional[int]:

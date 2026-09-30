@@ -27,7 +27,7 @@ import threading
 from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from app.config import Economics
 from app.hl.client import CLOID_PREFIX
@@ -128,6 +128,11 @@ class PgDatabase:
     def __init__(self, db: Any) -> None:
         if isinstance(db, PgDatabase):
             db = db._db
+        if hasattr(db, "execute") and not hasattr(db, "fetchall"):
+            # an open SQLAlchemy Connection handed in by the API (inside the caller's transaction)
+            from app.db.engine import SqlAlchemyRunner
+
+            db = SqlAlchemyRunner(db)
         if not (hasattr(db, "fetchall") or hasattr(db, "begin")):
             raise TypeError("PgDatabase needs a DatabasePort (begin()) or a SqlRunner (fetchall())")
         self._db = db
@@ -302,7 +307,7 @@ class PgSubscriptionRepo:
     def closing_subscriptions(self, limit: int) -> Sequence[SubscriptionView]:
         rows = self.db.all(f"""
             SELECT {_SUB_VIEW_COLS} {_SUB_VIEW_FROM}
-             WHERE s.status = CAST(:st AS subscription_status) AND s.master_address IS NOT NULL
+             WHERE s.status = CAST(:st AS subscription_status)
              ORDER BY s.status_changed_at, s.id
              LIMIT CAST(:lim AS integer)""", st=CLOSING_STATUS, lim=int(limit))
         return [_sub_view(r) for r in rows]
@@ -513,6 +518,20 @@ class PgSettlementRepo:
     def __init__(self, db: PgDatabase, economics: Economics | None = None) -> None:
         self.db = db
         self.economics = economics or Economics()
+        self._cols: frozenset[str] | None = None
+
+    def _pnl_columns(self) -> frozenset[str]:
+        """Attribution columns added by the data-jobs migration (0006): fills.net_pnl_micro (exact
+        floor((closedPnl − fee)·1e6)) and funding_events.attributed_micro (the subscription's share of an account
+        payment). Used when present; before 0006 the legacy columns are the only source."""
+        if self._cols is None:
+            rows = self.db.all("""
+                SELECT table_name || '.' || column_name AS c FROM information_schema.columns
+                 WHERE table_schema = 'public'
+                   AND ((table_name = 'fills' AND column_name = 'net_pnl_micro')
+                        OR (table_name = 'funding_events' AND column_name = 'attributed_micro'))""")
+            self._cols = frozenset(str(r["c"]) for r in rows)
+        return self._cols
 
     def subscriptions_to_settle(self) -> Sequence[SettlementSubscription]:
         rows = self.db.all("""
@@ -542,12 +561,16 @@ class PgSettlementRepo:
     def pnl_since(self, subscription_id: str, since: datetime | None, until: datetime) -> PnlDelta:
         """Attributed fills (closedPnl − fee, fee incl. builder fee: app.hl.fills) + attributed funding in
         (since, until]. After a cancellation, funding is only counted up to cancelled_at (SPEC §12 "leave")."""
-        row = self.db.one("""
-            SELECT (SELECT coalesce(sum(f.closed_pnl_micro - f.fee_micro), 0)::bigint FROM fills f
+        cols = self._pnl_columns()
+        fill_pnl = ("coalesce(f.net_pnl_micro, f.closed_pnl_micro - f.fee_micro)" if "fills.net_pnl_micro" in cols
+                    else "f.closed_pnl_micro - f.fee_micro")
+        funding = ("coalesce(e.attributed_micro, 0)" if "funding_events.attributed_micro" in cols else "e.usdc_micro")
+        row = self.db.one(f"""
+            SELECT (SELECT coalesce(sum({fill_pnl}), 0)::bigint FROM fills f
                      WHERE f.subscription_id = CAST(:s AS uuid)
                        AND (CAST(:since AS timestamptz) IS NULL OR f.time > CAST(:since AS timestamptz))
                        AND f.time <= CAST(:until AS timestamptz)) AS realized,
-                   (SELECT coalesce(sum(e.usdc_micro), 0)::bigint FROM funding_events e
+                   (SELECT coalesce(sum({funding}), 0)::bigint FROM funding_events e
                      WHERE e.subscription_id = CAST(:s AS uuid)
                        AND (CAST(:since AS timestamptz) IS NULL OR e.time > CAST(:since AS timestamptz))
                        AND e.time <= CAST(:until AS timestamptz)
@@ -829,8 +852,3 @@ def open_time_ms(v: Any) -> int:
         return int(v)
     dt = as_datetime(v)
     return int(dt.timestamp() * 1000)
-
-
-def iter_chunks(items: Sequence[Any], n: int) -> Iterable[Sequence[Any]]:
-    for i in range(0, len(items), n):
-        yield items[i:i + n]

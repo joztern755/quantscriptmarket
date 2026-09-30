@@ -1,14 +1,17 @@
 """Plain-text templates for USER alerts (Telegram + email). SPEC §12 alert kinds.
 
-Payload contract per kind (producers: events_outbox from the data jobs (0006), settlement, payments, API):
-  trade_opened / trade_closed / trade_resized
-        strategy, coin, side ("buy"|"sell"), size (decimal str), avg_px (decimal str), fee_micro (int),
-        optional: builder_fee_micro, notional_micro, position_size (decimal str, after the trade)
-  trade_pnl            strategy, coin, realized_pnl_micro (int, after fees), optional fee_micro
+Payload contract per kind (producers: events_outbox from the data jobs (0006, app/jobs_data), settlement,
+payments, API). Keys match what app/jobs_data emits; alternatives in brackets are accepted too.
+  trade_opened / trade_closed / trade_resized   (app/jobs_data/fills.trade_events)
+        coin, side ("buy"|"sell"), size, avg_px (decimal str), fees_micro [fee_micro], builder_fee_micro,
+        notional_micro, realized_pnl_micro, net_pnl_micro, position_after [position_size], liquidation (bool),
+        strategy (name; added by the delivery worker from strategy_id)
+  trade_pnl            coin, net_pnl_micro [realized_pnl_micro], fees_micro, strategy — derived by the worker from
+                       trade_closed / trade_resized events with a non-zero realized PnL (mutable separately)
   daily_pnl_summary    date (YYYY-MM-DD), realized_pnl_micro, fees_micro, fills, closed_trades, lines (list[str])
-  agent_expiring       days_left (14|7|3|1), expires_at (ISO or date), optional wallet (masked on render)
-  agent_expired        optional expired_at, wallet
-  builder_approval_missing   optional wallet
+  agent_expiring       days_left, valid_until_ms [expires_at], master [wallet] (short address) — app/jobs_data/agents
+  agent_expired / agent_revoked   master [wallet / master_address], valid_until_ms, reason
+  builder_approval_missing        optional master [wallet]
   balance_low / balance_empty        balance_micro, threshold_bps, need_micro
   subscription_past_due / subscription_reduce_only   strategy (name), optional subscription
   profit_share_charged amount_micro, optional strategy, profit_micro, rate_bps
@@ -97,25 +100,42 @@ def _dash(origin: str) -> str:
     return f"{origin.rstrip('/')}/#/dashboard"
 
 
+def _fee_key(p: P) -> str:
+    return "fees_micro" if p.d.get("fees_micro") is not None else "fee_micro"
+
+
+def _pnl_key(p: P) -> str:
+    return "net_pnl_micro" if p.d.get("net_pnl_micro") is not None else "realized_pnl_micro"
+
+
 def _trade(verb: str) -> Tmpl:
     def t(p: P, origin: str) -> tuple[str, str]:
-        extra = []
-        if p.d.get("position_size") is not None:
-            extra.append(f"Position now: {p.s('position_size')} {p.s('coin')}")
+        lines = [f"{p.s('strategy', 'Your strategy')}: {p.side()} {p.s('size')} {p.s('coin')} @ avg {p.s('avg_px')}"]
+        if p.d.get("notional_micro") is not None:
+            lines.append(f"Notional: {p.usd('notional_micro')}")
+        fees = f"Fees: {p.usd(_fee_key(p))}"
         if p.d.get("builder_fee_micro") is not None:
-            extra.append(f"of which builder fee: {p.usd('builder_fee_micro')}")
-        body = (f"{p.s('strategy')}: {p.side()} {p.s('size')} {p.s('coin')} @ avg {p.s('avg_px')}\n"
-                f"Fees: {p.usd('fee_micro')}" + ("".join("\n" + x for x in extra)))
-        return f"Trade {verb}: {p.s('coin')}", body
+            fees += f" (incl. builder fee {p.usd('builder_fee_micro')})"
+        lines.append(fees)
+        pos = p.d.get("position_after", p.d.get("position_size"))
+        if pos is not None:
+            lines.append(f"Position now: {sanitize_text(str(pos))} {p.s('coin')}")
+        pnl = p.int(_pnl_key(p))
+        if verb != "opened" and pnl:
+            lines.append(f"Realized PnL: {p.usd(_pnl_key(p), sign=True)} (after fees)")
+        if p.d.get("liquidation") is True:
+            lines.append("This fill was a LIQUIDATION.")
+        return f"Trade {verb}: {p.s('coin')}", "\n".join(lines)
     return t
 
 
 def _trade_pnl(p: P, origin: str) -> tuple[str, str]:
-    v = p.int("realized_pnl_micro")
+    k = _pnl_key(p)
+    v = p.int(k)
     word = "profit" if (v or 0) >= 0 else "loss"
-    fee = f" (after {p.usd('fee_micro')} fees)" if p.d.get("fee_micro") is not None else " (after fees)"
-    return (f"Realized {word}: {p.usd('realized_pnl_micro', sign=True)} on {p.s('coin')}",
-            f"{p.s('strategy')} closed a trade on {p.s('coin')}: {p.usd('realized_pnl_micro', sign=True)}{fee}.")
+    fee = f" (after {p.usd(_fee_key(p))} fees)" if p.d.get(_fee_key(p)) is not None else " (after fees)"
+    return (f"Realized {word}: {p.usd(k, sign=True)} on {p.s('coin')}",
+            f"{p.s('strategy', 'Your strategy')} closed a trade on {p.s('coin')}: {p.usd(k, sign=True)}{fee}.")
 
 
 def _daily(p: P, origin: str) -> tuple[str, str]:
@@ -126,25 +146,38 @@ def _daily(p: P, origin: str) -> tuple[str, str]:
     return f"Daily PnL {p.s('date')}: {p.usd('realized_pnl_micro', sign=True)}", "\n".join(body)
 
 
+def _wallet(p: P) -> str:
+    for k in ("master", "wallet", "master_address"):
+        if p.d.get(k):
+            return f" for wallet {p.s(k)}"
+    return ""
+
+
+def _expiry(p: P) -> str:
+    ms = p.int("valid_until_ms")
+    if ms is not None and ms > 0:
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return p.s("expires_at")
+
+
 def _agent_expiring(p: P, origin: str) -> tuple[str, str]:
     days = p.int("days_left")
-    when = f"in {days} day{'s' if days != 1 else ''}" if days is not None else "soon"
-    wallet = f" for wallet {p.s('wallet')}" if p.d.get("wallet") else ""
+    when = ("today" if days == 0 else f"in {days} day{'s' if days != 1 else ''}") if days is not None else "soon"
     return (f"Agent approval expires {when}",
-            f"Your trading agent approval{wallet} expires {when} ({p.s('expires_at')}). After that no orders can be "
+            f"Your trading agent approval{_wallet(p)} expires {when} ({_expiry(p)}). After that no orders can be "
             f"placed or closed for you. Re-approve in one step: {_dash(origin)}")
 
 
 def _agent_expired(p: P, origin: str) -> tuple[str, str]:
-    wallet = f" for wallet {p.s('wallet')}" if p.d.get("wallet") else ""
     return ("Agent approval expired — trading stopped",
-            f"Your trading agent approval{wallet} has expired, so strategies can no longer open or close positions "
+            f"Your trading agent approval{_wallet(p)} has expired, so strategies can no longer open or close positions "
             f"for you. Open positions stay as they are. Re-approve now: {_dash(origin)}")
 
 
 def _builder_missing(p: P, origin: str) -> tuple[str, str]:
     return ("Builder-fee approval missing",
-            "The builder-fee approval on your Hyperliquid account is missing or too low, so no new orders can be "
+            f"The builder-fee approval{_wallet(p)} on Hyperliquid is missing or too low, so no new orders can be "
             f"placed. Approve it again: {_dash(origin)}")
 
 
@@ -200,10 +233,13 @@ def _new_device(p: P, origin: str) -> tuple[str, str]:
 
 
 def _market_paused(p: P, origin: str) -> tuple[str, str]:
+    if str(p.d.get("cause") or "") == "kill switch":
+        return (f"Trading halted on {p.s('scope')}",
+                f"A kill switch halted all trading on {p.s('scope')}, a market your strategies trade. No orders are "
+                "placed there (open positions stay as they are) until it is lifted.")
     cause = f" Cause: {p.s('cause')}." if p.d.get("cause") else ""
-    return (f"Trading paused on {p.s('scope')}",
-            f"New entries are paused on {p.s('scope')}, a market your strategies trade. Exits still run.{cause} "
-            "We will notify you when it resumes.")
+    return (f"New entries paused on {p.s('scope')}",
+            f"New entries are paused on {p.s('scope')}, a market your strategies trade. Exits still run.{cause}")
 
 
 def _unreachable(p: P, origin: str) -> tuple[str, str]:
@@ -224,6 +260,22 @@ USER_TEMPLATES: dict[str, Tmpl] = {
     "agent_expiring": _agent_expiring,
     "agent_expired": _agent_expired,
     "builder_approval_missing": _builder_missing,
+    "agent_revoked": lambda p, o: ("Agent approval revoked",
+                                   f"The trading agent approval{_wallet(p)} is no longer active on-chain, so strategies "
+                                   "cannot trade this wallet (open positions stay as they are). If you did not do this, "
+                                   f"check your wallet. Reconnect: {_dash(o)}"),
+    "user_drawdown": lambda p, o: ("Large drawdown",
+                                   f"A subscription lost {p.usd('pnl_24h_micro')} over 24 hours on an allocation of "
+                                   f"{p.usd('allocation_micro')}. Review it: {_dash(o)}"),
+    "subscription_renewed": lambda p, o: ("Subscription renewed",
+                                          f"{p.s('strategy')} was renewed for {p.usd('amount_micro')} from your fee "
+                                          "balance."),
+    "plan_past_due": lambda p, o: ("Plan renewal failed",
+                                   f"Your {p.s('plan')} plan renewal of {p.usd('due_micro')} could not be paid "
+                                   f"(available {p.usd('available_micro')}). Top up: {_dash(o)}"),
+    "plan_downgraded": lambda p, o: ("Plan downgraded",
+                                     f"Your plan changed from {p.s('from')} to {p.s('to')} because the renewal could not "
+                                     "be paid."),
     "balance_low": _balance("Fee balance running low",
                             "Below 0% of the need, subscriptions go past due and then reduce-only (exits only)."),
     "balance_empty": _balance("Fee balance empty",

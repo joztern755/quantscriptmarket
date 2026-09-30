@@ -250,7 +250,7 @@ export function normalizePublicConfig(raw: unknown, fallback = false): PublicCon
     } else if (k === "stripe_fee_absorbed") {
       economics.stripe_fee_absorbed = econRaw[k] === true;
     } else {
-      (economics as Record<string, number | string>)[k] = num(econRaw[k], ECON_DEFAULTS[k] as number);
+      (economics as unknown as Record<string, number>)[k] = num(econRaw[k], ECON_DEFAULTS[k] as number);
     }
   }
   const lvRaw = (r.legal_versions && typeof r.legal_versions === "object" ? r.legal_versions : {}) as Record<string, unknown>;

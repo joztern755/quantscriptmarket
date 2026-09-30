@@ -96,6 +96,7 @@ __all__ = [
     "verify_and_parse",
     "fetch_signals",
     "ingest_signals",
+    "ingest",
 ]
 
 MAX_BODY_BYTES = 1_000_000          # 1 MB cap on signals.json (SILVER-only file is ~350 bytes)
@@ -635,3 +636,12 @@ def ingest_signals(url: str | None = None, **kwargs: Any) -> IngestResult:
         return IngestResult(ok=True, batch=fetch_signals(url, **kwargs))
     except SignalRejected as e:
         return IngestResult(ok=False, error=e)
+
+
+def ingest(db: Any, now: datetime, **params: Any) -> dict[str, Any]:
+    """``/internal/ingest-signals`` entrypoint (``fn(db=, now=, **params)``): fetch + verify the feed with
+    ``ingest_signals`` and store the records for each listed strategy's latest version, idempotently; alerts (and the
+    SPEC §5.5 auto-pause) on rejection. DB work lives in ``app.jobs_data.signals.ingest``."""
+    from app.jobs_data.signals import ingest as _ingest  # noqa: PLC0415 — keeps this module DB-free
+
+    return _ingest(db, now, **params)

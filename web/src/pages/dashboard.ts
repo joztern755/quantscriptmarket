@@ -2,13 +2,14 @@
 // fee balance + ledger + deposits (USDC UsdSend / Stripe Payment Element) + withdraw (step-up), alerts inbox.
 import type { PageContext } from "../core/router.js";
 import { h, mount, skeleton, errorState, emptyState, note, stat, kv, table, tabs, button, toast, confirmDialog, modal, field, badge, subStatusBadge, type Column } from "../core/ui.js";
-import { api, publicConfig, newIdempotencyKey, type PublicConfig } from "../core/api.js";
+import { cancelButtons } from "../core/subscriptions.js";
+import { api, publicConfig, peekPublicConfig, newIdempotencyKey, type PublicConfig } from "../core/api.js";
 import { appConfig } from "../core/config.js";
 import { loadStripe, stripeFeeNotice } from "../core/stripe.js";
 import { connectWallet, getConnectedWallet } from "../core/wallet.js";
 import { usdSend } from "../core/hl.js";
 import { fmtUsd, fmtLeverage, fmtDate, fmtDateTime, fmtRelative, fmtNum, shortAddr } from "../core/format.js";
-import type { Subscription, Position, Balance, LedgerRow, Alert } from "./_shared/types.js";
+import type { Subscription, Position, Balance, LedgerRow, Alert, UsdcTypedDataOut, UsdcConfirmOut, StripeDepositOut, PayoutOut } from "./_shared/types.js";
 import { ensurePageCss, listOf, isAbortError, errCode, errMessage, isAddress, hlNum, usdInput, pageHead, panel, every, isRec, LOSS_WARNING } from "./_shared/util.js";
 
 export const title = "Dashboard";
@@ -50,13 +51,13 @@ async function overviewTab(body: HTMLElement, ctx: PageContext): Promise<void> {
     mount(subsBox, skeleton(6));
     try {
       const [subsRaw, bal, alertsRaw] = await Promise.all([
-        api.get<unknown>("/subscriptions", { signal: ctx.signal }),
+        api.get<unknown>("/subscriptions?limit=100", { signal: ctx.signal }),
         api.get<Balance>("/balance", { signal: ctx.signal }).catch(() => null),
         api.get<unknown>("/alerts", { signal: ctx.signal }).catch(() => null),
       ]);
       if (!ctx.isCurrent()) return;
-      const subs = listOf<Subscription>(subsRaw, "subscriptions");
-      const alerts = listOf<Alert>(alertsRaw, "alerts");
+      const subs = listOf<Subscription>(subsRaw);
+      const alerts = listOf<Alert>(alertsRaw);
       const live = subs.filter((x) => x.status !== "cancelled");
       const pnl = live.reduce((a, x) => a + (x.cum_pnl_micro ?? 0), 0);
       const unread = alerts.filter((a) => !a.acked_at).length;
@@ -64,7 +65,7 @@ async function overviewTab(body: HTMLElement, ctx: PageContext): Promise<void> {
         kpis,
         stat("Active subscriptions", fmtNum(live.filter((x) => x.status === "active").length, 0), `${live.length} total`),
         stat("Strategy PnL", h("span", { class: pnl >= 0 ? "pos" : "neg" }, fmtUsd(pnl, { sign: true })), "attributed, net of fees"),
-        stat("Fee balance", bal ? fmtUsd(bal.balance_micro) : "—", bal ? h("a", { href: "#/dashboard/balance" }, "Top up") : "unavailable"),
+        stat("Fee balance", bal ? fmtUsd(bal.fee_balance_micro) : "—", bal ? h("a", { href: "#/dashboard/balance" }, "Top up") : "unavailable"),
         stat("Unread alerts", fmtNum(unread, 0), h("a", { href: "#/dashboard/alerts" }, "Open inbox")),
       );
       const troubled = live.filter((x) => x.status === "past_due" || x.status === "reduce_only");
@@ -125,7 +126,8 @@ function subsTable(ctx: PageContext, subs: Subscription[], reload: () => void): 
 }
 
 function subActions(ctx: PageContext, s: Subscription, reload: () => void): HTMLElement {
-  if (s.status === "cancelled") return h("span", { class: "muted small" }, "Cancelled");
+  if (s.status === "cancelled") return h("span", { class: "muted small" }, s.cancel_positions === "leave" ? "Cancelled · positions left open" : "Cancelled");
+  if (s.status === "closing") return h("span", { class: "muted small" }, "Closing positions…");
   const path = `/subscriptions/${encodeURIComponent(s.id)}`;
   const paused = s.status === "paused_user";
   return h(
@@ -148,33 +150,35 @@ function subActions(ctx: PageContext, s: Subscription, reload: () => void): HTML
       },
     }),
     button("Edit", { kind: "ghost", onClick: () => editSubscription(ctx, s, reload) }),
-    button("Cancel", {
-      kind: "danger",
-      onClick: async () => {
-        const ok = await confirmDialog({
-          title: "Cancel subscription?",
-          message: h(
-            "div",
-            { class: "stack tight" },
-            h("p", null, `The strategy stops managing ${shortAddr(s.trading_address)}. No new positions will be opened.`),
-            h("p", { class: "small muted" }, "Review any remaining positions on Hyperliquid afterwards. Refunds follow the Terms. You can revoke the agent and builder-fee approvals on Hyperliquid at any time."),
-          ),
-          confirmLabel: "Cancel subscription",
-          cancelLabel: "Keep it",
-          danger: true,
-          requireText: "CANCEL",
-        });
-        if (!ok) return;
-        await api.del(path, { signal: ctx.signal });
-        toast("Subscription cancelled.", "good");
-        reload();
-      },
-    }),
+    button("Cancel…", { kind: "danger", onClick: () => cancelChooser(s, reload) }),
   );
 }
 
+/** SPEC §12 cancel flow: the two core buttons (close / leave), each with a double confirmation and step-up,
+ *  → DELETE /v1/subscriptions/{id} {"positions": "close"|"leave"} (core/subscriptions.ts). */
+function cancelChooser(s: Subscription, reload: () => void): void {
+  const m = modal({
+    title: `Cancel ${s.strategy_name ?? "subscription"}`,
+    body: h(
+      "div",
+      { class: "stack" },
+      h("p", null, `Choose what happens to the open positions on ${shortAddr(s.trading_address)}. Your prepaid period is not refunded.`),
+      cancelButtons({ id: s.id, strategy_name: s.strategy_name ?? "this strategy", markets: s.strategy_markets }, () => {
+        m.close();
+        reload();
+      }),
+    ),
+    actions: [{ label: "Keep subscription", kind: "plain" }],
+  });
+}
+
 function editSubscription(ctx: PageContext, s: Subscription, reload: () => void): void {
-  const maxLev = Math.max(1, Math.min(5, Math.floor(s.strategy_max_leverage ?? Math.max(1, s.max_leverage_x100 / 100))));
+  // Upper bound from platform / launch caps; the server also applies the strategy's MAX_LEVERAGE (422 details.max_x100).
+  const cfg = peekPublicConfig();
+  let maxLev = cfg?.platform_max_leverage ?? 5;
+  if (cfg?.max_user_leverage_x100) maxLev = Math.min(maxLev, Math.floor(cfg.max_user_leverage_x100 / 100));
+  maxLev = Math.max(1, maxLev);
+  const minAlloc = cfg?.min_allocation_micro ?? 100_000_000;
   const alloc = usdInput({ value: String(s.allocation_micro / 1_000_000), id: "e-alloc" });
   const lev = h("select", { id: "e-lev" }, ...Array.from({ length: maxLev }, (_, i) => h("option", { value: String(i + 1) }, `${i + 1}×`)));
   lev.value = String(Math.min(maxLev, Math.max(1, Math.round(s.max_leverage_x100 / 100))));
@@ -194,8 +198,8 @@ function editSubscription(ctx: PageContext, s: Subscription, reload: () => void)
           kind: "primary",
           onClick: async () => {
             const micro = alloc.micro();
-            if (micro === null || micro < 10_000_000) {
-              toast("Enter an allocation of at least $10.", "warn");
+            if (micro === null || micro < minAlloc) {
+              toast(`Enter an allocation of at least ${fmtUsd(minAlloc)}.`, "warn");
               return;
             }
             await api.patch(`/subscriptions/${encodeURIComponent(s.id)}`, { allocation_micro: micro, max_leverage_x100: Number(lev.value) * 100 }, { signal: ctx.signal, idempotencyKey: key });
@@ -220,12 +224,13 @@ async function positionsTab(body: HTMLElement, ctx: PageContext): Promise<void> 
       const res = await api.get<unknown>("/positions", { signal: ctx.signal });
       if (!ctx.isCurrent()) return;
       const rows = listOf<Position>(res, "positions");
+      const unavailable = listOf<string>(res, "unavailable");
       updated.textContent = `Updated ${fmtDateTime(Date.now())}`;
       const cols: Column<Position>[] = [
         { key: "coin", label: "Market", value: (p) => h("b", null, p.coin), primary: true },
         { key: "acct", label: "Account", value: (p) => h("span", { class: "mono" }, shortAddr(p.trading_address)) },
-        { key: "side", label: "Side", value: (p) => (hlNum(p.szi) >= 0 ? badge("Long", "good") : badge("Short", "bad")) },
-        { key: "size", label: "Size", value: (p) => fmtNum(Math.abs(hlNum(p.szi)), 4), align: "right", mono: true },
+        { key: "side", label: "Side", value: (p) => (hlNum(p.size) >= 0 ? badge("Long", "good") : badge("Short", "bad")) },
+        { key: "size", label: "Size", value: (p) => fmtNum(Math.abs(hlNum(p.size)), 4), align: "right", mono: true },
         { key: "entry", label: "Entry", value: (p) => dispNum(p.entry_px), align: "right", mono: true },
         { key: "value", label: "Value", value: (p) => dispUsd(p.position_value), align: "right", mono: true },
         {
@@ -241,7 +246,11 @@ async function positionsTab(body: HTMLElement, ctx: PageContext): Promise<void> 
         { key: "lev", label: "Leverage", value: (p) => (p.leverage === null || p.leverage === undefined ? "—" : `${fmtNum(hlNum(p.leverage), 1)}×`), align: "right", mono: true, hideOnMobile: true },
         { key: "liq", label: "Liq. price", value: (p) => dispNum(p.liquidation_px), align: "right", mono: true, hideOnMobile: true },
       ];
-      mount(box, table({ columns: cols, rows, rowKey: (p) => p.trading_address + p.coin, empty: "No open positions." }));
+      mount(
+        box,
+        unavailable.length ? note(`Couldn't load positions for ${unavailable.map((a) => shortAddr(a)).join(", ")} right now.`, "warn") : null,
+        table({ columns: cols, rows, rowKey: (p) => p.trading_address + p.coin, empty: "No open positions." }),
+      );
     } catch (err) {
       if (isAbortError(err) || !ctx.isCurrent()) return;
       if (!quiet) mount(box, errorState(err, () => void load()));
@@ -300,30 +309,34 @@ async function balanceTab(body: HTMLElement, ctx: PageContext): Promise<void> {
   let bal: Balance | null = null;
   const load = async (): Promise<void> => {
     try {
-      bal = await api.get<Balance & Record<string, unknown>>("/balance", { signal: ctx.signal });
+      const [b, ledger] = await Promise.all([
+        api.get<Balance>("/balance", { signal: ctx.signal }),
+        api.get<unknown>("/balance/ledger?limit=100", { signal: ctx.signal }),
+      ]);
+      bal = b;
       if (!ctx.isCurrent()) return;
-      const b = bal as Balance & { withdrawable_micro?: number };
       mount(
         summary,
         h(
           "div",
           { class: "stats" },
-          stat("Fee balance", fmtUsd(b.balance_micro)),
-          stat("Withdrawable", typeof b.withdrawable_micro === "number" ? fmtUsd(b.withdrawable_micro) : "—", "USDC deposits only"),
-          stat("Estimated monthly need", typeof b.estimated_monthly_need_micro === "number" ? fmtUsd(b.estimated_monthly_need_micro) : "—"),
+          stat("Fee balance", fmtUsd(b.fee_balance_micro)),
+          stat("Withdrawable", fmtUsd(b.withdrawable_micro), "USDC deposits only"),
+          stat("Pending withdrawals", fmtUsd(b.withdrawals_pending_micro)),
+          stat("Estimated monthly need", fmtUsd(b.estimated_monthly_need_micro), b.reserve_required_micro > 0 ? `+ ${fmtUsd(b.reserve_required_micro)} reserve` : undefined),
         ),
-        typeof b.estimated_monthly_need_micro === "number" && b.balance_micro < b.estimated_monthly_need_micro
+        b.fee_balance_micro < b.estimated_monthly_need_micro + b.reserve_required_micro
           ? note(`Your balance is below one month of estimated fees. If it runs out, subscriptions go past due and, after ${cfg.economics.past_due_grace_hours}h, reduce-only (no new positions).`, "warn")
           : null,
       );
-      const rows = listOf<LedgerRow>(bal, "history", "ledger", "entries");
+      const rows = listOf<LedgerRow>(ledger);
       const cols: Column<LedgerRow>[] = [
         { key: "date", label: "Date", value: (r) => fmtDateTime(r.created_at), primary: true },
         { key: "kind", label: "Type", value: (r) => kindLabel(r.kind) },
         { key: "memo", label: "Details", value: (r) => h("span", { class: "muted break" }, r.memo ?? ""), hideOnMobile: true },
         { key: "amt", label: "Amount", value: (r) => h("span", { class: r.amount_micro >= 0 ? "pos" : "neg" }, fmtUsd(r.amount_micro, { sign: true })), align: "right", mono: true },
       ];
-      mount(ledgerBox, table({ columns: cols, rows, rowKey: (r) => r.id ?? r.created_at + r.kind, empty: "No ledger entries yet." }));
+      mount(ledgerBox, table({ columns: cols, rows, rowKey: (r) => r.tx_id, empty: "No ledger entries yet." }));
     } catch (err) {
       if (isAbortError(err) || !ctx.isCurrent()) return;
       mount(summary, errorState(err, () => void load()));
@@ -341,11 +354,14 @@ function kindLabel(k: string): string {
     deposit: "Deposit",
     deposit_usdc: "Deposit (USDC)",
     deposit_stripe: "Deposit (card)",
-    subscription: "Subscription",
+    subscription_start: "Subscription",
+    subscription_renewal: "Subscription renewal",
     profit_share: "Profit share",
     post_purchase: "Paid post",
-    plan: "Plan",
-    withdrawal: "Withdrawal",
+    plan_purchase: "Plan",
+    withdrawal_hold: "Withdrawal (held)",
+    withdrawal_release: "Withdrawal rejected (released)",
+    withdrawal_sent: "Withdrawal sent",
     stripe_refund: "Refund",
     stripe_dispute: "Dispute",
   };
@@ -390,10 +406,10 @@ function depositPanel(ctx: PageContext, cfg: PublicConfig, onDone: () => void): 
     if (!w) return;
     usdcStatus.className = "status";
     usdcStatus.textContent = "Preparing…";
-    const td = await api.post<Record<string, unknown>>("/deposits/usdc/typed-data", { amount_micro: m, from_address: w.address }, { signal: ctx.signal });
-    const depositId = String(td.deposit_id ?? td.id ?? "");
+    const td = await api.post<UsdcTypedDataOut>("/deposits/usdc/typed-data", { amount_micro: m, from_address: w.address, signature_chain_id: await w.chainIdHex() }, { signal: ctx.signal });
+    if (td.destination.toLowerCase() !== cfg.treasury_address) throw new Error("The server's deposit address does not match the published treasury address. Nothing was sent.");
     usdcStatus.textContent = `Check your wallet: send ${fmtUsd(m)} USDC from ${shortAddr(w.address)} to ${shortAddr(cfg.treasury_address)} (Hyperliquid UsdSend)…`;
-    const r = await usdSend(w, { destination: cfg.treasury_address, amountMicro: m, serverTypedData: td.typed_data ?? td.typedData, expectDestination: cfg.treasury_address });
+    const r = await usdSend(w, { destination: cfg.treasury_address, amountMicro: m, serverTypedData: td.payload.typed_data, expectDestination: cfg.treasury_address });
     if (!r.ok) {
       usdcStatus.className = "status err";
       usdcStatus.textContent = `Hyperliquid rejected the transfer: ${r.error ?? "unknown error"}`;
@@ -401,9 +417,11 @@ function depositPanel(ctx: PageContext, cfg: PublicConfig, onDone: () => void): 
     }
     usdcStatus.textContent = "Sent. Confirming with the server…";
     try {
-      await api.post("/deposits/usdc/confirm", { deposit_id: depositId || undefined, from_address: w.address, amount_micro: m }, { signal: ctx.signal });
+      const c = await api.post<UsdcConfirmOut>("/deposits/usdc/confirm", { from_address: w.address, time_ms: r.nonce ?? td.time_ms }, { signal: ctx.signal });
       usdcStatus.className = "status ok";
-      usdcStatus.textContent = "Deposit received. Your balance is updated.";
+      usdcStatus.textContent = c.credited.length
+        ? `Deposit received. Your balance is ${fmtUsd(c.fee_balance_micro)}.`
+        : "Transfer sent. It will be credited automatically once Hyperliquid shows it (usually within a minute).";
     } catch (err) {
       usdcStatus.className = "status";
       usdcStatus.textContent = `Transfer sent. It will be credited automatically once detected (${errMessage(err)}).`;
@@ -419,7 +437,7 @@ function depositPanel(ctx: PageContext, cfg: PublicConfig, onDone: () => void): 
       return;
     }
     mount(stripeBox, skeleton(4));
-    const [stripeRaw, pi] = await Promise.all([loadStripe(), api.post<Record<string, unknown>>("/deposits/stripe", { amount_micro: m }, { signal: ctx.signal })]);
+    const [stripeRaw, pi] = await Promise.all([loadStripe(), api.post<StripeDepositOut>("/deposits/stripe", { amount_micro: m }, { signal: ctx.signal })]);
     if (!ctx.isCurrent()) return;
     const clientSecret = typeof pi.client_secret === "string" ? pi.client_secret : "";
     if (!/^pi_[A-Za-z0-9]+_secret_[A-Za-z0-9]+$/.test(clientSecret)) throw new Error("Payment could not be started. Please try again.");
@@ -500,8 +518,9 @@ function withdrawPanel(ctx: PageContext, cfg: PublicConfig, getBal: () => Balanc
     "div",
     { class: "stack" },
     h("p", { class: "small muted" }, "Withdraw unused fee balance that came from USDC deposits. Withdrawals are reviewed and approved by two administrators, then sent as USDC on Hyperliquid."),
+    cfg.features.payouts ? null : note("Withdrawals are not enabled yet during the internal launch phase.", "info"),
     field("Amount (USD)", amount.el),
-    field("Destination address", to, "Must be a wallet you control on Hyperliquid."),
+    field("Destination address", to, "Must be one of your verified wallets."),
     h(
       "div",
       { class: "btns" },
@@ -511,8 +530,9 @@ function withdrawPanel(ctx: PageContext, cfg: PublicConfig, getBal: () => Balanc
           const addr = to.value.trim();
           if (m === null || m <= 0) return toast("Enter a valid amount.", "warn");
           if (!isAddress(addr)) return toast("Enter a valid 0x address.", "warn");
-          const b = getBal() as (Balance & { withdrawable_micro?: number }) | null;
-          if (b && typeof b.withdrawable_micro === "number" && m > b.withdrawable_micro) return toast(`You can withdraw up to ${fmtUsd(b.withdrawable_micro)}.`, "warn");
+          const b = getBal();
+          if (m < cfg.economics.min_topup_micro) return toast(`The minimum withdrawal is ${fmtUsd(cfg.economics.min_topup_micro)}.`, "warn");
+          if (b && m > b.withdrawable_micro) return toast(`You can withdraw up to ${fmtUsd(b.withdrawable_micro)}.`, "warn");
           const ok = await confirmDialog({
             title: "Request withdrawal?",
             message: kv([
@@ -524,9 +544,10 @@ function withdrawPanel(ctx: PageContext, cfg: PublicConfig, getBal: () => Balanc
           });
           if (!ok) return;
           try {
-            await api.post("/withdrawals", { amount_micro: m, to_address: addr.toLowerCase() }, { signal: ctx.signal, idempotencyKey: key });
+            await api.post<PayoutOut>("/withdrawals", { amount_micro: m, to_address: addr.toLowerCase() }, { signal: ctx.signal, idempotencyKey: key });
           } catch (err) {
             if (errCode(err) === "insufficient_balance") return toast("Not enough withdrawable balance.", "warn");
+            if (errCode(err) === "forbidden") return toast(errMessage(err), "warn");
             throw err;
           }
           key = newIdempotencyKey();
@@ -546,7 +567,7 @@ async function alertsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
     try {
       const res = await api.get<unknown>("/alerts", { signal: ctx.signal });
       if (!ctx.isCurrent()) return;
-      const alerts = listOf<Alert>(res, "alerts").sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+      const alerts = listOf<Alert>(res).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
       if (!alerts.length) {
         mount(box, emptyState("No alerts", "Low balance, fills, errors and security events will appear here."));
         return;
@@ -563,11 +584,12 @@ async function alertsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
 function alertItem(ctx: PageContext, a: Alert, reload: () => void): HTMLElement {
   const tone = a.severity === "critical" ? "bad" : a.severity === "warn" ? "warn" : "info";
   const payloadMsg = isRec(a.payload) && typeof a.payload.message === "string" ? a.payload.message : "";
+  const detail = payloadMsg || Object.entries(a.payload ?? {}).filter(([, v]) => typeof v === "string" || typeof v === "number").slice(0, 4).map(([k, v]) => `${k.replace(/_/g, " ")}: ${String(v)}`).join(" · ");
   return h(
     "div",
     { class: ["alert-item", !a.acked_at && "unread"] },
     h("div", { class: "row between" }, h("span", { class: "row" }, badge(a.severity, tone), h("span", { class: "alert-title" }, kindLabel(a.kind))), h("span", { class: "small muted", title: fmtDateTime(a.created_at) }, fmtRelative(a.created_at))),
-    a.message || payloadMsg ? h("p", { class: "small break" }, a.message ?? payloadMsg) : null,
+    detail ? h("p", { class: "small break" }, detail) : null,
     !a.acked_at
       ? h(
           "div",

@@ -9,6 +9,7 @@ settlement job's keys (`sub:{id}:{period_end}`, `plan:{uid}:{period_end}`, `ps:�
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Optional
 
@@ -61,7 +62,27 @@ def post(conn: Any, svc: Any, *, key: str, kind: str, memo: str, created_by: str
         raise AssertionError("refusing to post an unbalanced or empty ledger transaction")
     for code in sorted({a for a, _ in lines}):
         svc.ledger.ensure_account(conn, code)
-    return svc.ledger.post(conn, idempotency_key=key, kind=kind, memo=memo, entries=lines, created_by=created_by)
+    owners = sorted({a.split(":")[1] for a, _ in lines if a.startswith("user:") and a.endswith(":fee_balance")})
+    before = {u: spendable(conn, svc, u) for u in owners}
+    tx = svc.ledger.post(conn, idempotency_key=key, kind=kind, memo=memo, entries=lines, created_by=created_by)
+    for u in owners:
+        _fee_balance_changed(conn, svc, u, before[u])
+    return tx
+
+
+def _fee_balance_changed(conn: Any, svc: Any, user_id: str, prev: int) -> None:
+    """Low-balance alerts (SPEC §1: 50/20/0 % of the monthly need) — app.alerts.delivery.on_balance_changed.
+    Runs in a SAVEPOINT and never fails the money movement."""
+    try:
+        from app.alerts.delivery import on_balance_changed
+        new = spendable(conn, svc, user_id)
+        if new == prev:
+            return
+        savepoint = getattr(svc.store, "savepoint", None)
+        with (savepoint(conn) if savepoint is not None else nullcontext()):
+            on_balance_changed(conn, user_id, prev, new, svc=svc, raise_errors=True)
+    except Exception as e:  # noqa: BLE001 - alerts must never block a ledger posting
+        log.warning("low-balance alert hook failed", extra={"fields": {"user_id": user_id, "error": type(e).__name__}})
 
 
 def spendable(conn: Any, svc: Any, user_id: str) -> int:

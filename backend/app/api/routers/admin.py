@@ -32,7 +32,7 @@ from app.api.deps import (
     user_limit,
 )
 from app.api.routers.alerts import alert_out
-from app.api.routers.creator import version_out
+from app.api.routers.creator import history_days_for, version_out
 from app.api.validation import micro_to_usd_string
 from app.errors import Conflict, Forbidden, NotFound, ValidationFailed
 
@@ -155,9 +155,11 @@ def _apply_change(conn: Any, svc: Services, ctx: AuthCtx, ch: dict) -> None:
             # SPEC §12 (owner): ≥ risk.min_listing_history_days (180) of backtestable history to list; versions
             # under short_history_warning_days (365) list with a "Short history (N days)" warning instead.
             bt = ver.get("backtest") or {}
-            days = bt.get("history_days")
-            if not isinstance(days, (int, float)) or isinstance(days, bool):
-                days = (bt.get("period") or {}).get("sim_days") or 0
+            days = history_days_for(svc, list(ver.get("markets") or st["markets"] or []), ver.get("timeframe") or st["timeframe"], bt)
+            recorded = bt.get("history_days")
+            if isinstance(recorded, int) and not isinstance(recorded, bool):
+                days = max(days or 0, recorded)
+            days = days or 0
             min_days = svc.settings.risk.min_listing_history_days
             if float(days) < min_days:
                 raise Conflict(f"backtest covers less than {min_days} days of history; cannot list",

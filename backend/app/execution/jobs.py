@@ -1,0 +1,698 @@
+"""Internal job entrypoints (``/internal/*`` on the executor service; SPEC §2, §8) and the executor's composition root.
+
+Contract with ``app.api.adapters.JOB_ENTRYPOINTS``: every job is called ``fn(db=<DatabasePort>, now=<aware UTC
+datetime>, **params)`` and returns a JSON-able dict. ``db`` is the API's ``SqlDatabase`` (``begin()`` → SQLAlchemy
+connection; on the executor service it connects as ``app_executor``). ``latest_reconciliation(conn)`` is called with
+an open connection by the admin console.
+
+Scheduler cadence (Cloud Scheduler → OIDC → executor service; source of truth: infra/gcp/env.sh SCHEDULER_SPEC):
+  /internal/tick            * * * * *      1. ``run_creator_signals`` — runs each listed creator version in the sandbox
+                            (every minute)    ONCE per closed bar of its TIMEFRAME (1h / 4h / 1d): it acts only when
+                                              the bar has closed + ``bar_settle_seconds`` (30 s) and no signal exists
+                                              for it yet, waits up to ``missing_bar_grace_seconds`` for the closed
+                                              candle to be served; every other minute it is a no-op;
+                                           2. the executor tick (signals → jittered, guarded IOC orders; closing
+                                              subscriptions flattened; see app.execution.executor).
+  /internal/settle-daily    30 0 * * *     ``settle_daily`` — after the fills/funding sync of the previous day.
+                                           Router param ``settle_date`` = the trading day being settled (default
+                                           yesterday); PnL cut-off = settle_date + 1 day 00:00 UTC (never after now).
+  /internal/reconcile       7 * * * *      ``reconcile`` — positions vs targets, builder fees DB vs on-chain, treasury;
+                                           alert dedup keys are per day, every run's report is stored.
+  /internal/referral-tiers  15 1 * * *     ``referral_tiers`` — re-evaluates users.referral_tier (SPEC §1.2); the next
+                                           settlement's builder-fee referral split uses it.
+All jobs are idempotent (ledger idempotency keys, UNIQUE constraints, cursors); settle/reconcile/referral-tiers take
+a job-level advisory lock and the tick locks per subscription (and per creator version), so Scheduler retries and
+overlapping runs are safe.
+
+Composition: ``Runtime`` builds every dependency from ``Settings`` (Hyperliquid info client + readers, SDK gateway
+factory with our builder code, KMS decryptors, notifier, sandbox client, jitter, planner, clock). Every piece is a
+constructor argument, so tests inject fakes (``Runtime(settings, info=FakeInfo(...), gateways=FakeGatewayFactory(...),
+...)``) and pass ``runtime=`` to the job functions. The process-wide default runtime is built lazily
+(``get_runtime`` / ``set_runtime``).
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import threading
+import time
+import urllib.error
+import urllib.request
+from datetime import date, datetime, timedelta, timezone
+from decimal import ROUND_DOWN, ROUND_FLOOR, Decimal
+from typing import Any, Callable, Mapping
+
+from app.config import Economics, get_settings
+from app.errors import ExternalServiceError, ValidationFailed
+from app.logging import get_logger
+from app.money import BPS, parse_decimal, to_micro
+
+from .executor import Executor, ExecutorConfig
+from .pg import (
+    PgAlertRepo,
+    PgContactDirectory,
+    PgCreatorSignalRepo,
+    PgDatabase,
+    PgFlagRepo,
+    PgLedger,
+    PgLockProvider,
+    PgMarketPauseFlags,
+    PgReconcileRepo,
+    PgReconciliationStore,
+    PgReferralLookup,
+    PgReferralTierRepo,
+    PgSettlementRepo,
+    PgSignalRepo,
+    PgSubscriptionRepo,
+    PgUnitOfWork,
+    open_time_ms,
+)
+from .ports import AlertEvent
+from .reconcile import ReconcileConfig, Reconciler
+from .settlement import Settlement
+from .wiring import (
+    CatalogMarketData,
+    DomainBilling,
+    DomainFees,
+    DomainJitter,
+    DomainProfitShare,
+    NotifierAlertSink,
+    RiskPlanner,
+    SystemClock,
+)
+
+__all__ = [
+    "run_tick", "run_creator_signals", "settle_daily", "reconcile", "referral_tiers", "latest_reconciliation",
+    "Runtime", "get_runtime", "set_runtime", "SandboxClient", "HlBuilderRewardsReader", "HlTreasuryReader",
+    "build_notifier", "jitter_salt", "INTERVAL_MS", "weight_to_bps",
+]
+
+log = get_logger("app.execution.jobs")
+
+UTC = timezone.utc
+INTERVAL_MS = {"1h": 3_600_000, "4h": 4 * 3_600_000, "1d": 86_400_000}
+
+
+# ======================================================================================================== helpers
+
+def _aware(now: datetime) -> datetime:
+    if not isinstance(now, datetime) or now.tzinfo is None:
+        raise ValueError("now must be a timezone-aware datetime")
+    return now.astimezone(UTC)
+
+
+def _ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+
+def jitter_salt(settings: Any) -> bytes:
+    """Secret per-deployment salt for execution delays / ordering (SPEC §5.8), derived from the audit pepper
+    (Secret Manager) with domain separation. Dev/test without a pepper use a fixed, clearly non-prod salt."""
+    raw = getattr(settings, "audit_pepper_b64", "") or ""
+    pepper = base64.b64decode(raw) if raw else b""
+    if not pepper:
+        if getattr(settings, "is_prod", False):
+            raise RuntimeError("AUDIT_PEPPER_B64 is required in prod (jitter salt)")
+        pepper = b"aijalon-dev-only-jitter-pepper"
+    return hmac.new(pepper, b"aijalon/execution/jitter-salt/v1", hashlib.sha256).digest()
+
+
+def weight_to_bps(weight: Any, max_leverage: int) -> int:
+    """Sandbox float weight → integer bps (× 10000), truncated toward zero (never more exposure than asked)."""
+    if isinstance(weight, bool) or not isinstance(weight, (int, float, str, Decimal)):
+        raise ValidationFailed("weight must be a number")
+    d = Decimal(str(weight))
+    if not d.is_finite():
+        raise ValidationFailed("weight must be finite")
+    bps = int((d * BPS).to_integral_value(rounding=ROUND_DOWN))
+    cap = int(max_leverage) * BPS
+    if abs(bps) > cap:
+        raise ValidationFailed("weight above the version's MAX_LEVERAGE", weight=str(weight))
+    return bps
+
+
+# ======================================================================================================== on-chain readers
+
+class HlBuilderRewardsReader:
+    """``BuilderRewardsReader``: builder fees accrued on-chain to our builder address = unclaimed builder rewards
+    (info ``referral`` → ``builderRewards``) + rewards already claimed (non-funding ledger updates of type
+    ``rewardsClaim``). UNVERIFIED field names (docs blocked here) — verify on mainnet before go-live; a wrong read
+    only raises a reconciliation alert, it never moves money."""
+
+    def __init__(self, info: Any, builder_address: str, *, since_ms: int = 1_704_067_200_000) -> None:
+        self.info = info
+        self.builder = builder_address.lower()
+        self.since_ms = since_ms
+
+    def cumulative_builder_rewards_micro(self) -> int:
+        if not self.builder:
+            raise ValidationFailed("builder address not configured")
+        ref = self.info.post({"type": "referral", "user": self.builder})
+        unclaimed = parse_decimal(str((ref or {}).get("builderRewards", "0")))
+        claimed = Decimal(0)
+        for u in self.info.iter_user_non_funding_ledger_updates(self.builder, self.since_ms, int(time.time() * 1000)):
+            delta = u.get("delta") or {}
+            if delta.get("type") == "rewardsClaim":
+                claimed += parse_decimal(str(delta.get("amount", "0")))
+        return to_micro(unclaimed + claimed, ROUND_FLOOR)
+
+
+class HlTreasuryReader:
+    """``TreasuryReader``: USDC in the treasury's perps account (deposits arrive by usdSend). The treasury holds no
+    positions, so accountValue = USDC. UNVERIFIED against a live treasury — verify before go-live."""
+
+    def __init__(self, info: Any, treasury_address: str) -> None:
+        self.info = info
+        self.treasury = treasury_address.lower()
+
+    def treasury_usdc_micro(self) -> int:
+        if not self.treasury:
+            raise ValidationFailed("treasury address not configured")
+        state = self.info.clearinghouse_state(self.treasury, "")
+        value = ((state or {}).get("marginSummary") or {}).get("accountValue", "0")
+        return to_micro(parse_decimal(str(value)), ROUND_FLOOR)
+
+
+# ======================================================================================================== sandbox client
+
+class SandboxClient:
+    """POST ``{sandbox_url}/run`` (app/sandbox/service.py). Auth: ``X-Sandbox-Secret`` + a Google-signed ID token
+    for Cloud Run IAM (audience = service URL, ``google-auth``; import-guarded: required in prod, optional in dev)."""
+
+    def __init__(self, url: str, secret: str, *, require_id_token: bool, timeout: float = 60.0,
+                 token_provider: Callable[[str], str | None] | None = None,
+                 opener: Callable[..., Any] = urllib.request.urlopen, max_response_bytes: int = 1 << 20) -> None:
+        self.url = (url or "").rstrip("/")
+        self.secret = secret or ""
+        self.require_id_token = require_id_token
+        self.timeout = timeout
+        self._token_provider = token_provider or self._google_id_token
+        self._open = opener
+        self._max = max_response_bytes
+
+    @staticmethod
+    def _google_id_token(audience: str) -> str | None:
+        try:
+            from google.auth.transport.requests import Request as GRequest  # type: ignore[import-not-found]
+            from google.oauth2 import id_token  # type: ignore[import-not-found]
+        except ImportError:
+            return None
+        return id_token.fetch_id_token(GRequest(), audience)
+
+    def _token(self) -> str | None:
+        try:
+            tok = self._token_provider(self.url)
+        except Exception as e:  # noqa: BLE001 - metadata server / credentials unavailable
+            if self.require_id_token:
+                raise ExternalServiceError("cannot obtain sandbox identity token", error=type(e).__name__) from None
+            return None
+        if not tok and self.require_id_token:
+            raise ExternalServiceError("cannot obtain sandbox identity token (google-auth missing)")
+        return tok or None
+
+    def run(self, source: str, bars: Mapping[str, Any], *, now_ms: int) -> dict[str, Any]:
+        if not self.url:
+            raise ExternalServiceError("sandbox_url not configured")
+        if not self.secret:
+            raise ExternalServiceError("sandbox shared secret not configured")
+        headers = {"Content-Type": "application/json", "X-Sandbox-Secret": self.secret}
+        tok = self._token()
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
+        body = json.dumps({"source": source, "bars": bars, "now_ms": int(now_ms)}, separators=(",", ":")).encode()
+        req = urllib.request.Request(self.url + "/run", data=body, method="POST", headers=headers)
+        try:
+            with self._open(req, timeout=self.timeout) as r:  # noqa: S310 - URL from config
+                raw = r.read(self._max + 1)
+        except urllib.error.HTTPError as e:
+            detail: dict[str, Any] = {}
+            try:
+                detail = json.loads(e.read(65536) or b"{}")
+            except ValueError:
+                pass
+            raise ExternalServiceError("sandbox run failed", status=e.code,
+                                       sandbox_error=str(detail.get("error") or "")[:64],
+                                       message=str(detail.get("message") or "")[:200]) from None
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise ExternalServiceError("sandbox unavailable", error=type(e).__name__) from None
+        if len(raw) > self._max:
+            raise ExternalServiceError("sandbox response too large")
+        try:
+            out = json.loads(raw)
+        except ValueError:
+            raise ExternalServiceError("sandbox returned invalid JSON") from None
+        if not isinstance(out, dict) or not isinstance(out.get("weights"), dict):
+            raise ExternalServiceError("sandbox returned no weights")
+        return out
+
+
+# ======================================================================================================== notifier
+
+_DEDUPE_LOCK = threading.Lock()
+_DEDUPE: Any = None
+
+
+def _shared_dedupe() -> Any:
+    global _DEDUPE
+    with _DEDUPE_LOCK:
+        if _DEDUPE is None:
+            from app.alerts.notifier import InMemoryDedupeStore
+
+            _DEDUPE = InMemoryDedupeStore()
+        return _DEDUPE
+
+
+def build_notifier(settings: Any, db: PgDatabase, *, dedupe_store: Any = None) -> Any:
+    """Notifier for the executor service: in-app rows (alerts table), email (Resend) to the user and ops for
+    warn/critical, Telegram ops page for critical, auto-pause (new_entries_paused:{coin}) for critical market alerts.
+    The dedupe store is per process; alert ROWS are additionally deduped across instances (PgAlertRepo)."""
+    from app.alerts import notifier as n
+
+    email = None
+    if getattr(settings, "email_provider_api_key", ""):
+        email = n.EmailSink(n.ResendProvider(settings.email_provider_api_key, settings.email_from))
+    telegram = None
+    if getattr(settings, "telegram_bot_token", "") and getattr(settings, "telegram_ops_chat_id", ""):
+        telegram = n.TelegramSink(settings.telegram_bot_token, settings.telegram_ops_chat_id)
+    return n.Notifier(in_app=n.InAppSink(PgAlertRepo(db)), email=email, telegram=telegram,
+                      contacts=PgContactDirectory(db), ops_emails=getattr(settings, "ops_emails", ()),
+                      flags=PgMarketPauseFlags(db), dedupe_store=dedupe_store or _shared_dedupe())
+
+
+# ======================================================================================================== runtime
+
+class Runtime:
+    """Composition root. Every argument overrides the settings-derived default (tests inject fakes).
+
+    Factories taking the job's ``PgDatabase``: ``key_provider_factory(db)``, ``alert_sink_factory(db)``.
+    """
+
+    def __init__(self, settings: Any = None, *, info: Any = None, market_source: Any = None, market_data: Any = None,
+                 positions: Any = None, order_status: Any = None, gateways: Any = None,
+                 key_provider_factory: Callable[[PgDatabase], Any] | None = None,
+                 code_decryptor: Any = None, alert_sink_factory: Callable[[PgDatabase], Any] | None = None,
+                 clock: Any = None, jitter: Any = None, planner: Any = None,
+                 executor_config: ExecutorConfig | None = None, sandbox: Any = None, builder_rewards: Any = None,
+                 treasury: Any = None, economics: Economics | None = None,
+                 reconcile_config: ReconcileConfig | None = None, bar_settle_seconds: int = 30,
+                 missing_bar_grace_seconds: int = 600, creator_signal_budget_seconds: float = 20.0) -> None:
+        self.settings = settings or get_settings()
+        s = self.settings
+        self.economics = economics or getattr(s, "economics", None) or Economics()
+        self.clock = clock or SystemClock()
+        self._info = info
+        self._market_source = market_source
+        self._market_data = market_data
+        self._positions = positions
+        self._order_status = order_status
+        self._gateways = gateways
+        self._key_provider_factory = key_provider_factory
+        self._code_decryptor = code_decryptor
+        self._alert_sink_factory = alert_sink_factory
+        self._jitter = jitter
+        self._planner = planner
+        self.executor_config = executor_config or ExecutorConfig.from_settings(s)
+        self._sandbox = sandbox
+        self._builder_rewards = builder_rewards
+        self._treasury = treasury
+        self.reconcile_config = reconcile_config or ReconcileConfig()
+        self.bar_settle_seconds = bar_settle_seconds
+        self.missing_bar_grace_seconds = missing_bar_grace_seconds
+        self.creator_signal_budget_seconds = creator_signal_budget_seconds
+        self._traded_coins: tuple[str, ...] = ()
+        self._agent_decryptor: Any = None
+        self._lock = threading.RLock()
+
+    # ---- Hyperliquid ------------------------------------------------------------------------------------------
+    @property
+    def info(self) -> Any:
+        if self._info is None:
+            with self._lock:
+                if self._info is None:
+                    from app.hl.info import InfoClient
+
+                    self._info = InfoClient(self.settings.hl_api_url)
+        return self._info
+
+    @property
+    def market_source(self) -> Any:
+        if self._market_source is None:
+            from app.hl.readers import HlMarketData
+
+            self._market_source = HlMarketData(self.info)
+        return self._market_source
+
+    @property
+    def market_data(self) -> Any:
+        if self._market_data is None:
+            self._market_data = CatalogMarketData(self.market_source)
+        return self._market_data
+
+    @property
+    def positions(self) -> Any:
+        if self._positions is None:
+            from app.hl.readers import HlPositionReader
+
+            self._positions = HlPositionReader(self.info)
+        return self._positions
+
+    @property
+    def order_status(self) -> Any:
+        if self._order_status is None:
+            from app.hl.readers import HlOrderStatusReader
+
+            self._order_status = HlOrderStatusReader(self.info)
+        return self._order_status
+
+    def _catalog_for_gateway(self) -> Any:
+        return self.market_source.catalog(self._traded_coins)
+
+    @property
+    def gateways(self) -> Any:
+        if self._gateways is None:
+            from app.hl.client import BuilderCode, SdkGatewayFactory
+
+            builder = BuilderCode(self.settings.builder_address, self.economics.builder_fee_tenths_bp)
+            self._gateways = SdkGatewayFactory(self._catalog_for_gateway, builder, base_url=self.settings.hl_api_url)
+        return self._gateways
+
+    # ---- secrets ----------------------------------------------------------------------------------------------
+    def key_provider(self, db: PgDatabase) -> Any:
+        if self._key_provider_factory is not None:
+            return self._key_provider_factory(db)
+        from .keys import DbAgentKeyProvider
+
+        with self._lock:
+            if self._agent_decryptor is None:
+                from app.security.kms import make_decryptor
+
+                self._agent_decryptor = make_decryptor(self.settings)   # one per process, agent keys only
+        dec = self._agent_decryptor
+        return DbAgentKeyProvider(db, decryptor_factory=lambda: dec)
+
+    @property
+    def code_decryptor(self) -> Any:
+        if self._code_decryptor is None:
+            from .keys import CreatorCodeDecryptor
+
+            self._code_decryptor = CreatorCodeDecryptor(settings=self.settings)   # dedicated instance
+        return self._code_decryptor
+
+    # ---- alerts / misc ----------------------------------------------------------------------------------------
+    def alerts(self, db: PgDatabase) -> Any:
+        if self._alert_sink_factory is not None:
+            return self._alert_sink_factory(db)
+        return NotifierAlertSink(build_notifier(self.settings, db))
+
+    @property
+    def jitter(self) -> Any:
+        if self._jitter is None:
+            self._jitter = DomainJitter(jitter_salt(self.settings), self.settings.risk.jitter_max_seconds)
+        return self._jitter
+
+    @property
+    def planner(self) -> Any:
+        if self._planner is None:
+            self._planner = RiskPlanner(self.settings.risk, grace_hours=self.economics.past_due_grace_hours)
+        return self._planner
+
+    @property
+    def sandbox(self) -> Any:
+        if self._sandbox is None:
+            self._sandbox = SandboxClient(self.settings.sandbox_url, self.settings.sandbox_shared_secret,
+                                          require_id_token=bool(self.settings.is_prod))
+        return self._sandbox
+
+    @property
+    def builder_rewards(self) -> Any:
+        if self._builder_rewards is None:
+            self._builder_rewards = HlBuilderRewardsReader(self.info, self.settings.builder_address)
+        return self._builder_rewards
+
+    @property
+    def treasury(self) -> Any:
+        if self._treasury is None:
+            self._treasury = HlTreasuryReader(self.info, self.settings.treasury_address)
+        return self._treasury
+
+    # ---- composed services ------------------------------------------------------------------------------------
+    def executor(self, db: PgDatabase, *, alerts: Any = None) -> Executor:
+        subs = PgSubscriptionRepo(db)
+        try:
+            self._traded_coins = tuple(subs.traded_markets())
+        except Exception:  # noqa: BLE001 - only narrows the gateway catalog; fall back to the validator dex
+            log.warning("traded_markets_unavailable", exc_info=True)
+        return Executor(
+            signals=PgSignalRepo(db), subscriptions=subs, market_data=self.market_data, positions=self.positions,
+            order_status=self.order_status, keys=self.key_provider(db), gateways=self.gateways,
+            flags=PgFlagRepo(db), alerts=alerts or self.alerts(db), clock=self.clock, locks=PgLockProvider(db),
+            planner=self.planner, jitter=self.jitter, config=self.executor_config)
+
+    def settlement(self, db: PgDatabase, *, alerts: Any = None) -> Settlement:
+        grace = self.economics.past_due_grace_hours
+        return Settlement(
+            repo=PgSettlementRepo(db, self.economics), ledger=PgLedger(db), uow=PgUnitOfWork(db),
+            profit_share=DomainProfitShare(self.economics), fees=DomainFees(self.economics),
+            billing=DomainBilling(grace), referrals=PgReferralLookup(db, self.economics),
+            alerts=alerts or self.alerts(db), clock=self.clock)
+
+    def reconciler(self, db: PgDatabase, *, alerts: Any = None) -> Reconciler:
+        return Reconciler(repo=PgReconcileRepo(db), positions=self.positions, builder_rewards=self.builder_rewards,
+                          treasury=self.treasury, ledger=PgLedger(db), alerts=alerts or self.alerts(db),
+                          config=self.reconcile_config)
+
+
+_RUNTIME: Runtime | None = None
+_RUNTIME_LOCK = threading.Lock()
+
+
+def get_runtime() -> Runtime:
+    global _RUNTIME
+    with _RUNTIME_LOCK:
+        if _RUNTIME is None:
+            _RUNTIME = Runtime()
+        return _RUNTIME
+
+
+def set_runtime(runtime: Runtime | None) -> None:
+    """Install (or with None: reset) the process-wide runtime."""
+    global _RUNTIME
+    with _RUNTIME_LOCK:
+        _RUNTIME = runtime
+
+
+def _db(db: Any) -> PgDatabase:
+    if db is None:
+        raise ValueError("db is required")
+    return db if isinstance(db, PgDatabase) else PgDatabase(db)
+
+
+def _emit(alerts: Any, severity: str, kind: str, payload: dict[str, Any], *, dedup: str | None = None,
+          user_id: str | None = None) -> None:
+    try:
+        alerts.emit(AlertEvent(severity=severity, kind=kind, payload=payload, user_id=user_id, dedup_key=dedup))
+    except Exception:  # noqa: BLE001
+        log.error("alert_emit_failed", exc_info=True, extra={"fields": {"kind": kind}})
+
+
+# ======================================================================================================== jobs
+
+def run_tick(*, db: Any, now: datetime, runtime: Runtime | None = None, creator_signals: bool = True) -> dict[str, Any]:
+    """/internal/tick (every minute): creator signals for bars that just closed, then the executor tick."""
+    rt = runtime or get_runtime()
+    now = _aware(now)
+    pdb = _db(db)
+    alerts = rt.alerts(pdb)
+    out: dict[str, Any] = {}
+    if creator_signals:
+        try:
+            out["creator_signals"] = run_creator_signals(db=pdb, now=now, runtime=rt, alerts=alerts)
+        except Exception as e:  # noqa: BLE001 - never block the executor on the sandbox
+            log.error("creator_signals_failed", exc_info=True)
+            out["creator_signals"] = {"error": type(e).__name__}
+    report = rt.executor(pdb, alerts=alerts).run_tick(now)
+    out.update(report.as_dict())
+    return out
+
+
+def settle_daily(*, db: Any, now: datetime, settle_date: date | str | None = None,
+                 runtime: Runtime | None = None) -> dict[str, Any]:
+    """/internal/settle-daily (00:30 UTC). ``settle_date`` = the trading day to settle (router default: yesterday);
+    its PnL cut-off is the next midnight, clamped to today's midnight. Without it: cut-off = today 00:00 UTC."""
+    rt = runtime or get_runtime()
+    now = _aware(now)
+    pdb = _db(db)
+    if isinstance(settle_date, str):
+        settle_date = date.fromisoformat(settle_date)
+    cutoff_day = now.date() if settle_date is None else min(settle_date + timedelta(days=1), now.date())
+    with PgLockProvider(pdb).try_lock("job:settle-daily") as held:
+        if not held:
+            return {"skipped": "another settlement is running", "cutoff_day": cutoff_day.isoformat()}
+        report = rt.settlement(pdb).settle_daily(cutoff_day, now)
+    out = report.as_dict()
+    out["status_changes"] = [list(x) for x in out.get("status_changes", [])]
+    out["business_day"] = (cutoff_day - timedelta(days=1)).isoformat()
+    out["cutoff"] = datetime.combine(cutoff_day, datetime.min.time(), tzinfo=UTC).isoformat()
+    return out
+
+
+def reconcile(*, db: Any, now: datetime, runtime: Runtime | None = None) -> dict[str, Any]:
+    """/internal/reconcile (daily). The report is stored (reconciliation_reports) for the admin console."""
+    rt = runtime or get_runtime()
+    now = _aware(now)
+    pdb = _db(db)
+    date_key = now.date().isoformat()
+    with PgLockProvider(pdb).try_lock("job:reconcile") as held:
+        if not held:
+            return {"skipped": "another reconciliation is running"}
+        report = rt.reconciler(pdb).run(date_key).as_dict()
+        PgReconciliationStore(pdb).save(date_key, report, now)
+    return {"date_key": date_key, **report}
+
+
+def latest_reconciliation(conn: Any = None, *, db: Any = None, now: datetime | None = None) -> dict[str, Any] | None:
+    """Latest stored reconciliation report (admin console). ``conn``: an open SQLAlchemy connection (API) or a
+    SqlRunner; ``db``: a DatabasePort."""
+    target = conn if conn is not None else db
+    if target is None:
+        raise ValueError("conn or db required")
+    return PgReconciliationStore(_db(target)).latest()
+
+
+def referral_tiers(*, db: Any, now: datetime, runtime: Runtime | None = None, window_days: int = 30) -> dict[str, Any]:
+    """/internal/referral-tiers (daily, before settlement): SPEC §1.2 tiers on trailing-30-day stats of each
+    referrer's referred users (active users OR referred notional) → users.referral_tier."""
+    from app.domain.referrals import evaluate_tier
+
+    rt = runtime or get_runtime()
+    now = _aware(now)
+    pdb = _db(db)
+    repo = PgReferralTierRepo(pdb)
+    since = now - timedelta(days=int(window_days))
+    evaluated = 0
+    changes: list[dict[str, Any]] = []
+    with PgLockProvider(pdb).try_lock("job:referral-tiers") as held:
+        if not held:
+            return {"skipped": "another referral-tier run is in progress"}
+        for r in repo.referrer_stats(since, now):
+            evaluated += 1
+            tier = evaluate_tier(int(r["active_users"]), int(r["notional_micro"]), rt.economics.referral_tiers)
+            if tier.name != r["tier"] and repo.set_tier(r["referrer_id"], tier.name):
+                changes.append({"user_id": r["referrer_id"], "from": r["tier"], "to": tier.name,
+                                "active_users": int(r["active_users"]), "notional_micro": int(r["notional_micro"])})
+    log.info("referral_tiers_done", extra={"fields": {"evaluated": evaluated, "changed": len(changes)}})
+    return {"evaluated": evaluated, "changed": len(changes), "changes": changes[:200],
+            "window_start": since.isoformat()}
+
+
+# ---------------------------------------------------------------------------------------------------- creator signals
+
+def _bars_for(rt: Runtime, repo: PgCreatorSignalRepo, coin: str, interval: str, lookback: int, bar_close_ms: int,
+              use_stored: bool) -> list[dict[str, Any]]:
+    """Closed bars (open time t, t + interval ≤ bar_close) oldest → newest, at most ``lookback``. Stored candles
+    first (immutable once closed); whatever is missing — the newest bars, or older history — from candleSnapshot."""
+    iv = INTERVAL_MS[interval]
+    need_from = bar_close_ms - lookback * iv
+    rows: dict[int, dict[str, Any]] = {}
+    if use_stored:
+        try:
+            for r in repo.stored_candles(coin, interval, lookback + 2):
+                t = open_time_ms(r["open_time"])
+                rows[t] = {"t": t, "o": r["o"], "h": r["h"], "l": r["l"], "c": r["c"], "v": r["v"]}
+        except Exception:  # noqa: BLE001 - the API path below still works
+            log.warning("stored_candles_unavailable", exc_info=True, extra={"fields": {"coin": coin}})
+    last_needed = bar_close_ms - iv
+    if not rows or min(rows) > need_from:
+        start = need_from
+    else:
+        start = max(rows) + iv
+    if start <= last_needed:
+        for c in rt.info.candle_snapshot(coin, interval, start, bar_close_ms):
+            t = int(c["t"])
+            rows.setdefault(t, {"t": t, "o": str(c["o"]), "h": str(c["h"]), "l": str(c["l"]), "c": str(c["c"]),
+                                "v": str(c.get("v", "0"))})
+    closed = [rows[t] for t in sorted(rows) if t + iv <= bar_close_ms]
+    return closed[-lookback:]
+
+
+def run_creator_signals(*, db: Any, now: datetime, runtime: Runtime | None = None,
+                        alerts: Any = None) -> dict[str, Any]:
+    """For every listed creator version whose TIMEFRAME bar has closed (and settled ``bar_settle_seconds``) and has
+    no signal yet: fetch bars, decrypt the code (dedicated decryptor, AAD bound to strategy + code hash), run it
+    ONCE in the sandbox, store one ``signals`` row per market (source sandbox). The executor then fans out."""
+    rt = runtime or get_runtime()
+    now = _aware(now)
+    pdb = _db(db)
+    alerts = alerts or rt.alerts(pdb)
+    repo = PgCreatorSignalRepo(pdb)
+    locks = PgLockProvider(pdb)
+    now_ms = _ms(now)
+    t0 = time.monotonic()
+    rep: dict[str, Any] = {"versions": 0, "not_closed": 0, "already": 0, "waiting_data": 0, "stored": 0,
+                           "errors": 0, "deferred": 0}
+    versions = repo.creator_versions()
+    rep["versions"] = len(versions)
+    use_stored: bool | None = None
+    for v in versions:
+        interval = str(v["timeframe"])
+        iv = INTERVAL_MS.get(interval)
+        if iv is None:
+            rep["errors"] += 1
+            continue
+        bar_close_ms = now_ms - now_ms % iv
+        bar_close = datetime.fromtimestamp(bar_close_ms / 1000, tz=UTC)
+        if now_ms - bar_close_ms < rt.bar_settle_seconds * 1000:
+            rep["not_closed"] += 1
+            continue
+        if repo.has_signal(v["version_id"], bar_close):
+            rep["already"] += 1
+            continue
+        if time.monotonic() - t0 > rt.creator_signal_budget_seconds:
+            rep["deferred"] += 1
+            continue
+        try:
+            with locks.try_lock(f"sig:{v['version_id']}") as held:
+                if not held or repo.has_signal(v["version_id"], bar_close):
+                    rep["already"] += 1
+                    continue
+                if use_stored is None:
+                    use_stored = pdb.table_exists("candles")
+                lookback = int(v["lookback"])
+                bars = {c: _bars_for(rt, repo, c, interval, lookback, bar_close_ms, use_stored) for c in v["markets"]}
+                missing = sorted(c for c, b in bars.items() if not b or b[-1]["t"] != bar_close_ms - iv)
+                if missing and now_ms - bar_close_ms < rt.missing_bar_grace_seconds * 1000:
+                    rep["waiting_data"] += 1
+                    continue
+                source = rt.code_decryptor.open_source(strategy_id=v["strategy_id"], code_hash=v["code_hash"],
+                                                       ciphertext=v["code_ciphertext"])
+                result = rt.sandbox.run(source, bars, now_ms=bar_close_ms)
+                del source
+                if result.get("code_hash") and result["code_hash"] != v["code_hash"]:
+                    raise ExternalServiceError("sandbox ran different code than the version's code_hash")
+                weights = result["weights"]
+                unknown = sorted(set(weights) - set(v["markets"]))
+                if unknown:
+                    raise ValidationFailed("sandbox returned weights for markets outside MARKETS", markets=unknown)
+                bps = {c: weight_to_bps(weights.get(c, 0), int(v["max_leverage"])) for c in v["markets"]}
+                if sum(abs(x) for x in bps.values()) > int(v["max_leverage"]) * BPS:
+                    raise ValidationFailed("Σ|weights| above MAX_LEVERAGE")
+                raw = {"weights": {c: str(weights.get(c, 0)) for c in v["markets"]}, "code_hash": v["code_hash"],
+                       "cpu_seconds": result.get("cpu_seconds"), "bars_last_t": {c: (b[-1]["t"] if b else None)
+                                                                                for c, b in bars.items()},
+                       "missing_last_bar": missing, "computed_at": now.isoformat()}
+                rep["stored"] += repo.insert_signals(strategy_id=v["strategy_id"], version_id=v["version_id"],
+                                                     bar_close=bar_close, weights_bps=bps, raw=raw)
+                log.info("creator_signal_stored", extra={"fields": {"strategy_version_id": v["version_id"],
+                                                                    "bar_close": bar_close.isoformat(),
+                                                                    "weights_bps": bps}})
+        except Exception as e:  # noqa: BLE001 - one version never blocks the others
+            rep["errors"] += 1
+            log.error("creator_signal_failed", exc_info=True,
+                      extra={"fields": {"strategy_version_id": v["version_id"], "error": type(e).__name__}})
+            _emit(alerts, "warn", "creator_signal_failed",
+                  {"strategy_version_id": v["version_id"], "bar_close": bar_close.isoformat(),
+                   "error": type(e).__name__, "detail": str(getattr(e, "message", ""))[:200]},
+                  dedup=f"creator_signal_failed:{v['version_id']}:{bar_close.isoformat()}")
+    return rep

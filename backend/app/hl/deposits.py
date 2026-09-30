@@ -34,7 +34,7 @@ from typing import Any, Collection, Iterable, Mapping
 from app.errors import ValidationFailed
 from app.money import parse_decimal, to_micro
 
-__all__ = ["DepositDetected", "DepositScan", "detect_deposits", "TRANSFER_TYPES"]
+__all__ = ["DepositDetected", "DepositScan", "detect_deposits", "TRANSFER_TYPES", "scan"]
 
 TRANSFER_TYPES = ("send", "usdSend", "internalTransfer", "spotTransfer")
 _ADDR_RE = re.compile(r"^0x[0-9a-f]{40}$")
@@ -161,3 +161,12 @@ def detect_deposits(ledger_updates: Iterable[Mapping[str, Any]], *, treasury_add
         else:
             out.unverified.append(det)
     return out
+
+
+def scan(db: Any, now: Any, **params: Any) -> dict:
+    """``/internal/deposits-scan`` entrypoint (``fn(db=, now=, **params)``): scan the treasury's ledger updates and
+    book every USDC transfer into it — see ``app.jobs_data.deposits.deposits_scan`` (DB + network live there; this
+    module stays pure)."""
+    from app.jobs_data.deposits import deposits_scan
+
+    return deposits_scan(db, now, **params)

@@ -92,7 +92,8 @@ _SPECS: tuple[KindSpec, ...] = (
     KindSpec("strategy_paused", "Strategy paused", "markets", mandatory=True, email=True),
     KindSpec("signal_stale", "Strategy signal stale", "markets"),
     # system
-    KindSpec("test_alert", "Test alert", "security", email=True, listed=False),
+    # sent inline by POST /v1/alerts/test (both channels); the worker never re-sends it
+    KindSpec("test_alert", "Test alert", "security", telegram=False, listed=False),
 )
 
 CATALOG: dict[str, KindSpec] = {s.kind: s for s in _SPECS}

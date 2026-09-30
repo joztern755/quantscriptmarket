@@ -183,7 +183,7 @@ def normalize_email(raw: Any) -> str:
     if not isinstance(raw, str):
         raise ValidationFailed("invalid email address")
     e = raw.strip()
-    if len(e) > 254 or not _EMAIL_RE.match(e) or any(ord(ch) < 33 or ord(ch) == 127 for ch in e):
+    if len(e) > 254 or not _EMAIL_RE.fullmatch(e) or any(ord(ch) < 33 or ord(ch) == 127 for ch in e):
         raise ValidationFailed("invalid email address")
     local, _, domain = e.rpartition("@")
     return f"{local}@{domain.lower()}"

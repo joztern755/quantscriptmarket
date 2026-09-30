@@ -1,28 +1,32 @@
-// #/admin[/:tab] — admin console. Every action is maker-checker / audit-logged server-side and needs step-up
-// (core api retries after step-up automatically). UI role check only; the API enforces role=admin.
+// #/admin[/:tab] — admin console over backend/app/api/routers/admin.py (docs/API_CONTRACT.md). Every mutation is
+// step-up + audit-logged server-side (core api retries after step-up automatically). Maker-checker: protective
+// actions apply at once; permissive ones (lift a switch, list a version, in-house price, unsuspend, KYC approval,
+// payouts) need a second, different admin. UI role check only; the API enforces role=admin from its own DB.
 import type { PageContext } from "../core/router.js";
 import { h, mount, skeleton, errorState, emptyState, note, table, tabs, button, toast, confirmDialog, promptDialog, badge, kv, field, type Column } from "../core/ui.js";
-import { api, newIdempotencyKey } from "../core/api.js";
+import { api, publicConfig } from "../core/api.js";
 import { connectWallet, getConnectedWallet } from "../core/wallet.js";
-import { usdSend } from "../core/hl.js";
-import { fmtUsd, fmtBps, fmtDateTime, fmtRelative, shortAddr } from "../core/format.js";
-import type { Backtest } from "./_shared/types.js";
+import { usdSend, hlInfo } from "../core/hl.js";
+import { fmtUsd, fmtBps, fmtDateTime, fmtRelative, shortAddr, microToDecimal } from "../core/format.js";
+import type { CreatorVersion, Page, Alert } from "./_shared/types.js";
 import { backtestPanel } from "./_shared/backtest.js";
-import { ensurePageCss, listOf, isAbortError, pageHead, panel, isAddress, usdInput, pctToBps, bpsToPctInput, isRec, errMessage } from "./_shared/util.js";
+import { ensurePageCss, listOf, isAbortError, pageHead, panel, isAddress, usdInput, isRec, errMessage } from "./_shared/util.js";
 
 export const title = "Admin";
 
 const TABS = [
   { key: "flags", label: "Kill switches" },
+  { key: "approvals", label: "Approvals" },
   { key: "payouts", label: "Payouts" },
-  { key: "review", label: "Strategy review" },
-  { key: "prices", label: "In-house prices" },
+  { key: "strategies", label: "Strategies" },
   { key: "alerts", label: "Alerts" },
   { key: "recon", label: "Reconciliation" },
   { key: "users", label: "Users" },
 ];
 
 const MARKETS = ["BTC", "SOL", "HYPE", "xyz:GOLD", "xyz:SILVER", "xyz:CL", "xyz:BRENTOIL"];
+/** schemas.Reason: 5–500 chars. */
+const REASON = /^[\s\S]{5,500}$/;
 
 export async function render(root: HTMLElement, ctx: PageContext): Promise<void> {
   ensurePageCss();
@@ -37,12 +41,12 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
     h(
       "div",
       { class: "stack" },
-      pageHead("Admin", "Operations console", "Every action is audit-logged. Lifting a kill switch, approving payouts and similar actions need a second, different admin."),
+      pageHead("Admin", "Operations console", "Every action is audit-logged. Lifting a kill switch, listing a version, prices, KYC approvals and payouts need a second, different admin."),
       tabs(TABS, tab, (k) => ctx.navigate(k === "flags" ? "/admin" : `/admin/${k}`)),
       body,
     ),
   );
-  const fn = { flags: flagsTab, payouts: payoutsTab, review: reviewTab, prices: pricesTab, alerts: alertsTab, recon: reconTab, users: usersTab }[tab as "flags"] ?? flagsTab;
+  const fn = { flags: flagsTab, approvals: approvalsTab, payouts: payoutsTab, strategies: strategiesTab, alerts: alertsTab, recon: reconTab, users: usersTab }[tab as "flags"] ?? flagsTab;
   await fn(body, ctx);
 }
 
@@ -62,26 +66,23 @@ async function loadInto<T>(box: HTMLElement, ctx: PageContext, fetcher: () => Pr
   await run();
 }
 
-const isMine = (ctx: PageContext, who: unknown): boolean => typeof who === "string" && !!ctx.me && (who === ctx.me.id || who === ctx.me.email);
+async function askReason(titleText: string, placeholder?: string): Promise<string | null> {
+  const r = await promptDialog({ title: titleText, label: "Reason (audit log, 5–500 characters)", placeholder, pattern: REASON });
+  return r && r.trim().length >= 5 ? r.trim() : null;
+}
+
+const meId = (ctx: PageContext): string => String(ctx.me?.id ?? "");
 
 // ------------------------------------------------------------------------------------------ flags
+/** FlagOut. pending_by / updated_by are audit actors ("admin:<uuid>"). */
 interface Flag {
   key: string;
   value: unknown;
-  updated_by?: string | null;
-  updated_at?: string | null;
-}
-interface PendingFlag {
-  id: string;
-  key: string;
-  value: unknown;
-  requested_by: string;
-  requested_at?: string;
-  reason?: string | null;
-}
-
-function flagOn(v: unknown): boolean {
-  return v === true || (isRec(v) && v.enabled === true) || v === "true";
+  pending_value: unknown;
+  pending_by: string | null;
+  pending_at: string | null;
+  updated_by: string | null;
+  updated_at: string | null;
 }
 
 async function flagsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
@@ -90,19 +91,25 @@ async function flagsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
   await loadInto(
     box,
     ctx,
-    () => api.get<unknown>("/admin/flags", { signal: ctx.signal }),
-    (res, reload) => {
-      const flags = listOf<Flag>(res, "flags");
-      const pending = listOf<PendingFlag>(isRec(res) ? res.pending : [], "pending");
+    () => api.get<unknown>("/admin/flags", { signal: ctx.signal }).then((r) => listOf<Flag>(r)),
+    (flags, reload) => {
       const byKey = new Map(flags.map((f) => [f.key, f]));
       const keys = ["kill_switch_global", "new_entries_paused", ...MARKETS.map((m) => `kill_switch_market:${m}`)];
       for (const f of flags) if (!keys.includes(f.key)) keys.push(f.key);
+      const pending = flags.filter((f) => f.pending_by);
       const set = async (key: string, on: boolean): Promise<void> => {
-        const reason = await promptDialog({ title: on ? `Engage ${key}` : `Request to lift ${key}`, label: "Reason (audit log)", placeholder: "e.g. oracle divergence on xyz:SILVER", submitLabel: on ? "Engage now" : "Request lift" });
-        if (!reason || reason.trim().length < 4) return;
+        const reason = await askReason(on ? `Engage ${key}` : `Request to lift ${key}`, "e.g. oracle divergence on xyz:SILVER");
+        if (!reason) return;
         if (!on && !(await confirmDialog({ title: "Lift kill switch?", message: "Lifting requires approval by a second admin. Trading resumes only after approval.", confirmLabel: "Request lift", danger: true, requireText: "LIFT" }))) return;
-        const r = await api.post<Record<string, unknown>>("/admin/flags", { key, value: on, reason: reason.trim() }, { signal: ctx.signal });
-        toast(r && r.status === "pending" ? "Request created — waiting for a second admin." : on ? "Engaged." : "Updated.", "good");
+        const r = await api.post<{ status: string }>("/admin/flags", { key, value: on, reason }, { signal: ctx.signal });
+        toast(r.status === "pending" ? "Request created — waiting for a second admin." : "Engaged.", "good");
+        reload();
+      };
+      const decide = async (f: Flag, approve: boolean): Promise<void> => {
+        const reason = await askReason(`${approve ? "Approve" : "Reject"} lifting ${f.key}`);
+        if (!reason) return;
+        await api.post(`/admin/flags/${encodeURIComponent(f.key)}/${approve ? "approve" : "reject"}`, { reason }, { signal: ctx.signal });
+        toast(approve ? "Approved." : "Rejected.", "good");
         reload();
       };
       mount(
@@ -111,36 +118,22 @@ async function flagsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
         panel(
           "Pending approvals",
           pending.length
-            ? table<PendingFlag>({
+            ? table<Flag>({
                 columns: [
                   { key: "k", label: "Flag", value: (p) => h("span", { class: "mono break" }, p.key), primary: true },
-                  { key: "v", label: "New value", value: (p) => (flagOn(p.value) ? badge("ON", "bad") : badge("OFF", "good")) },
-                  { key: "by", label: "Requested by", value: (p) => `${p.requested_by}${p.requested_at ? " · " + fmtRelative(p.requested_at) : ""}` },
-                  { key: "r", label: "Reason", value: (p) => h("span", { class: "break" }, p.reason ?? "") },
+                  { key: "v", label: "New value", value: (p) => (p.pending_value === true ? badge("ON", "bad") : badge("OFF", "good")) },
+                  { key: "by", label: "Requested by", value: (p) => `${p.pending_by}${p.pending_at ? " · " + fmtRelative(p.pending_at) : ""}` },
                   {
                     key: "a",
                     label: "",
                     value: (p) =>
-                      isMine(ctx, p.requested_by)
+                      p.pending_by === `admin:${meId(ctx)}`
                         ? h("span", { class: "small muted" }, "Needs another admin")
-                        : h(
-                            "div",
-                            { class: "btns" },
-                            button("Approve", {
-                              kind: "primary",
-                              onClick: async () => {
-                                if (!(await confirmDialog({ title: `Approve ${p.key} → ${flagOn(p.value) ? "ON" : "OFF"}?`, message: "You are the checker for this change.", confirmLabel: "Approve", danger: !flagOn(p.value) }))) return;
-                                await api.post(`/admin/flags/pending/${encodeURIComponent(p.id)}/approve`, {}, { signal: ctx.signal });
-                                toast("Approved.", "good");
-                                reload();
-                              },
-                            }),
-                            button("Reject", { kind: "ghost", onClick: async () => { await api.post(`/admin/flags/pending/${encodeURIComponent(p.id)}/reject`, {}, { signal: ctx.signal }); reload(); } }),
-                          ),
+                        : h("div", { class: "btns" }, button("Approve", { kind: "primary", onClick: () => decide(p, true) }), button("Reject", { kind: "ghost", onClick: () => decide(p, false) })),
                   },
                 ],
                 rows: pending,
-                rowKey: (p) => p.id,
+                rowKey: (p) => p.key,
               })
             : h("p", { class: "small muted" }, "Nothing waiting."),
         ),
@@ -148,8 +141,7 @@ async function flagsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
           "Switches",
           ...keys.map((k) => {
             const f = byKey.get(k);
-            const on = flagOn(f?.value);
-            const hasPending = pending.some((p) => p.key === k);
+            const on = f?.value === true;
             return h(
               "div",
               { class: "kill-row" },
@@ -158,9 +150,7 @@ async function flagsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
                 "div",
                 { class: "btns" },
                 on ? badge("ENGAGED", "bad") : badge("off", "muted"),
-                on
-                  ? button(hasPending ? "Lift requested" : "Request lift", { kind: "ghost", disabled: hasPending, onClick: () => set(k, false) })
-                  : button("Engage", { kind: "danger", onClick: () => set(k, true) }),
+                on ? button(f?.pending_by ? "Lift requested" : "Request lift", { kind: "ghost", disabled: !!f?.pending_by, onClick: () => set(k, false) }) : button("Engage", { kind: "danger", onClick: () => set(k, true) }),
               ),
             );
           }),
@@ -170,7 +160,7 @@ async function flagsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
             button("Other market…", {
               kind: "ghost",
               onClick: async () => {
-                const coin = await promptDialog({ title: "Kill switch for market", label: "Coin", placeholder: "xyz:SILVER", pattern: /^(?:[a-z0-9]{1,12}:)?[A-Za-z0-9]{1,20}$/ });
+                const coin = await promptDialog({ title: "Kill switch for market", label: "Coin", placeholder: "xyz:SILVER", pattern: /^(?:[a-z0-9]{1,16}:)?[A-Za-z0-9]{1,32}$/ });
                 if (coin) await set(`kill_switch_market:${coin.trim()}`, true);
               },
             }),
@@ -181,43 +171,166 @@ async function flagsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
   );
 }
 
-// ------------------------------------------------------------------------------------------ payouts
-interface Payout {
+// ------------------------------------------------------------------------------------------ approvals (admin_changes)
+interface Change {
   id: string;
-  kind?: string; // payout | withdrawal
-  beneficiary?: string;
-  beneficiary_email?: string | null;
-  amount_micro: number;
-  to_address: string;
-  status: string; // requested | approved_1 | approved_2 | sent | rejected
-  maker_admin?: string | null;
-  checker_admin?: string | null;
-  created_at?: string;
-  tx_hash?: string | null;
+  kind: string; // strategy_list | strategy_price | user_unsuspend | kyc_approve
+  target: string;
+  payload: Record<string, unknown>;
+  reason: string;
+  status: string;
+  maker_admin: string;
+  checker_admin: string | null;
+  created_at: string;
+  decided_at: string | null;
 }
 
-async function payoutsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
+async function approvalsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
   const box = h("div", { class: "stack" });
   mount(body, box);
   await loadInto(
     box,
     ctx,
-    () => api.get<unknown>("/admin/payouts", { signal: ctx.signal }).then((r) => listOf<Payout>(r, "payouts", "items")),
+    () => api.get<Page<Change>>("/admin/changes?status=pending", { signal: ctx.signal }).then((r) => listOf<Change>(r)),
+    (rows, reload) => {
+      const decide = async (c: Change, approve: boolean): Promise<void> => {
+        const reason = await askReason(`${approve ? "Approve" : "Reject"} ${c.kind.replace(/_/g, " ")}`);
+        if (!reason) return;
+        await api.post(`/admin/changes/${encodeURIComponent(c.id)}/${approve ? "approve" : "reject"}`, { reason }, { signal: ctx.signal });
+        toast(approve ? "Approved and applied." : "Rejected.", "good");
+        reload();
+      };
+      mount(
+        box,
+        note("Changes proposed by one admin (listing a version, in-house prices, un-suspending a user, approving KYC). A different admin must approve.", "info"),
+        table<Change>({
+          columns: [
+            { key: "k", label: "Change", value: (c) => h("b", null, c.kind.replace(/_/g, " ")), primary: true },
+            { key: "t", label: "Target", value: (c) => h("span", { class: "mono break" }, c.target) },
+            { key: "p", label: "Details", value: (c) => h("span", { class: "small break" }, changeDetails(c)) },
+            { key: "r", label: "Reason", value: (c) => h("span", { class: "small break" }, c.reason), hideOnMobile: true },
+            { key: "w", label: "Proposed", value: (c) => fmtRelative(c.created_at), hideOnMobile: true },
+            {
+              key: "a",
+              label: "",
+              value: (c) =>
+                c.maker_admin === meId(ctx)
+                  ? h("span", { class: "small muted" }, "Needs another admin")
+                  : h("div", { class: "btns" }, button("Approve", { kind: "primary", onClick: () => decide(c, true) }), button("Reject", { kind: "ghost", onClick: () => decide(c, false) })),
+            },
+          ],
+          rows,
+          rowKey: (c) => c.id,
+          empty: "Nothing waiting for approval.",
+        }),
+      );
+    },
+  );
+}
+
+function changeDetails(c: Change): string {
+  const p = c.payload;
+  if (c.kind === "strategy_list") return `list version v${String(p.version ?? "?")}`;
+  if (c.kind === "strategy_price") return `price ${typeof p.previous_micro === "number" ? fmtUsd(p.previous_micro) : "—"} → ${typeof p.price_monthly_micro === "number" ? fmtUsd(p.price_monthly_micro) : "—"}`;
+  if (c.kind === "kyc_approve") return `provider ${String(p.provider ?? "")}`;
+  return "";
+}
+
+// ------------------------------------------------------------------------------------------ payouts
+/** AdminPayoutOut. maker_admin / checker_admin / beneficiary are user ids. */
+interface Payout {
+  id: string;
+  kind: "withdrawal" | "payout";
+  beneficiary: string;
+  amount_micro: number;
+  to_address: string;
+  status: string; // requested | approved_1 | approved_2 | sent | rejected
+  maker_admin: string | null;
+  checker_admin: string | null;
+  tx_hash: string | null;
+  created_at: string;
+}
+
+/** After a treasury usdSend, find its hash in the treasury's ledger (userNonFundingLedgerUpdates). */
+async function findSendHash(treasury: string, to: string, amountMicro: number, sentAtMs: number): Promise<string | null> {
+  const want = microToDecimal(amountMicro);
+  for (let i = 0; i < 6; i++) {
+    try {
+      const ups = await hlInfo<unknown>({ type: "userNonFundingLedgerUpdates", user: treasury, startTime: sentAtMs - 120_000 });
+      if (Array.isArray(ups)) {
+        for (const u of ups) {
+          if (!isRec(u) || !isRec(u.delta) || typeof u.hash !== "string") continue;
+          const d = u.delta;
+          const amt = String(d.amount ?? d.usdc ?? "");
+          if (String(d.destination ?? "").toLowerCase() === to.toLowerCase() && Number(amt) === Number(want) && /^0x[0-9a-fA-F]{64}$/.test(u.hash)) return u.hash.toLowerCase();
+        }
+      }
+    } catch {
+      /* retry */
+    }
+    await new Promise((r) => setTimeout(r, 2500));
+  }
+  return null;
+}
+
+async function payoutsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
+  const box = h("div", { class: "stack" });
+  mount(body, box);
+  const cfg = await publicConfig();
+  if (!ctx.isCurrent()) return;
+  await loadInto(
+    box,
+    ctx,
+    async () => {
+      const [w, p] = await Promise.all([
+        api.get<Page<Payout>>("/admin/payouts?kind=withdrawal&limit=100", { signal: ctx.signal }),
+        api.get<Page<Payout>>("/admin/payouts?kind=payout&limit=100", { signal: ctx.signal }),
+      ]);
+      return [...listOf<Payout>(w), ...listOf<Payout>(p)].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+    },
     (rows, reload) => {
       const open = rows.filter((p) => p.status !== "sent" && p.status !== "rejected");
       const done = rows.filter((p) => p.status === "sent" || p.status === "rejected");
+      const base = (p: Payout): string => `/admin/payouts/${p.kind}/${encodeURIComponent(p.id)}`;
+      const recordSent = async (p: Payout, txHash: string, timeMs: number): Promise<void> => {
+        await api.post(`${base(p)}/sent`, { tx_hash: txHash, time_ms: timeMs }, { signal: ctx.signal, idempotencyKey: `payout-sent-${p.id}-${txHash.slice(2, 18)}` });
+        toast("Sent and recorded.", "good");
+        reload();
+      };
+      const signAndSend = async (p: Payout): Promise<void> => {
+        if (!isAddress(p.to_address)) throw new Error("Invalid destination address.");
+        const treasury = cfg.treasury_address;
+        if (cfg._fallback || !isAddress(treasury)) throw new Error("The treasury address is not configured / config unavailable. Nothing was signed.");
+        const w = getConnectedWallet() ?? (await connectWallet());
+        if (!w) return;
+        // The treasury key never touches a server: only the treasury hardware wallet may sign this usdSend.
+        if (w.address.toLowerCase() !== treasury.toLowerCase()) {
+          throw new Error(`The connected wallet ${shortAddr(w.address)} is not the treasury ${shortAddr(treasury)}. Connect the treasury hardware wallet; nothing was signed.`);
+        }
+        if (!(await confirmDialog({ title: "Send USDC from treasury?", message: kv([["Amount", fmtUsd(p.amount_micro)], ["To", h("span", { class: "mono break" }, p.to_address)], ["From (treasury)", h("span", { class: "mono break" }, treasury)]]), confirmLabel: "Sign in wallet", danger: true }))) return;
+        const td = await api.post<{ payout: Payout; payload: { typed_data?: unknown }; exchange_url: string }>(`${base(p)}/typed-data`, { signature_chain_id: await w.chainIdHex() }, { signal: ctx.signal });
+        if (td.payout.to_address.toLowerCase() !== p.to_address.toLowerCase() || td.payout.amount_micro !== p.amount_micro) throw new Error("The payout changed on the server. Reload and check again.");
+        const r = await usdSend(w, { destination: p.to_address, amountMicro: p.amount_micro, serverTypedData: td.payload.typed_data, expectDestination: p.to_address });
+        if (!r.ok) throw new Error(`Hyperliquid rejected the transfer: ${r.error ?? "unknown error"}`);
+        const sentAt = r.nonce ?? Date.now();
+        toast("Transfer submitted. Looking up the transaction hash…", "info");
+        const hash = (await findSendHash(treasury, p.to_address, p.amount_micro, sentAt)) ??
+          (await promptDialog({ title: "Transaction hash", message: "Couldn't find the transfer automatically. Paste its hash from the Hyperliquid explorer (treasury address).", label: "Tx hash (0x…64 hex)", pattern: /^0x[0-9a-fA-F]{64}$/ }));
+        if (!hash) return;
+        await recordSent(p, hash.toLowerCase(), sentAt);
+      };
       const action = (p: Payout): HTMLElement => {
         if (p.status === "requested" || p.status === "approved_1") {
-          const mine = isMine(ctx, p.maker_admin);
-          if (p.status === "approved_1" && mine) return h("span", { class: "small muted" }, "Waiting for a second admin");
+          if (p.beneficiary === meId(ctx)) return h("span", { class: "small muted" }, "Your own request");
+          if (p.status === "approved_1" && p.maker_admin === meId(ctx)) return h("span", { class: "small muted" }, "Waiting for a second admin");
           return h(
             "div",
             { class: "btns" },
             button(p.status === "requested" ? "Approve (1st)" : "Approve (2nd)", {
               kind: "primary",
               onClick: async () => {
-                if (!(await confirmDialog({ title: "Approve payout?", message: kv([["Amount", fmtUsd(p.amount_micro)], ["To", h("span", { class: "mono break" }, p.to_address)], ["Beneficiary", p.beneficiary_email ?? p.beneficiary ?? "—"]]), confirmLabel: "Approve" }))) return;
-                await api.post(`/admin/payouts/${encodeURIComponent(p.id)}/approve`, {}, { signal: ctx.signal });
+                if (!(await confirmDialog({ title: "Approve payout?", message: kv([["Kind", p.kind], ["Amount", fmtUsd(p.amount_micro)], ["To", h("span", { class: "mono break" }, p.to_address)], ["Beneficiary", h("span", { class: "mono" }, p.beneficiary)]]), confirmLabel: "Approve" }))) return;
+                await api.post(`${base(p)}/approve`, {}, { signal: ctx.signal });
                 toast("Approved.", "good");
                 reload();
               },
@@ -225,45 +338,43 @@ async function payoutsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
             button("Reject", {
               kind: "ghost",
               onClick: async () => {
-                const reason = await promptDialog({ title: "Reject payout", label: "Reason" });
+                const reason = await askReason("Reject payout");
                 if (!reason) return;
-                await api.post(`/admin/payouts/${encodeURIComponent(p.id)}/reject`, { reason }, { signal: ctx.signal });
+                await api.post(`${base(p)}/reject`, { reason }, { signal: ctx.signal });
                 reload();
               },
             }),
           );
         }
         if (p.status === "approved_2") {
-          return button("Sign & send (hardware wallet)", {
-            kind: "primary",
-            onClick: async () => {
-              if (!isAddress(p.to_address)) throw new Error("Invalid destination address.");
-              const w = getConnectedWallet() ?? (await connectWallet());
-              if (!w) return;
-              if (!(await confirmDialog({ title: "Send USDC from treasury?", message: kv([["Amount", fmtUsd(p.amount_micro)], ["To", h("span", { class: "mono break" }, p.to_address)], ["From", h("span", { class: "mono break" }, w.address)]]), confirmLabel: "Sign in wallet", danger: true }))) return;
-              const td = await api.post<Record<string, unknown>>(`/admin/payouts/${encodeURIComponent(p.id)}/typed-data`, { from_address: w.address }, { signal: ctx.signal });
-              const r = await usdSend(w, { destination: p.to_address, amountMicro: p.amount_micro, serverTypedData: td.typed_data ?? td.typedData, expectDestination: p.to_address });
-              if (!r.ok) throw new Error(`Hyperliquid rejected the transfer: ${r.error ?? "unknown error"}`);
-              await api.post(`/admin/payouts/${encodeURIComponent(p.id)}/sent`, { from_address: w.address }, { signal: ctx.signal, idempotencyKey: `payout-sent-${p.id}` });
-              toast("Sent.", "good");
-              reload();
-            },
-          });
+          return h(
+            "div",
+            { class: "btns" },
+            button("Sign & send (treasury wallet)", { kind: "primary", disabled: !cfg.features.payouts, onClick: () => signAndSend(p) }),
+            button("Record tx hash…", {
+              kind: "ghost",
+              onClick: async () => {
+                const hash = await promptDialog({ title: "Record a sent transfer", message: "Only if the usdSend was already submitted from the treasury.", label: "Tx hash (0x…64 hex)", pattern: /^0x[0-9a-fA-F]{64}$/ });
+                if (hash) await recordSent(p, hash.toLowerCase(), Date.now());
+              },
+            }),
+          );
         }
         return h("span", { class: "small muted" }, p.tx_hash ? shortAddr(p.tx_hash, 10, 6) : p.status);
       };
       const cols: Column<Payout>[] = [
-        { key: "who", label: "Beneficiary", value: (p) => h("span", { class: "break" }, `${p.kind ?? "payout"} · ${p.beneficiary_email ?? p.beneficiary ?? "—"}`), primary: true },
+        { key: "who", label: "Beneficiary", value: (p) => h("span", { class: "break" }, `${p.kind} · `, h("span", { class: "mono" }, shortAddr(p.beneficiary, 8, 4))), primary: true },
         { key: "amt", label: "Amount", value: (p) => fmtUsd(p.amount_micro), align: "right", mono: true },
         { key: "to", label: "To", value: (p) => h("span", { class: "mono", title: p.to_address }, shortAddr(p.to_address)) },
         { key: "st", label: "Status", value: (p) => badge(p.status.replace(/_/g, " "), p.status === "sent" ? "good" : p.status === "rejected" ? "bad" : "warn") },
-        { key: "mk", label: "Maker / checker", value: (p) => `${p.maker_admin ?? "—"} / ${p.checker_admin ?? "—"}`, hideOnMobile: true },
-        { key: "at", label: "Requested", value: (p) => (p.created_at ? fmtRelative(p.created_at) : "—"), hideOnMobile: true },
+        { key: "mk", label: "Maker / checker", value: (p) => `${p.maker_admin ? shortAddr(p.maker_admin, 8, 4) : "—"} / ${p.checker_admin ? shortAddr(p.checker_admin, 8, 4) : "—"}`, hideOnMobile: true },
+        { key: "at", label: "Requested", value: (p) => fmtRelative(p.created_at), hideOnMobile: true },
         { key: "a", label: "", value: action },
       ];
       mount(
         box,
-        note("Two different admins must approve before sending. The treasury key never touches a server: the final UsdSend is signed here with the treasury hardware wallet.", "info"),
+        cfg.features.payouts ? null : note("Payouts are disabled in this launch phase (PAYOUTS_ENABLED=false): approvals and sending are refused by the server.", "warn"),
+        note(`Two different admins must approve before sending. The final UsdSend is signed here with the treasury hardware wallet (${cfg.treasury_address ? shortAddr(cfg.treasury_address) : "not configured"}); any other connected wallet is refused.`, "info"),
         panel("Queue", table({ columns: cols, rows: open, rowKey: (p) => p.id, empty: "Queue is empty." })),
         panel("Recent", table({ columns: cols.filter((c) => c.key !== "a").concat([{ key: "tx", label: "Tx", value: (p) => (p.tx_hash ? h("span", { class: "mono" }, shortAddr(p.tx_hash, 10, 6)) : "—") }]), rows: done.slice(0, 50), rowKey: (p) => p.id, empty: "Nothing yet." })),
       );
@@ -271,152 +382,167 @@ async function payoutsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
   );
 }
 
-// ------------------------------------------------------------------------------------------ review
-interface ReviewItem {
+// ------------------------------------------------------------------------------------------ strategies
+/** AdminStrategyOut (versions: latest 5, newest first). */
+interface AdminStrategy {
   id: string;
+  slug: string;
   name: string;
-  slug?: string;
-  owner_email?: string | null;
-  owner_kyc_status?: string | null;
-  markets?: string[];
-  description?: string | null;
-  price_monthly_micro?: number;
-  profit_share_bps?: number;
   status: string;
-  version?: { id: string; version: number; code_hash?: string; source?: string; backtest?: Backtest | null; submitted_at?: string } | null;
+  in_house: boolean;
+  owner_user_id: string | null;
+  owner_kyc_status: string | null;
+  price_monthly_micro: number | null;
+  profit_share_bps: number;
+  versions: CreatorVersion[];
 }
 
-async function reviewTab(body: HTMLElement, ctx: PageContext): Promise<void> {
+async function strategiesTab(body: HTMLElement, ctx: PageContext): Promise<void> {
+  let status = ctx.query.get("status") ?? "review";
+  const sel = h("select", { "aria-label": "Status" }, ...["review", "listed", "paused", "draft", "delisted"].map((x) => h("option", { value: x }, x)));
+  sel.value = status;
   const box = h("div", { class: "stack" });
-  mount(body, box);
-  await loadInto(
-    box,
-    ctx,
-    () => api.get<unknown>("/admin/strategies?status=review", { signal: ctx.signal }).then((r) => listOf<ReviewItem>(r, "strategies")),
-    (rows, reload) => {
-      if (!rows.length) {
-        mount(box, emptyState("No strategies waiting for review"));
-        return;
-      }
-      mount(
-        box,
-        ...rows.map((s) => {
-          const decide = async (decision: "approve" | "reject"): Promise<void> => {
-            const noteText = await promptDialog({ title: decision === "approve" ? `Approve ${s.name}` : `Reject ${s.name}`, label: "Review note (sent to creator, audit-logged)" });
-            if (noteText === null) return;
-            if (decision === "approve" && !(await confirmDialog({ title: "List this version?", message: "The strategy becomes visible and subscribable. A new version resets its live record.", confirmLabel: "Approve & list" }))) return;
-            await api.post(`/admin/strategies/${encodeURIComponent(s.id)}/review`, { version_id: s.version?.id, decision, note: noteText }, { signal: ctx.signal });
-            toast(decision === "approve" ? "Approved." : "Rejected.", "good");
-            reload();
-          };
-          return panel(
-            h("div", { class: "row between w-full" }, h("h2", null, s.name, s.version ? ` · v${s.version.version}` : ""), badge(s.owner_kyc_status === "verified" ? "KYC verified" : `KYC ${s.owner_kyc_status ?? "unknown"}`, s.owner_kyc_status === "verified" ? "good" : "bad")),
-            kv([
-              ["Creator", s.owner_email ?? "—"],
-              ["Markets", (s.markets ?? []).join(", ") || "—"],
-              ["Price / profit share", `${fmtUsd(s.price_monthly_micro ?? 0)} / ${fmtBps(s.profit_share_bps ?? 0)}`],
-              ["Source", s.version?.source ?? "—"],
-              ["Code hash", h("span", { class: "mono break" }, s.version?.code_hash ?? "—")],
-              ["Submitted", s.version?.submitted_at ? fmtDateTime(s.version.submitted_at) : "—"],
-            ]),
-            s.description ? h("p", { class: "small break" }, s.description) : null,
-            backtestPanel(s.version?.backtest ?? null),
-            h("div", { class: "btns" }, button("Approve & list", { kind: "primary", onClick: () => decide("approve") }), button("Reject", { kind: "danger", onClick: () => decide("reject") })),
-          );
-        }),
-      );
-    },
-  );
+  const cfg = await publicConfig();
+  const load = (): Promise<void> =>
+    loadInto(
+      box,
+      ctx,
+      () => api.get<Page<AdminStrategy>>(`/admin/strategies?status=${encodeURIComponent(status)}&limit=50`, { signal: ctx.signal }).then((r) => listOf<AdminStrategy>(r)),
+      (rows, reload) => {
+        if (!rows.length) {
+          mount(box, emptyState(`No ${status} strategies`));
+          return;
+        }
+        const act = async (s: AdminStrategy, path: string, label: string, danger = false): Promise<void> => {
+          const reason = await askReason(`${label}: ${s.name}`);
+          if (!reason) return;
+          if (danger && !(await confirmDialog({ title: `${label}?`, message: "Live subscriptions of a delisted strategy go reduce-only (exits only).", confirmLabel: label, danger: true }))) return;
+          const r = await api.post<{ status: string }>(`/admin/strategies/${encodeURIComponent(s.id)}/${path}`, { reason }, { signal: ctx.signal });
+          toast(r.status === "pending" ? "Proposed — a second admin must approve." : "Done.", "good");
+          reload();
+        };
+        mount(
+          box,
+          ...rows.map((s) => {
+            const unpublished = s.versions.filter((v) => !v.published_at);
+            const price = usdInput({ value: String((s.price_monthly_micro ?? 0) / 1_000_000) });
+            return panel(
+              h("div", { class: "row between w-full" }, h("h2", null, s.name), h("span", { class: "row" }, badge(s.status, s.status === "listed" ? "good" : "muted"), s.in_house ? badge("in-house", "info") : badge(`KYC ${s.owner_kyc_status ?? "not started"}`, s.owner_kyc_status === "approved" ? "good" : "bad"))),
+              kv([
+                ["Slug", h("span", { class: "mono" }, s.slug)],
+                ["Price / profit share", `${s.price_monthly_micro === null ? "not set" : fmtUsd(s.price_monthly_micro)} / ${fmtBps(s.profit_share_bps)}`],
+                ["Owner", s.owner_user_id ? h("span", { class: "mono break" }, s.owner_user_id) : "in-house"],
+              ]),
+              ...s.versions.map((v) =>
+                h(
+                  "details",
+                  null,
+                  h("summary", null, `v${v.version} · ${v.published_at ? `listed ${fmtDateTime(v.published_at)}` : "unpublished"} · ${String(v.params.source ?? "?")} · hash ${v.code_hash.slice(0, 12)}…`),
+                  (() => {
+                    const bt = v.backtest;
+                    const days = typeof bt?.history_days === "number" ? bt.history_days : bt?.period?.sim_days;
+                    return h(
+                      "div",
+                      { class: "stack" },
+                      typeof days === "number" && days < cfg.min_listing_history_days ? note(`Only ${Math.floor(days)} days of history — listing needs ≥ ${cfg.min_listing_history_days} days (the server refuses).`, "bad") : null,
+                      backtestPanel(bt, { shortHistoryDays: typeof days === "number" && days < cfg.short_history_warning_days ? Math.floor(days) : null }),
+                      !v.published_at && s.status !== "delisted"
+                        ? h(
+                            "div",
+                            { class: "btns" },
+                            button(`Propose listing v${v.version}`, {
+                              kind: "primary",
+                              onClick: async () => {
+                                const reason = await askReason(`List ${s.name} v${v.version}`);
+                                if (!reason) return;
+                                await api.post(`/admin/strategies/${encodeURIComponent(s.id)}/list`, { version_id: v.id, reason }, { signal: ctx.signal });
+                                toast("Proposed — a second admin approves it under Approvals.", "good");
+                                reload();
+                              },
+                            }),
+                          )
+                        : null,
+                    );
+                  })(),
+                ),
+              ),
+              unpublished.length === 0 && !s.versions.length ? h("p", { class: "small muted" }, "No versions uploaded.") : null,
+              s.in_house
+                ? h(
+                    "div",
+                    { class: "row" },
+                    field("In-house price / month (USD)", price.el),
+                    button("Propose price", {
+                      onClick: async () => {
+                        const p = price.micro() ?? (price.el.value.trim() === "0" ? 0 : null);
+                        if (p === null) return toast("Invalid price.", "warn");
+                        const reason = await askReason(`Set ${s.name} price to ${fmtUsd(p)}`);
+                        if (!reason) return;
+                        await api.post(`/admin/strategies/${encodeURIComponent(s.id)}/price`, { price_monthly_micro: p, reason }, { signal: ctx.signal });
+                        toast("Proposed — a second admin must approve.", "good");
+                        reload();
+                      },
+                    }),
+                  )
+                : null,
+              h(
+                "div",
+                { class: "btns" },
+                s.status === "review" ? button("Reject to draft", { kind: "ghost", onClick: () => act(s, "reject", "Reject") }) : null,
+                s.status === "listed" ? button("Pause", { kind: "ghost", onClick: () => act(s, "pause", "Pause") }) : null,
+                s.status !== "delisted" ? button("Delist", { kind: "danger", onClick: () => act(s, "delist", "Delist", true) }) : null,
+                !s.in_house && s.owner_user_id && s.owner_kyc_status && s.owner_kyc_status !== "approved"
+                  ? button("KYC decision…", { kind: "ghost", onClick: () => kycDecision(ctx, s.owner_user_id as string, reload) })
+                  : null,
+              ),
+            );
+          }),
+        );
+      },
+    );
+  sel.addEventListener("change", () => {
+    status = sel.value;
+    void load();
+  });
+  mount(body, h("div", { class: "filters" }, h("div", { class: "field" }, h("span", { class: "fl" }, "Status"), sel)), box);
+  await load();
 }
 
-// ------------------------------------------------------------------------------------------ in-house prices
-async function pricesTab(body: HTMLElement, ctx: PageContext): Promise<void> {
-  const box = h("div", { class: "stack" });
-  mount(body, box);
-  await loadInto(
-    box,
-    ctx,
-    () => api.get<unknown>("/admin/strategies?in_house=true", { signal: ctx.signal }).then((r) => listOf<ReviewItem>(r, "strategies")),
-    (rows, reload) => {
-      if (!rows.length) {
-        mount(box, emptyState("No in-house strategies"));
-        return;
-      }
-      mount(
-        box,
-        note("Price changes apply from each subscriber's next renewal. Changes are audit-logged and need step-up.", "info"),
-        ...rows.map((s) => {
-          const price = usdInput({ value: String((s.price_monthly_micro ?? 0) / 1_000_000) });
-          const ps = h("input", { type: "text", inputmode: "decimal", value: bpsToPctInput(s.profit_share_bps ?? 0) });
-          const statusSel = h("select", null, ...["draft", "listed", "paused", "delisted"].map((x) => h("option", { value: x }, x)));
-          statusSel.value = s.status;
-          const key = newIdempotencyKey();
-          return panel(
-            h("div", { class: "row between w-full" }, h("h2", null, s.name), badge(s.status, s.status === "listed" ? "good" : "muted")),
-            h("div", { class: "form-grid two-col" }, field("Price / month (USD)", price.el), field("Profit share %", ps), field("Status", statusSel)),
-            h(
-              "div",
-              { class: "btns" },
-              button("Save", {
-                kind: "primary",
-                onClick: async () => {
-                  const p = price.micro() ?? (price.el.value.trim() === "0" ? 0 : null);
-                  const bps = pctToBps(ps.value);
-                  if (p === null) return toast("Invalid price.", "warn");
-                  if (bps === null) return toast("Invalid profit share.", "warn");
-                  if (!(await confirmDialog({ title: `Update ${s.name}?`, message: kv([["Price / month", fmtUsd(p)], ["Profit share", fmtBps(bps)], ["Status", statusSel.value]]), confirmLabel: "Save" }))) return;
-                  await api.patch(`/admin/strategies/${encodeURIComponent(s.id)}`, { price_monthly_micro: p, profit_share_bps: bps, status: statusSel.value }, { signal: ctx.signal, idempotencyKey: key });
-                  toast("Saved.", "good");
-                  reload();
-                },
-              }),
-            ),
-          );
-        }),
-      );
-    },
-  );
+async function kycDecision(ctx: PageContext, userId: string, reload: () => void): Promise<void> {
+  const approve = await confirmDialog({ title: "KYC decision", message: "Record the verification provider's verdict. Approval unlocks listing, paid posts and payouts and needs a second admin; rejection applies now.", confirmLabel: "Approve (propose)", cancelLabel: "Reject…" });
+  const reason = await askReason(approve ? "Approve creator KYC" : "Reject creator KYC");
+  if (!reason) return;
+  const r = await api.post<{ status: string }>(`/admin/users/${encodeURIComponent(userId)}/kyc`, { decision: approve ? "approved" : "rejected", reason }, { signal: ctx.signal });
+  toast(r.status === "pending" ? "Proposed — a second admin must approve." : "Recorded.", "good");
+  reload();
 }
 
 // ------------------------------------------------------------------------------------------ alerts
-interface AdminAlert {
-  id: string;
-  severity: string;
-  kind: string;
-  user_id?: string | null;
-  payload?: Record<string, unknown> | null;
-  message?: string | null;
-  created_at: string;
-  acked_at?: string | null;
-  acked_by?: string | null;
-}
-
 async function alertsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
   let sev = ctx.query.get("severity") ?? "";
+  let unacked = true;
   const sel = h("select", { "aria-label": "Severity" }, h("option", { value: "" }, "All severities"), h("option", { value: "critical" }, "Critical"), h("option", { value: "warn" }, "Warn"), h("option", { value: "info" }, "Info"));
   sel.value = sev;
+  const ack = h("select", { "aria-label": "Acknowledged" }, h("option", { value: "1" }, "Unacknowledged"), h("option", { value: "0" }, "All"));
   const box = h("div", { class: "stack" });
   const load = (): Promise<void> =>
     loadInto(
       box,
       ctx,
-      () => api.get<unknown>(`/admin/alerts${sev ? `?severity=${encodeURIComponent(sev)}` : ""}`, { signal: ctx.signal }).then((r) => listOf<AdminAlert>(r, "alerts")),
+      () => api.get<Page<Alert>>(`/admin/alerts?unacked=${unacked}${sev ? `&severity=${encodeURIComponent(sev)}` : ""}&limit=100`, { signal: ctx.signal }).then((r) => listOf<Alert>(r)),
       (rows, reload) => {
         mount(
           box,
-          table<AdminAlert>({
+          table<Alert>({
             columns: [
               { key: "t", label: "When", value: (a) => h("span", { title: fmtDateTime(a.created_at) }, fmtRelative(a.created_at)), primary: true },
               { key: "s", label: "Severity", value: (a) => badge(a.severity, a.severity === "critical" ? "bad" : a.severity === "warn" ? "warn" : "info") },
               { key: "k", label: "Kind", value: (a) => h("span", { class: "mono" }, a.kind) },
-              { key: "m", label: "Details", value: (a) => h("span", { class: "small break" }, a.message ?? (a.payload ? JSON.stringify(a.payload).slice(0, 300) : "")) },
+              { key: "m", label: "Details", value: (a) => h("span", { class: "small break" }, JSON.stringify(a.payload).slice(0, 300)) },
               {
                 key: "a",
                 label: "",
-                value: (a) =>
-                  a.acked_at
-                    ? h("span", { class: "small muted" }, `acked${a.acked_by ? " by " + a.acked_by : ""}`)
-                    : button("Acknowledge", { kind: "ghost", onClick: async () => { await api.post(`/admin/alerts/${encodeURIComponent(a.id)}/ack`, {}, { signal: ctx.signal }); reload(); } }),
+                value: (a) => (a.acked_at ? h("span", { class: "small muted" }, `acked ${fmtRelative(a.acked_at)}`) : button("Acknowledge", { kind: "ghost", onClick: async () => { await api.post(`/admin/alerts/${encodeURIComponent(a.id)}/ack`, {}, { signal: ctx.signal }); reload(); } })),
               },
             ],
             rows,
@@ -430,18 +556,26 @@ async function alertsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
     sev = sel.value;
     void load();
   });
-  mount(body, h("div", { class: "filters" }, h("div", { class: "field" }, h("span", { class: "fl" }, "Severity"), sel)), box);
+  ack.addEventListener("change", () => {
+    unacked = ack.value === "1";
+    void load();
+  });
+  mount(body, h("div", { class: "filters" }, h("div", { class: "field" }, h("span", { class: "fl" }, "Severity"), sel), h("div", { class: "field" }, h("span", { class: "fl" }, "Show"), ack)), box);
   await load();
 }
 
 // ------------------------------------------------------------------------------------------ reconciliation
-interface ReconCheck {
-  name: string;
-  ledger_micro?: number | null;
-  onchain_micro?: number | null;
-  diff_micro?: number | null;
-  ok: boolean;
-  note?: string | null;
+/** ReconciliationOut.report = app.execution.reconcile.ReconcileReport.as_dict(). */
+interface ReconReport {
+  positions_checked?: number;
+  drifts?: { subscription_id: string; coin: string; expected_micro: number; actual_micro: number }[];
+  builder_db_micro?: number | null;
+  builder_chain_micro?: number | null;
+  builder_mismatch?: boolean;
+  treasury_ledger_micro?: number | null;
+  treasury_chain_micro?: number | null;
+  treasury_mismatch?: boolean;
+  errors?: string[];
 }
 
 async function reconTab(body: HTMLElement, ctx: PageContext): Promise<void> {
@@ -450,46 +584,72 @@ async function reconTab(body: HTMLElement, ctx: PageContext): Promise<void> {
   await loadInto(
     box,
     ctx,
-    () => api.get<Record<string, unknown>>("/admin/reconciliation", { signal: ctx.signal }),
+    () => api.get<{ report: ReconReport | null; generated_at: string | null }>("/admin/reconciliation", { signal: ctx.signal }),
     (res) => {
-      const checks = listOf<ReconCheck>(res, "checks", "items");
-      const bad = checks.filter((c) => !c.ok);
+      const r = res.report;
+      if (!r) {
+        mount(box, emptyState("No reconciliation report yet", "The daily job has not produced a report."));
+        return;
+      }
+      const usd = (v: unknown): string => (typeof v === "number" ? fmtUsd(v) : "—");
+      const diff = (a: unknown, b: unknown): string => (typeof a === "number" && typeof b === "number" ? fmtUsd(b - a, { sign: true }) : "—");
+      const checks = [
+        { name: "Builder fees: ledger vs Hyperliquid rewards", l: r.builder_db_micro, o: r.builder_chain_micro, bad: !!r.builder_mismatch },
+        { name: "Treasury USDC: ledger vs on-chain", l: r.treasury_ledger_micro, o: r.treasury_chain_micro, bad: !!r.treasury_mismatch },
+      ];
+      const drifts = r.drifts ?? [];
+      const bad = checks.filter((c) => c.bad).length + drifts.length + (r.errors?.length ?? 0);
       mount(
         box,
-        h("p", { class: "small muted" }, typeof res.generated_at === "string" ? `Generated ${fmtDateTime(res.generated_at)} · ` : "", "Daily: Σ builder-fee ledger vs Hyperliquid builder rewards; treasury USDC vs ledger; positions vs expected. Mismatch > $1 raises a critical alert."),
-        bad.length ? note(`${bad.length} check${bad.length > 1 ? "s" : ""} failing.`, "bad") : note("All checks passing.", "info"),
-        table<ReconCheck>({
+        h("p", { class: "small muted" }, res.generated_at ? `Generated ${fmtDateTime(res.generated_at)} · ` : "", `${r.positions_checked ?? 0} positions checked. Mismatch > $1 raises a critical alert.`),
+        bad ? note(`${bad} issue${bad > 1 ? "s" : ""} found.`, "bad") : note("All checks passing.", "info"),
+        table({
           columns: [
-            { key: "n", label: "Check", value: (c) => c.name, primary: true },
-            { key: "l", label: "Ledger", value: (c) => (typeof c.ledger_micro === "number" ? fmtUsd(c.ledger_micro) : "—"), align: "right", mono: true },
-            { key: "o", label: "On-chain", value: (c) => (typeof c.onchain_micro === "number" ? fmtUsd(c.onchain_micro) : "—"), align: "right", mono: true },
-            { key: "d", label: "Diff", value: (c) => (typeof c.diff_micro === "number" ? h("span", { class: c.diff_micro === 0 ? "" : "neg" }, fmtUsd(c.diff_micro, { sign: true })) : "—"), align: "right", mono: true },
-            { key: "s", label: "Status", value: (c) => (c.ok ? badge("ok", "good") : badge("mismatch", "bad")) },
-            { key: "x", label: "Note", value: (c) => h("span", { class: "small break" }, c.note ?? ""), hideOnMobile: true },
+            { key: "n", label: "Check", value: (c: (typeof checks)[number]) => c.name, primary: true },
+            { key: "l", label: "Ledger", value: (c: (typeof checks)[number]) => usd(c.l), align: "right", mono: true },
+            { key: "o", label: "On-chain", value: (c: (typeof checks)[number]) => usd(c.o), align: "right", mono: true },
+            { key: "d", label: "Diff", value: (c: (typeof checks)[number]) => diff(c.l, c.o), align: "right", mono: true },
+            { key: "s", label: "Status", value: (c: (typeof checks)[number]) => (c.bad ? badge("mismatch", "bad") : badge("ok", "good")) },
           ],
           rows: checks,
           rowKey: (c) => c.name,
-          empty: "No reconciliation report yet.",
         }),
+        drifts.length
+          ? panel(
+              "Position drifts",
+              table({
+                columns: [
+                  { key: "s", label: "Subscription", value: (d: (typeof drifts)[number]) => h("span", { class: "mono" }, shortAddr(d.subscription_id, 8, 4)), primary: true },
+                  { key: "c", label: "Coin", value: (d: (typeof drifts)[number]) => d.coin },
+                  { key: "e", label: "Expected", value: (d: (typeof drifts)[number]) => usd(d.expected_micro), align: "right", mono: true },
+                  { key: "a", label: "Actual", value: (d: (typeof drifts)[number]) => usd(d.actual_micro), align: "right", mono: true },
+                ],
+                rows: drifts,
+                rowKey: (d) => d.subscription_id + d.coin,
+              }),
+            )
+          : null,
+        r.errors?.length ? panel("Errors", h("ul", { class: "small" }, ...r.errors.map((e) => h("li", { class: "break" }, e)))) : null,
       );
     },
   );
 }
 
 // ------------------------------------------------------------------------------------------ users
+/** AdminUserOut. */
 interface AdminUser {
   id: string;
-  email?: string | null;
-  display_name?: string | null;
+  email: string | null;
+  display_name: string | null;
   role: string;
-  plan?: string;
+  plan: string;
   status: string;
-  kyc_status?: string | null;
-  created_at?: string;
+  country_attested: string | null;
+  created_at: string;
 }
 
 async function usersTab(body: HTMLElement, ctx: PageContext): Promise<void> {
-  const q = h("input", { type: "search", placeholder: "Email, user id or wallet 0x…", "aria-label": "Search users", value: ctx.query.get("q") ?? "" });
+  const q = h("input", { type: "search", placeholder: "Email or name (3+ characters)", "aria-label": "Search users", value: ctx.query.get("q") ?? "" });
   const box = h("div", { class: "stack" });
   const search = (): Promise<void> => {
     const term = q.value.trim();
@@ -500,7 +660,7 @@ async function usersTab(body: HTMLElement, ctx: PageContext): Promise<void> {
     return loadInto(
       box,
       ctx,
-      () => api.get<unknown>(`/admin/users?q=${encodeURIComponent(term)}`, { signal: ctx.signal }).then((r) => listOf<AdminUser>(r, "users")),
+      () => api.get<Page<AdminUser>>(`/admin/users?q=${encodeURIComponent(term)}`, { signal: ctx.signal }).then((r) => listOf<AdminUser>(r)),
       (rows, reload) => {
         mount(
           box,
@@ -508,37 +668,43 @@ async function usersTab(body: HTMLElement, ctx: PageContext): Promise<void> {
             columns: [
               { key: "e", label: "User", value: (u) => h("span", { class: "break" }, u.email ?? u.display_name ?? u.id), primary: true },
               { key: "r", label: "Role", value: (u) => u.role },
-              { key: "p", label: "Plan", value: (u) => u.plan ?? "—", hideOnMobile: true },
-              { key: "k", label: "KYC", value: (u) => u.kyc_status ?? "—", hideOnMobile: true },
+              { key: "p", label: "Plan", value: (u) => u.plan, hideOnMobile: true },
+              { key: "k", label: "Country", value: (u) => u.country_attested ?? "—", hideOnMobile: true },
               { key: "s", label: "Status", value: (u) => badge(u.status, u.status === "active" ? "good" : "bad") },
-              { key: "c", label: "Joined", value: (u) => (u.created_at ? fmtRelative(u.created_at) : "—"), hideOnMobile: true },
+              { key: "c", label: "Joined", value: (u) => fmtRelative(u.created_at), hideOnMobile: true },
               {
                 key: "a",
                 label: "",
                 value: (u) =>
-                  u.id === ctx.me?.id
+                  u.id === meId(ctx)
                     ? h("span", { class: "small muted" }, "you")
-                    : u.status === "suspended"
-                      ? button("Unsuspend", {
-                          kind: "ghost",
-                          onClick: async () => {
-                            const reason = await promptDialog({ title: `Unsuspend ${u.email ?? u.id}`, label: "Reason (audit log)" });
-                            if (!reason) return;
-                            await api.post(`/admin/users/${encodeURIComponent(u.id)}/unsuspend`, { reason }, { signal: ctx.signal });
-                            reload();
-                          },
-                        })
-                      : button("Suspend", {
-                          kind: "danger",
-                          onClick: async () => {
-                            const reason = await promptDialog({ title: `Suspend ${u.email ?? u.id}`, label: "Reason (audit log)" });
-                            if (!reason) return;
-                            if (!(await confirmDialog({ title: "Suspend user?", message: "The user is blocked from account actions. This is audit-logged and reversible by an admin.", confirmLabel: "Suspend", danger: true, requireText: "SUSPEND" }))) return;
-                            await api.post(`/admin/users/${encodeURIComponent(u.id)}/suspend`, { reason }, { signal: ctx.signal });
-                            toast("Suspended.", "good");
-                            reload();
-                          },
-                        }),
+                    : h(
+                        "div",
+                        { class: "btns" },
+                        u.status === "suspended"
+                          ? button("Unsuspend", {
+                              kind: "ghost",
+                              onClick: async () => {
+                                const reason = await askReason(`Unsuspend ${u.email ?? u.id}`);
+                                if (!reason) return;
+                                await api.post(`/admin/users/${encodeURIComponent(u.id)}/unsuspend`, { reason }, { signal: ctx.signal });
+                                toast("Proposed — a second admin must approve.", "good");
+                                reload();
+                              },
+                            })
+                          : button("Suspend", {
+                              kind: "danger",
+                              onClick: async () => {
+                                const reason = await askReason(`Suspend ${u.email ?? u.id}`);
+                                if (!reason) return;
+                                if (!(await confirmDialog({ title: "Suspend user?", message: "The user is blocked from account actions. This is audit-logged; lifting it needs two admins.", confirmLabel: "Suspend", danger: true, requireText: "SUSPEND" }))) return;
+                                await api.post(`/admin/users/${encodeURIComponent(u.id)}/suspend`, { reason }, { signal: ctx.signal });
+                                toast("Suspended.", "good");
+                                reload();
+                              },
+                            }),
+                        u.role === "creator" ? button("KYC…", { kind: "ghost", onClick: () => kycDecision(ctx, u.id, reload) }) : null,
+                      ),
               },
             ],
             rows,

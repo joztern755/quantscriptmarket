@@ -252,7 +252,7 @@ export function buildOwnershipMessage(p: { address: string; nonce: string; issue
 
 /** Wallet ownership proof: server nonce → personal_sign(SIWE text) → POST /v1/wallets/verify. */
 export async function proveOwnership(wallet: Wallet): Promise<{ address: string }> {
-  const { nonce } = await api.post<{ nonce: string }>("/wallets/nonce", { address: wallet.address });
+  const { nonce } = await api.post<{ nonce: string; expires_at: string }>("/wallets/nonce");
   const issuedAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
   const expirationTime = new Date(Date.now() + 10 * 60_000).toISOString().replace(/\.\d{3}Z$/, "Z");
   const message = buildOwnershipMessage({ address: wallet.address, nonce, issuedAt, expirationTime, chainId: await wallet.chainId() });

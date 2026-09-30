@@ -28,8 +28,10 @@ from app.api.deps import (
     user_limit,
 )
 from app.errors import Conflict, Forbidden, NotFound, ValidationFailed
+from app.logging import get_logger
 
 router = APIRouter(prefix="/creator", tags=["creator"])
+log = get_logger("app.api.creator")
 
 UNPROVEN_WARNING = "Backtest of a newly uploaded script can be fitted to history; not proven live yet"
 EDITABLE_STATUSES = ("draft", "review")
@@ -59,6 +61,24 @@ def version_out(r: dict, *, warning: Optional[str] = UNPROVEN_WARNING) -> S.Crea
                                published_at=r.get("published_at"), live_since=r.get("live_since"),
                                params=r.get("params") or {}, backtest=r.get("backtest"), created_at=r["created_at"],
                                warning=warning)
+
+
+def history_days_for(svc: Services, markets: list[str], timeframe: str, report: Optional[dict]) -> Optional[int]:
+    """SPEC §12 listing history: the shortest market's backtestable history in whole days = max of what our own
+    candle store holds (app.jobs_data.candles.listing_history) and the span the backtest simulated. None = unknown."""
+    days: list[int] = []
+    period = (report or {}).get("period") if isinstance(report, dict) else None
+    sim = period.get("sim_days") if isinstance(period, dict) else None
+    if isinstance(sim, (int, float)) and not isinstance(sim, bool) and math.isfinite(sim):
+        days.append(int(math.floor(sim)))
+    try:
+        from app.jobs_data.candles import listing_history
+        stored = listing_history(svc.db, list(markets), timeframe, risk=svc.settings.risk).get("days")
+        if isinstance(stored, int) and stored > 0:
+            days.append(stored)
+    except Exception as e:  # noqa: BLE001 - candle store unavailable (tests/fakes, not migrated): backtest span only
+        log.warning("listing history unavailable", extra={"fields": {"error": type(e).__name__}})
+    return max(days) if days else None
 
 
 def _check_terms(svc: Services, profit_share_bps: Optional[int], price_micro: Optional[int]) -> None:
@@ -152,6 +172,10 @@ def upload_version(strategy_id: UUID, body: S.VersionUploadIn, ctx: AuthCtx = De
     if unknown:
         raise ValidationFailed("unknown Hyperliquid markets", markets=unknown)
     report = _finite(svc.sandbox.backtest(code, meta))
+    if isinstance(report, dict):
+        hd = history_days_for(svc, markets, meta["timeframe"], report)
+        if hd is not None:
+            report["history_days"] = hd      # public "Short history (N days)" flag + admin ≥180-day listing check
     raw = code.encode("utf-8")
     code_hash = hashlib.sha256(raw).hexdigest()
     ciphertext, key_version = svc.code_vault.seal(raw, f"strategy_code:{sid}:{code_hash}".encode())

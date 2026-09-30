@@ -142,6 +142,7 @@ ON CONFLICT (code) DO NOTHING;
 GRANT SELECT, INSERT, UPDATE ON job_cursors TO app_executor;
 GRANT SELECT, INSERT ON candles TO app_executor;
 GRANT SELECT ON candles TO app_api;                                  -- backtests + listing history check
+GRANT SELECT ON job_cursors TO app_api;                              -- backtest: is a candle series backfilled?
 GRANT SELECT, INSERT ON events_outbox TO app_executor, app_api;
 GRANT UPDATE (delivered_at, attempts, last_error) ON events_outbox TO app_executor, app_api;
 GRANT UPDATE (valid_until, valid_until_checked_at) ON agent_keys TO app_executor;

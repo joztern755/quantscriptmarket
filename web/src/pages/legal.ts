@@ -7,25 +7,29 @@ import { ensurePageCss, isAbortError } from "./_shared/util.js";
 
 export const title = "Legal";
 
+/** Slug = legal/<file>.md name (gate.ts LEGAL_SLUGS; the backend hashes the same files for consent evidence). */
 const TITLES: Record<string, string> = {
   terms: "Terms of Service",
   "risk-disclosure": "Risk Disclosure",
   privacy: "Privacy Notice",
-  waiver: "Liability Waiver",
-  "restricted-jurisdictions": "Restricted Jurisdictions",
+  "liability-waiver": "Liability Waiver",
+  jurisdiction: "Eligibility & Restricted Jurisdictions",
+  "subscription-ack": "Subscription Acknowledgement",
+  "refund-policy": "Refund Policy",
   "creator-agreement": "Creator Agreement",
   "acceptable-use": "Acceptable Use Policy",
 };
 
-/** File name on the static host for a slug (the waiver page is published as liability-waiver.md). */
+/** Old links (build.mjs aliases) → canonical file. */
 const FILES: Record<string, string[]> = {
-  waiver: ["waiver", "liability-waiver"],
+  waiver: ["liability-waiver"],
+  "restricted-jurisdictions": ["jurisdiction"],
 };
 
 export async function render(root: HTMLElement, ctx: PageContext): Promise<void> {
   ensurePageCss();
   const doc = (ctx.params.doc ?? "").toLowerCase();
-  const allowed = new Set<string>([...Object.values(LEGAL_SLUGS), ...Object.keys(TITLES)]);
+  const allowed = new Set<string>([...Object.values(LEGAL_SLUGS), ...Object.keys(TITLES), ...Object.keys(FILES)]);
   const nav = h(
     "nav",
     { class: "row small", "aria-label": "Legal documents" },
@@ -35,7 +39,7 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
     mount(root, emptyState("Document not found", "Choose one of the documents below.", nav));
     return;
   }
-  const docTitle = TITLES[doc] ?? doc;
+  const docTitle = TITLES[doc] ?? TITLES[FILES[doc]?.[0] ?? ""] ?? doc;
   ctx.setTitle(docTitle);
   const body = h("article", { class: "prose" }, skeleton(8));
   mount(

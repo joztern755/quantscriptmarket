@@ -58,6 +58,7 @@ class FakeWorld:
     login_countries: set[tuple[str, str]] = field(default_factory=set)
     kyc: dict[str, dict] = field(default_factory=dict)
     jobs_run: list[tuple[str, dict]] = field(default_factory=list)
+    alert_contacts_missing: set[str] = field(default_factory=set)   # user ids WITHOUT Telegram+email (0007)
 
     # ------------------------------------------------------------------ seeding helpers
     def add_user(self, uid: str = "fb-user", *, role: str = "user", plan: str = "free", email: str = "u@example.com",
@@ -462,6 +463,10 @@ class FakeStore:
         return 1
 
     # alerts / audit
+    def alert_contacts_ready(self, conn, user_id):
+        """app.alerts.user_sinks.require_alert_contacts uses this in tests (default: contacts set up)."""
+        return str(user_id) not in self.w.alert_contacts_missing
+
     def insert_alert(self, conn, *, user_id, severity, kind, payload):
         self.w.alerts.append({"user_id": user_id, "severity": severity, "kind": kind, "payload": payload})
 

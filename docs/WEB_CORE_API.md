@@ -177,20 +177,25 @@ publicConfig(force?: boolean): Promise<PublicConfig>     // GET /v1/public/confi
 - Returns parsed JSON (or `undefined` for 204).
 
 ```ts
+// = backend PublicConfigOut (docs/API_CONTRACT.md is the full contract)
 interface PublicConfig {
   builder_address: string;           // lower-case 0x…
-  treasury_address: string;          // lower-case 0x… (USDC fee-balance deposits)
+  treasury_address: string;          // lower-case 0x… (USDC fee-balance deposits; ONLY wallet allowed to sign admin payouts)
   agent_name: string;                // "aijalon"
   hl_chain: "Mainnet" | "Testnet";
   stripe_publishable_key: string | null;
-  stripe_fee_estimate: { pct_bps: number; fixed_micro: number } | null;   // Stripe fees are PASSED TO THE USER (owner 30 Sep 2026); estimate only
+  stripe_fee_estimate_bps: number | null;          // = config.Settings.stripe_fee_estimate_bps; null = unknown / absorbed
+  stripe_fee_estimate_fixed_micro: number | null;  // = config.Settings.stripe_fee_estimate_fixed_micro
   restricted_jurisdictions: string[];  // ISO alpha-2
-  legal_versions: { terms: string; risk: string; privacy: string; waiver: string; jurisdiction: string; creator_agreement?: string; subscription_ack?: string };
-  economics: { builder_fee_tenths_bp: number; builder_split_creator_bps: number; builder_split_platform_bps: number; builder_split_referral_pool_bps: number;
-               profit_share_creator_cap_bps: number; platform_profit_share_bps: number; platform_profit_share_mode: "on_top" | "carved_out";
-               subscription_platform_bps: number; post_platform_fee_micro: number; post_min_price_micro: number; min_topup_micro: number; past_due_grace_hours: number };
+  legal_versions: { terms: string; risk: string; privacy: string; waiver: string; jurisdiction: string; creator_agreement?: string; subscription_ack?: string }; // consent doc keys
+  economics: { builder_fee_tenths_bp; builder_split_creator_bps; builder_split_platform_bps; builder_split_referral_pool_bps;
+               profit_share_creator_cap_bps; platform_profit_share_bps; platform_profit_share_mode: "on_top" | "carved_out";
+               subscription_platform_bps; post_platform_fee_micro; post_min_price_micro; min_topup_micro; past_due_grace_hours; stripe_fee_absorbed: boolean };
   plans: { key: "free"|"pro"|"max"; price_monthly_micro: number; max_active_strategies: number | null; features: string[] }[];
-  features: { creator_uploads: boolean };
+  referral_tiers: { name; min_active_users; min_notional_30d_micro; share_of_pool_bps }[];
+  features: { creator_uploads: boolean; payouts: boolean };
+  platform_max_leverage: number; max_user_leverage_x100: number | null; min_allocation_micro: number;
+  min_listing_history_days: number /* 180 */; short_history_warning_days: number /* 365 */; launch_phase: string;
   _fallback?: true;                  // set when the API was unreachable and static defaults are shown
 }
 ```
@@ -232,15 +237,20 @@ LEGAL_SLUGS: Record<ConsentDoc, string>      // see §1 (slug = legal file name)
 SITE_DOCS = ["jurisdiction","terms","risk","privacy","waiver"]
 gateForm(cfg, onAccept): HTMLElement ; renderSiteGate(root, cfg, onAccept) ; showGateModal(): Promise<boolean>   // used by core
 siteGateAccepted(cfg?: PublicConfig): boolean
-syncConsents(): Promise<void>                // POSTs locally-recorded site-entry consents to /v1/consents after sign-in (core calls it)
+syncConsents(): Promise<void>                // POSTs locally-recorded site-entry consents to /v1/consents after sign-in (core calls it); 409 → local acceptance dropped, gate shown again
+legalDocHash(doc: ConsentDoc, expectVersion?: string): Promise<string>
+  // sha256 hex of the EXACT bytes of dist/legal/<LEGAL_SLUGS[doc]>.md (fetched as ArrayBuffer, crypto.subtle.digest).
+  // Every consent carries it as doc_text_sha256; the backend compares it with config.legal_doc_hashes[doc] (409 on mismatch).
+  // With expectVersion, the file's "Version:" line must equal it (stale cached copy → ApiError legal_doc_stale).
 subscribeGate(opts: {
   strategy: { id: string; slug: string; name: string; price_monthly_micro: number; profit_share_bps: number; markets: string[]; risk_ack_text?: string | null };
   allocationMicro?: number;                  // optional, shown in the fee examples
 }): Promise<boolean>
   // Modal: strategy-specific risk acknowledgement + fee summary (builder fee 0.1% of notional, monthly
   // price, profit share = creator% + platform 1.5% (on_top) or carved out) + Terms/Risk again. Each box
-  // required. On accept POSTs consents {doc: "subscription_ack"|"terms"|"risk"|"waiver", context: "subscribe",
-  // strategy_id} to /v1/consents and resolves true; resolves false if dismissed.
+  // required. On accept POSTs consents {doc: "subscription_ack"|"terms"|"risk"|"waiver", doc_version,
+  // doc_text_sha256, context: "subscribe", strategy_id} to /v1/consents and resolves true (the backend accepts a
+  // subscription_ack recorded ≤ 30 min before POST /subscriptions); resolves false if dismissed.
 feeSummary(cfg: PublicConfig, s: {price_monthly_micro, profit_share_bps}): { label: string; value: string; note?: string }[]
 ```
 
@@ -282,7 +292,7 @@ approveBuilderFee(wallet, p?: { serverTypedData?: unknown }): Promise<HlResult> 
 usdSend(wallet, p: { destination: string; amountMicro: number | bigint; serverTypedData?: unknown; expectDestination: string }): Promise<HlResult>
 hlInfo<T>(body: Record<string, unknown>): Promise<T>                        // POST https://api.hyperliquid.xyz/info (read-only)
 maxFeeRateFromTenthsBp(100) === "0.1%" ; tenthsBpFromMaxFeeRate("0.1%") === 100 ; HL_TYPES ; HlValidationError
-interface HlResult { ok: boolean; status: "ok"|"err"; response: unknown; error?: string }
+interface HlResult { ok: boolean; status: "ok"|"err"; response: unknown; error?: string; nonce?: number /* signed nonce; usdSend: its time (ms) → /deposits/usdc/confirm {time_ms} */ }
 ```
 Always: server typed data (if given) is validated, then the final payload is rebuilt locally with
 the wallet's **current** chain id as `signatureChainId` (hex) and a fresh `Date.now()` nonce — never
@@ -310,7 +320,7 @@ fmtDate(iso | ms): string  // "30 Sep 2026" (UTC) ; fmtDateTime(): "30 Sep 2026,
 - `core/theme.ts`: `getTheme(): "light"|"dark"|"system"`, `setTheme(t)`, `effectiveTheme(): "light"|"dark"`, `onThemeChange(cb)`. (Toggle lives in the shell.)
 - `core/config.ts`: `appConfig(): AppConfig` (static `app-config.json`: apiOrigin, firebase web config, firebaseSdkVersion, hlApiUrl, siteOrigin).
 - `core/stripe.ts`: `loadStripe(): Promise<StripeLike>` (loads https://js.stripe.com/v3/ once with `publicConfig().stripe_publishable_key`);
-  `estimateStripeCredit(cfg, amountMicro) → { feeMicro, creditMicro, estimated }` (fee rounded UP; null when config has no estimate);
+  `estimateStripeCredit(cfg, amountMicro) → { feeMicro, creditMicro, estimated }` (fee = ceil(amount × stripe_fee_estimate_bps / 10000) + stripe_fee_estimate_fixed_micro, rounded UP; null when the config has no estimate);
   `stripeFeeNotice(cfg, amountMicro?) → string` — REQUIRED wording on every Stripe deposit UI: credit = amount paid − actual processor fee (estimate shown as an estimate).
 - `core/subscriptions.ts` (SPEC §12 cancel flow): `cancelButtons(sub: {id, strategy_name, markets}, onDone?(mode)) → HTMLElement`
   renders the two required buttons "Close positions and cancel" / "Leave positions open and cancel"; each runs
@@ -326,8 +336,11 @@ fmtDate(iso | ms): string  // "30 Sep 2026" (UTC) ; fmtDateTime(): "30 Sep 2026,
 - Error JSON: `{"error": {"code": "step_up_required", "message": "…", "details": {…}}, "request_id": "…"}`
   (core also tolerates FastAPI `{"detail": "…"}` / `{"detail": {"code": …}}`).
 - CORS must allow headers `Authorization, Content-Type, Idempotency-Key` from `https://aijalon.trade`.
-- `POST /v1/consents` body `{"consents": [{"doc": "terms", "doc_version": "2026-09-30", "context": "site_entry", "strategy_id": null, "accepted_at": "<ISO, client clock>"}]}`.
-- `POST /v1/wallets/nonce` → `{"nonce": "<≥16 chars alnum>"}` (NOT in SPEC §8 yet); `POST /v1/wallets/verify` `{address, message, signature}`; server must rebuild/parse the SIWE message and check domain `aijalon.trade`, nonce, issued-at freshness.
+- `POST /v1/consents` body `{"consents": [{"doc": "terms", "doc_version": "2026-09-30", "context": "site_entry", "strategy_id": null, "accepted_at": "<ISO, client clock>", "doc_text_sha256": "<sha256 hex of legal/terms.md bytes>"}]}`.
+  `doc` = consent doc key (DB enum): terms | risk | privacy | jurisdiction | waiver | creator_agreement | subscription_ack; the backend maps them to legal/*.md
+  (deps.LEGAL_DOC_FILES — same mapping as LEGAL_SLUGS and build.mjs DOC_FILES) and REQUIRES `doc_text_sha256` equal to the served file's hash.
+- `POST /v1/wallets/nonce` (no body) → `{"nonce": "<24 alnum>", "expires_at": "…"}`; `POST /v1/wallets/verify` `{address, message, signature}` (step-up); server parses the SIWE message and checks domain `aijalon.trade`, URI, nonce, issued-at freshness.
+- Every endpoint, request body and response shape the pages use is listed in **docs/API_CONTRACT.md** (backend = source of truth).
 - Referral: `?ref=CODE` captured first-touch for 30 days, sent once after sign-in via `PATCH /v1/me {"referral_code_used": "CODE"}`.
 - `GET /v1/me` returns `Me` (above). `401 mfa_required` when the token has no second factor.
 

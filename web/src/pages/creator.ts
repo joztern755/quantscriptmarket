@@ -4,13 +4,14 @@
 import type { PageContext } from "../core/router.js";
 import { h, mount, skeleton, errorState, emptyState, note, stat, kv, table, tabs, button, toast, confirmDialog, field, checkbox, badge, type Column, type Child } from "../core/ui.js";
 import { api, publicConfig, newIdempotencyKey, type PublicConfig } from "../core/api.js";
-import { LEGAL_SLUGS } from "../core/gate.js";
+import { LEGAL_SLUGS, legalDocHash } from "../core/gate.js";
 import { fmtUsd, fmtBps, fmtDate, fmtDateTime, fmtTenthsBp } from "../core/format.js";
-import type { Backtest, NoCodeSpec } from "./_shared/types.js";
+import type { CreatorStrategy, CreatorVersion, Earnings, NoCodeSpec } from "./_shared/types.js";
+import { payoutForm } from "./_shared/payout.js";
 import { profitShare, subscriptionSplit, builderSplit, postSplit } from "./_shared/fees.js";
 import { backtestPanel } from "./_shared/backtest.js";
 import { noCodeBuilder } from "./_shared/nocode-ui.js";
-import { precheckPython, PYTHON_TEMPLATE } from "./_shared/nocode.js";
+import { precheckPython, PYTHON_TEMPLATE, defaultSpec } from "./_shared/nocode.js";
 import { renderMarkdown } from "./_shared/markdown.js";
 import { ensurePageCss, listOf, isAbortError, errCode, errMessage, pageHead, panel, usdInput, pctToBps, bpsToPctInput, isRec, kvWide, BACKTEST_WARNING } from "./_shared/util.js";
 
@@ -26,30 +27,6 @@ const TABS = [
 
 const COIN_RE = /^(?:[a-z0-9]{1,12}:)?[A-Za-z0-9]{1,20}$/;
 const LAUNCH_MARKETS = ["BTC", "SOL", "HYPE", "xyz:GOLD", "xyz:SILVER", "xyz:CL", "xyz:BRENTOIL"];
-
-interface CreatorStrategy {
-  id: string;
-  slug: string;
-  name: string;
-  status: string;
-  markets?: string[];
-  price_monthly_micro?: number;
-  profit_share_bps?: number;
-  current_version?: { version: number; live_since?: string | null } | null;
-  versions?: { id?: string; version: number; status?: string; published_at?: string | null }[];
-  subscribers?: number | null;
-  in_house?: boolean;
-}
-
-interface VersionResult {
-  id?: string;
-  version_id?: string;
-  version?: number;
-  status?: string; // validating | backtesting | ready | failed | review | published
-  validation?: { ok: boolean; errors?: string[] } | null;
-  errors?: string[];
-  backtest?: Backtest | null;
-}
 
 export async function render(root: HTMLElement, ctx: PageContext): Promise<void> {
   ensurePageCss();
@@ -72,20 +49,21 @@ export async function render(root: HTMLElement, ctx: PageContext): Promise<void>
   if (tab === "new") return newStrategyTab(body, ctx, cfg);
   if (tab === "upload") return uploadTab(body, ctx, cfg);
   if (tab === "posts") return postsTab(body, ctx, cfg);
-  if (tab === "earnings") return earningsTab(body, ctx);
+  if (tab === "earnings") return earningsTab(body, ctx, cfg);
   return overviewTab(body, ctx);
 }
 
 // ------------------------------------------------------------------------------------------ KYC
+/** MeOut.kyc_status: pending | approved | rejected | null (not started). */
 function kycStatus(ctx: PageContext): string {
-  const me = ctx.me as Record<string, unknown> | null;
-  const v = me?.kyc_status ?? (isRec(me?.kyc) ? (me?.kyc as Record<string, unknown>).status : undefined);
+  const v = (ctx.me as Record<string, unknown> | null)?.kyc_status;
   return typeof v === "string" ? v : "none";
 }
 
 function kycBanner(ctx: PageContext, cfg: PublicConfig): HTMLElement {
   const status = kycStatus(ctx);
-  if (status === "verified" || status === "approved") return h("p", { class: "small" }, badge("Identity verified", "good"), " You can list strategies and receive payouts.");
+  if (status === "approved") return h("p", { class: "small" }, badge("Identity verified", "good"), " You can list strategies and receive payouts.");
+  const manualBox = h("div");
   const agree = checkbox(h("span", null, "I have read and accept the ", h("a", { href: `#/legal/${LEGAL_SLUGS.creator_agreement ?? "creator-agreement"}`, target: "_blank", rel: "noopener" }, "Creator Agreement"), " and ", h("a", { href: "#/legal/acceptable-use", target: "_blank", rel: "noopener" }, "Acceptable Use Policy"), "."), { required: true });
   return h(
     "div",
@@ -105,16 +83,23 @@ function kycBanner(ctx: PageContext, cfg: PublicConfig): HTMLElement {
               kind: "primary",
               onClick: async () => {
                 if (!agree.input.checked) return toast("Please accept the Creator Agreement first.", "warn");
+                const version = cfg.legal_versions.creator_agreement;
+                if (!version) throw new Error("Couldn't load the current Creator Agreement. Try again in a moment.");
                 await api.post("/consents", {
-                  consents: [{ doc: "creator_agreement", doc_version: cfg.legal_versions.creator_agreement ?? "draft", context: "creator", strategy_id: null, accepted_at: new Date().toISOString() }],
+                  consents: [{ doc: "creator_agreement", doc_version: version, context: "creator", strategy_id: null, accepted_at: new Date().toISOString(), doc_text_sha256: await legalDocHash("creator_agreement", version) }],
                 });
-                const res = await api.post<Record<string, unknown>>("/creator/kyc/session", {}, { signal: ctx.signal });
+                const res = await api.post<{ url: string; provider: string; status: string; manual: boolean }>("/creator/kyc/session", {}, { signal: ctx.signal });
+                if (res.manual) {
+                  mount(manualBox, note("Your identity check will be reviewed by our team. We'll contact you by email; no documents are uploaded here.", "info"));
+                  return;
+                }
                 const url = typeof res.url === "string" ? res.url : "";
                 if (!/^https:\/\/[^\s]+$/i.test(url)) throw new Error("Verification could not be started. Please try again later.");
                 window.location.assign(url);
               },
             }),
           ),
+          manualBox,
         ),
   );
 }
@@ -123,7 +108,7 @@ function kycBanner(ctx: PageContext, cfg: PublicConfig): HTMLElement {
 async function loadMyStrategies(ctx: PageContext): Promise<CreatorStrategy[]> {
   try {
     const res = await api.get<unknown>("/creator/strategies", { signal: ctx.signal });
-    return listOf<CreatorStrategy>(res, "strategies");
+    return listOf<CreatorStrategy>(res);
   } catch (err) {
     if (errCode(err) === "not_found") return [];
     throw err;
@@ -137,23 +122,24 @@ async function overviewTab(body: HTMLElement, ctx: PageContext): Promise<void> {
   const load = async (): Promise<void> => {
     mount(box, skeleton(6));
     try {
-      const [list, e] = await Promise.all([loadMyStrategies(ctx), api.get<Record<string, unknown>>("/creator/earnings", { signal: ctx.signal }).catch(() => null)]);
+      const [list, e] = await Promise.all([loadMyStrategies(ctx), api.get<Earnings>("/creator/earnings", { signal: ctx.signal }).catch(() => null)]);
+      const subsBy = new Map((e?.by_strategy ?? []).map((x) => [x.strategy_id, x.active_subscribers]));
       if (!ctx.isCurrent()) return;
       mount(
         earn,
         stat("Strategies", String(list.length)),
         stat("Listed", String(list.filter((s) => s.status === "listed").length)),
-        stat("Earned (all time)", e && typeof e.total_micro === "number" ? fmtUsd(e.total_micro) : "—"),
-        stat("Payable", e && typeof e.payable_micro === "number" ? fmtUsd(e.payable_micro) : "—"),
+        stat("Earned (all time)", e ? fmtUsd(e.total_earned_micro) : "—"),
+        stat("Payable", e ? fmtUsd(e.payable_micro) : "—"),
       );
       const cols: Column<CreatorStrategy>[] = [
         { key: "name", label: "Strategy", value: (s) => (s.status === "listed" ? h("a", { href: `#/s/${encodeURIComponent(s.slug)}` }, s.name) : s.name), primary: true },
         { key: "status", label: "Status", value: (s) => badge(s.status, s.status === "listed" ? "good" : s.status === "review" ? "info" : s.status === "delisted" ? "bad" : "muted") },
-        { key: "version", label: "Live version", value: (s) => (s.current_version ? `v${s.current_version.version}${s.current_version.live_since ? " · since " + fmtDate(s.current_version.live_since) : ""}` : "—") },
-        { key: "markets", label: "Markets", value: (s) => (s.markets ?? []).join(", "), hideOnMobile: true },
+        { key: "tf", label: "Timeframe", value: (s) => s.timeframe },
+        { key: "markets", label: "Markets", value: (s) => s.markets.join(", "), hideOnMobile: true },
         { key: "price", label: "Price / mo", value: (s) => (typeof s.price_monthly_micro === "number" ? fmtUsd(s.price_monthly_micro) : "—"), align: "right", mono: true },
         { key: "ps", label: "Profit share", value: (s) => (typeof s.profit_share_bps === "number" ? fmtBps(s.profit_share_bps) : "—"), align: "right", mono: true },
-        { key: "subs", label: "Subscribers", value: (s) => (typeof s.subscribers === "number" ? String(s.subscribers) : "—"), align: "right", mono: true },
+        { key: "subs", label: "Subscribers", value: (s) => String(subsBy.get(s.id) ?? 0), align: "right", mono: true },
         { key: "act", label: "", value: (s) => h("a", { class: "btn sm", href: `#/creator/upload?strategy=${encodeURIComponent(s.id)}` }, "Upload version") },
       ];
       mount(box, list.length ? table({ columns: cols, rows: list, rowKey: (s) => s.id }) : emptyState("No strategies yet", "Create your first strategy, then upload code or use the no-code builder.", h("a", { class: "btn primary", href: "#/creator/new" }, "New strategy")));
@@ -169,7 +155,13 @@ async function overviewTab(body: HTMLElement, ctx: PageContext): Promise<void> {
 async function newStrategyTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfig): Promise<void> {
   const e = cfg.economics;
   const cap = e.profit_share_creator_cap_bps;
-  const name = h("input", { type: "text", maxlength: 60, placeholder: "e.g. Silver trend 1D", id: "ns-name" });
+  const name = h("input", { type: "text", maxlength: 64, placeholder: "e.g. Silver trend 1D", id: "ns-name" });
+  // slug (URL id, unique, immutable): backend SLUG_RE ^[a-z0-9](?:[a-z0-9-]{1,46}[a-z0-9])$
+  const slug = h("input", { type: "text", maxlength: 48, placeholder: "silver-trend-1d", id: "ns-slug", spellcheck: "false", autocomplete: "off" });
+  let slugTouched = false;
+  const slugify = (x: string): string => x.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48).replace(/-+$/g, "");
+  name.addEventListener("input", () => { if (!slugTouched) slug.value = slugify(name.value); });
+  slug.addEventListener("input", () => { slugTouched = true; });
   const desc = h("textarea", { rows: 4, maxlength: 2000, id: "ns-desc", placeholder: "What the strategy does, when it trades, when it holds. No performance promises." });
   const markets = h("input", { type: "text", id: "ns-markets", placeholder: "BTC, xyz:SILVER", spellcheck: "false" });
   const chips = h(
@@ -230,6 +222,7 @@ async function newStrategyTab(body: HTMLElement, ctx: PageContext, cfg: PublicCo
         "div",
         { class: "form-grid two-col" },
         field("Name", name),
+        field("URL name (slug)", slug, "Lower-case letters, digits and dashes; cannot be changed later."),
         field("Timeframe", tf),
         h("div", { class: "stack tight" }, field("Markets (1–5)", markets, "Hyperliquid perp coins. Builder-deployed markets use dex:COIN."), chips),
         field("Description", desc),
@@ -249,12 +242,14 @@ async function newStrategyTab(body: HTMLElement, ctx: PageContext, cfg: PublicCo
             const p = price.micro() ?? (price.el.value.trim() === "" ? 0 : null);
             const bps = pctToBps(ps.value);
             if (n.length < 3) return toast("Name must be at least 3 characters.", "warn");
+            const sl = slug.value.trim();
+            if (!/^[a-z0-9](?:[a-z0-9-]{1,46}[a-z0-9])$/.test(sl)) return toast("Slug: 3–48 lower-case letters, digits or dashes (not at the ends).", "warn");
             if (!mk.length || mk.length > 5 || !mk.every((m) => COIN_RE.test(m))) return toast("Enter 1–5 valid markets.", "warn");
             if (p === null) return toast("Enter a valid monthly price.", "warn");
             if (bps === null || bps > cap) return toast(`Profit share must be 0–${fmtBps(cap)}.`, "warn");
-            const res = await api.post<Record<string, unknown>>(
+            const res = await api.post<CreatorStrategy>(
               "/creator/strategies",
-              { name: n, description: desc.value.trim(), markets: mk, timeframe: tf.value, price_monthly_micro: p, profit_share_bps: bps },
+              { slug: sl, name: n, description: desc.value.trim() || null, markets: mk, timeframe: tf.value, price_monthly_micro: p, profit_share_bps: bps },
               { signal: ctx.signal, idempotencyKey: key },
             );
             toast("Strategy created. Now upload a version.", "good");
@@ -283,7 +278,7 @@ async function uploadTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfig)
     return;
   }
   if (!ctx.isCurrent()) return;
-  const editable = list.filter((s) => !s.in_house && s.status !== "delisted");
+  const editable = list.filter((s) => s.status !== "delisted");
   if (!editable.length) {
     mount(body, emptyState("Create a strategy first", undefined, h("a", { class: "btn primary", href: "#/creator/new" }, "New strategy")));
     return;
@@ -331,7 +326,14 @@ async function uploadTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfig)
   });
   checkPy();
   let spec: NoCodeSpec | undefined;
-  const builder = noCodeBuilder(undefined, (sp) => { spec = sp; });
+  // The spec's MARKETS/TIMEFRAME must match the strategy (server: 422 otherwise) → start from the strategy's.
+  const specFor = (s: CreatorStrategy): NoCodeSpec => ({
+    ...defaultSpec(s.markets[0] ?? "BTC"),
+    markets: [...s.markets],
+    timeframe: (["1h", "4h", "1d"].includes(s.timeframe) ? s.timeframe : "1d") as NoCodeSpec["timeframe"],
+    max_leverage: Math.min(5, Math.max(1, s.markets.length)),
+  });
+  let builder = noCodeBuilder(specFor(selected()), (sp) => { spec = sp; });
 
   const drawMode = (): void => {
     mount(
@@ -357,76 +359,65 @@ async function uploadTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfig)
         : builder.el,
     );
   };
-  const drawWarn = (): void => {
+  // GET /creator/strategies/{id}/versions → the live (published) version, if any: uploading + listing a new one resets it.
+  let published: CreatorVersion | null = null;
+  const drawWarn = async (): Promise<void> => {
     const s = selected();
-    const hasLive = !!s.current_version || (s.versions ?? []).some((v) => v.published_at);
-    mount(resetWarn, hasLive ? note(h("span", null, h("b", null, "Publishing a new version resets your live track record. "), `v${s.current_version?.version ?? "?"}'s live ROI and $ made will no longer be shown as current; the new version starts from zero and is marked "Not live-proven" for 90 days.`), "bad") : null);
+    mount(resetWarn);
+    try {
+      const versions = listOf<CreatorVersion>(await api.get<unknown>(`/creator/strategies/${encodeURIComponent(s.id)}/versions`, { signal: ctx.signal }));
+      if (!ctx.isCurrent() || selected().id !== s.id) return;
+      published = versions.filter((v) => v.published_at).sort((a, b) => b.version - a.version)[0] ?? null;
+      mount(
+        resetWarn,
+        published
+          ? note(h("span", null, h("b", null, "Listing a new version resets your live track record. "), `v${published.version}'s live ROI and $ made will no longer be shown as current; the new version starts from zero and is marked "Not live-proven" for 90 days.`), "bad")
+          : null,
+        versions.length ? h("p", { class: "small muted" }, `Uploaded versions: ${versions.map((v) => `v${v.version}${v.published_at ? " (listed)" : ""}`).join(", ")}.`) : null,
+      );
+    } catch (err) {
+      if (!isAbortError(err)) mount(resetWarn, h("p", { class: "small muted" }, "Couldn't load this strategy's versions."));
+    }
   };
-  stratSel.addEventListener("change", () => { drawWarn(); mount(resultBox); });
+  stratSel.addEventListener("change", () => {
+    builder = noCodeBuilder(specFor(selected()), (sp) => { spec = sp; });
+    spec = undefined;
+    drawMode();
+    void drawWarn();
+    mount(resultBox);
+  });
   drawMode();
-  drawWarn();
+  void drawWarn();
 
-  let lastVersion: { strategyId: string; versionId: string } | null = null;
-
-  const showResult = (s: CreatorStrategy, r: VersionResult): void => {
-    const vid = String(r.version_id ?? r.id ?? "");
-    const errs = r.validation?.errors ?? r.errors ?? [];
-    const valid = r.validation ? r.validation.ok : errs.length === 0 && r.status !== "failed";
-    lastVersion = vid ? { strategyId: s.id, versionId: vid } : null;
-    const ready = valid && r.backtest && r.backtest.status !== "pending" && r.backtest.status !== "running" && !r.backtest.error;
+  /** Upload result: validation already passed (422 otherwise) and the walk-forward backtest ran in the sandbox.
+   *  The strategy moves to "review" automatically; an admin lists the version (maker-checker). */
+  const showResult = (s: CreatorStrategy, r: CreatorVersion | { errors: string[] }): void => {
+    if ("errors" in r) {
+      mount(resultBox, panel("Validation", h("div", { class: "stack tight" }, h("p", { class: "neg" }, "The sandbox rejected this version:"), h("ul", { class: "small" }, ...r.errors.map((e) => h("li", { class: "break" }, e))))));
+      return;
+    }
+    const bt = r.backtest;
+    const days = typeof bt?.history_days === "number" ? bt.history_days : bt?.period?.sim_days;
+    const shortDays = typeof days === "number" && days < cfg.short_history_warning_days ? Math.floor(days) : null;
     mount(
       resultBox,
       panel(
-        `Validation${r.version ? ` — v${r.version}` : ""}`,
-        valid ? h("p", { class: "pos" }, "Passed the sandbox validator.") : h("div", { class: "stack tight" }, h("p", { class: "neg" }, "The sandbox rejected this version:"), h("ul", { class: "small" }, ...errs.map((e) => h("li", { class: "break" }, e)))),
+        `Validation — v${r.version}`,
+        h("p", { class: "pos" }, "Passed the sandbox validator."),
+        kvWide([["Code hash", h("span", { class: "mono break" }, r.code_hash)], ["Uploaded", fmtDateTime(r.created_at)]]),
       ),
-      valid ? backtestPanel(r.backtest ?? { status: "pending" }, "Backtest results") : null,
-      ready && lastVersion
-        ? panel(
-            "Submit for review",
-            note(BACKTEST_WARNING, "warn"),
-            h("p", { class: "small muted" }, "An admin reviews the code, backtest and description. Listing requires identity verification. Submitting needs a fresh sign-in."),
-            h(
-              "div",
-              { class: "btns" },
-              button("Submit for review", {
-                kind: "primary",
-                onClick: async () => {
-                  const hasLive = !!s.current_version;
-                  const ok = await confirmDialog({
-                    title: "Submit this version for review?",
-                    message: hasLive ? "When approved and published, this version replaces the live one and resets your live track record to zero." : "An admin will review it before it can be listed.",
-                    confirmLabel: "Submit",
-                    danger: hasLive,
-                    requireText: hasLive ? "RESET" : undefined,
-                  });
-                  if (!ok || !lastVersion) return;
-                  await api.post(`/creator/strategies/${encodeURIComponent(lastVersion.strategyId)}/versions/${encodeURIComponent(lastVersion.versionId)}/submit`, {}, { signal: ctx.signal });
-                  toast("Submitted for review.", "good");
-                  ctx.navigate("/creator");
-                },
-              }),
-            ),
-          )
+      backtestPanel(bt, { title: "Backtest results", warning: r.warning, shortHistoryDays: shortDays }),
+      typeof days === "number" && days < cfg.min_listing_history_days
+        ? note(`Only ${Math.floor(days)} days of history: at least ${cfg.min_listing_history_days} days on every market are required to list.`, "bad")
         : null,
+      panel(
+        "Review",
+        note(BACKTEST_WARNING, "warn"),
+        h("p", { class: "small muted" }, s.status === "draft" || s.status === "review"
+          ? "This version is now waiting for admin review (code, backtest, description). Listing requires identity verification."
+          : "An admin must list this version before it replaces the live one."),
+      ),
     );
-  };
-
-  const poll = async (s: CreatorStrategy, vid: string): Promise<void> => {
-    for (let i = 0; i < 90 && ctx.isCurrent(); i++) {
-      await new Promise((r) => setTimeout(r, 5000));
-      if (!ctx.isCurrent()) return;
-      let r: VersionResult;
-      try {
-        r = await api.get<VersionResult>(`/creator/strategies/${encodeURIComponent(s.id)}/versions/${encodeURIComponent(vid)}`, { signal: ctx.signal });
-      } catch (err) {
-        if (isAbortError(err)) return;
-        continue;
-      }
-      showResult(s, r);
-      const bst = r.backtest?.status;
-      if (r.status === "failed" || (r.backtest && bst !== "pending" && bst !== "running")) return;
-    }
   };
 
   mount(
@@ -446,6 +437,13 @@ async function uploadTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfig)
           onClick: async () => {
             const s = selected();
             let payload: Record<string, unknown>;
+            if (published && !(await confirmDialog({
+              title: "Upload a new version?",
+              message: "When an admin lists it, this version replaces the live one and resets your live track record to zero.",
+              confirmLabel: "Upload",
+              danger: true,
+              requireText: "RESET",
+            }))) return;
             if (mode === "python") {
               const errs = precheckPython(code.value);
               if (errs.length && !(await confirmDialog({ title: "Upload anyway?", message: `Quick checks found ${errs.length} issue(s). The sandbox will probably reject it.`, confirmLabel: "Upload anyway" }))) return;
@@ -456,14 +454,18 @@ async function uploadTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfig)
               payload = { source: "nocode", spec: spec ?? builder.spec() };
             }
             mount(resultBox, panel("Validating…", skeleton(4)));
-            let r: VersionResult;
+            let r: CreatorVersion;
             try {
-              r = await api.post<VersionResult>(`/creator/strategies/${encodeURIComponent(s.id)}/versions`, payload, { signal: ctx.signal, timeoutMs: 120_000 });
+              r = await api.post<CreatorVersion>(`/creator/strategies/${encodeURIComponent(s.id)}/versions`, payload, { signal: ctx.signal, timeoutMs: 180_000 });
             } catch (err) {
               if (errCode(err) === "validation_failed") {
+                // details.errors: validator strings, or no-code {path, message}; details.fields for schema errors
                 const d = isRec(err) ? (err as { details?: Record<string, unknown> }).details : undefined;
-                const errs = Array.isArray(d?.errors) ? (d?.errors as unknown[]).map(String) : [errMessage(err)];
-                showResult(s, { status: "failed", validation: { ok: false, errors: errs } });
+                const raw = Array.isArray(d?.errors) ? (d?.errors as unknown[]) : Array.isArray(d?.fields) ? (d?.fields as unknown[]) : [];
+                const errs = raw.length
+                  ? raw.map((x) => (isRec(x) ? [Array.isArray(x.loc) ? x.loc.join(".") : x.path, x.message ?? x.msg].filter(Boolean).join(": ") : String(x)))
+                  : [errMessage(err)];
+                showResult(s, { errors: errs });
                 return;
               }
               mount(resultBox);
@@ -471,9 +473,7 @@ async function uploadTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfig)
             }
             if (!ctx.isCurrent()) return;
             showResult(s, r);
-            const vid = String(r.version_id ?? r.id ?? "");
-            const pending = !r.backtest || r.backtest.status === "pending" || r.backtest.status === "running" || r.status === "validating" || r.status === "backtesting";
-            if (vid && pending && r.status !== "failed" && r.validation?.ok !== false) void poll(s, vid);
+            void drawWarn();
           },
         }),
       ),
@@ -489,7 +489,6 @@ async function postsTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfig):
   const strategies = await loadMyStrategies(ctx).catch(() => [] as CreatorStrategy[]);
   if (!ctx.isCurrent()) return;
   const title = h("input", { type: "text", maxlength: 140, id: "po-title" });
-  const excerpt = h("textarea", { rows: 2, maxlength: 400, id: "po-ex", placeholder: "Teaser shown before purchase (optional)" });
   const bodyIn = h("textarea", { rows: 14, maxlength: 50000, id: "po-body", placeholder: "Markdown: # headings, **bold**, *italic*, lists, [links](https://…)" });
   const strat = h("select", { id: "po-strat" }, h("option", { value: "" }, "— none —"), ...strategies.map((s) => h("option", { value: s.id }, s.name)));
   const paid = checkbox("Paid post", { onChange: () => drawPrice() });
@@ -522,7 +521,6 @@ async function postsTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfig):
       "New post",
       field("Title", title),
       field("Related strategy", strat),
-      field("Teaser", excerpt),
       h("div", { class: "grid-2" }, field("Body (Markdown)", bodyIn), h("div", { class: "stack tight" }, h("span", { class: "fl" }, "Preview"), preview)),
       paid.el,
       priceBox,
@@ -543,79 +541,51 @@ async function postsTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfig):
               if (p === null || p < e.post_min_price_micro) return toast(`Minimum price is ${fmtUsd(e.post_min_price_micro)}.`, "warn");
               priceMicro = p;
             }
-            await api.post("/creator/posts", { title: t, body: b, excerpt: excerpt.value.trim() || null, price_micro: priceMicro, strategy_id: strat.value || null }, { signal: ctx.signal, idempotencyKey: key });
+            await api.post("/creator/posts", { title: t, body: b, price_micro: priceMicro, strategy_id: strat.value || null }, { signal: ctx.signal, idempotencyKey: key });
             key = newIdempotencyKey();
             toast("Post published.", "good");
             title.value = "";
             bodyIn.value = "";
-            excerpt.value = "";
             drawPreview();
-            void loadList();
           },
         }),
       ),
     ),
-    panel("My posts", listBox),
+    panel("My posts", h("p", { class: "small muted" }, "Published posts appear on the public ", h("a", { href: "#/posts" }, "Posts"), " page. Free posts show a 280-character preview there; paid posts show only the title until bought.")),
   );
 
-  const loadList = async (): Promise<void> => {
-    try {
-      const res = await api.get<unknown>("/creator/posts", { signal: ctx.signal });
-      if (!ctx.isCurrent()) return;
-      const posts = listOf<{ id: string; title: string; price_micro: number; published_at?: string | null; sales?: number }>(res, "posts");
-      mount(
-        listBox,
-        table({
-          columns: [
-            { key: "t", label: "Title", value: (p) => h("a", { href: `#/posts/${encodeURIComponent(p.id)}` }, p.title), primary: true },
-            { key: "p", label: "Price", value: (p) => (p.price_micro > 0 ? fmtUsd(p.price_micro) : "Free"), align: "right", mono: true },
-            { key: "s", label: "Sales", value: (p) => (typeof p.sales === "number" ? String(p.sales) : "—"), align: "right", mono: true },
-            { key: "d", label: "Published", value: (p) => (p.published_at ? fmtDate(p.published_at) : "—") },
-          ],
-          rows: posts,
-          rowKey: (p) => p.id,
-          empty: "No posts yet.",
-        }),
-      );
-    } catch (err) {
-      if (isAbortError(err) || !ctx.isCurrent()) return;
-      if (errCode(err) === "not_found") mount(listBox, h("p", { class: "small muted" }, "Your published posts appear on the public Posts page."));
-      else mount(listBox, errorState(err, () => void loadList()));
-    }
-  };
-  await loadList();
 }
 
 // ------------------------------------------------------------------------------------------ earnings
-async function earningsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
+async function earningsTab(body: HTMLElement, ctx: PageContext, cfg: PublicConfig): Promise<void> {
   mount(body, skeleton(8));
   try {
-    const e = await api.get<Record<string, unknown>>("/creator/earnings", { signal: ctx.signal });
+    const e = await api.get<Earnings>("/creator/earnings", { signal: ctx.signal });
     if (!ctx.isCurrent()) return;
-    const labels: Record<string, string> = {
-      total_micro: "Earned (all time)",
-      earned_30d_micro: "Earned (30 days)",
-      payable_micro: "Payable",
-      pending_micro: "Pending",
-      paid_out_micro: "Paid out",
-      subscriptions_micro: "Subscriptions",
-      profit_share_micro: "Profit share",
-      builder_micro: "Builder-fee share",
-      posts_micro: "Paid posts",
-    };
-    const bySource = isRec(e.by_source) ? e.by_source : {};
-    const tiles: Child[] = [];
-    for (const [k, l] of Object.entries(labels)) {
-      const v = typeof e[k] === "number" ? e[k] : typeof bySource[k.replace(/_micro$/, "")] === "number" ? bySource[k.replace(/_micro$/, "")] : undefined;
-      if (typeof v === "number") tiles.push(stat(l, fmtUsd(v)));
-    }
-    const hist = listOf<{ created_at: string; kind: string; amount_micro: number; memo?: string | null }>(e, "history", "entries", "ledger");
     mount(
       body,
-      tiles.length ? h("div", { class: "stats" }, ...tiles) : null,
-      note("Payouts require verified identity and are approved by two administrators, then sent as USDC on Hyperliquid.", "info"),
+      h(
+        "div",
+        { class: "stats" },
+        stat("Earned (all time)", fmtUsd(e.total_earned_micro)),
+        stat("Payable", fmtUsd(e.payable_micro)),
+        stat("Payouts pending", fmtUsd(e.payouts_pending_micro)),
+      ),
       panel(
-        "Earnings history",
+        "By strategy",
+        table({
+          columns: [
+            { key: "s", label: "Strategy", value: (r) => r.slug, primary: true },
+            { key: "a", label: "Active subscribers", value: (r) => String(r.active_subscribers), align: "right", mono: true },
+          ],
+          rows: e.by_strategy,
+          rowKey: (r) => r.strategy_id,
+          empty: "No strategies yet.",
+        }),
+      ),
+      panel("Request a payout", note("Payouts require verified identity (KYC) and are approved by two administrators, then sent as USDC on Hyperliquid.", "info"), payoutForm(ctx, cfg, "creator", e.payable_micro, () => void earningsTab(body, ctx, cfg))),
+      panel(
+        "Recent earnings",
         table({
           columns: [
             { key: "d", label: "Date", value: (r) => fmtDateTime(r.created_at), primary: true },
@@ -623,13 +593,14 @@ async function earningsTab(body: HTMLElement, ctx: PageContext): Promise<void> {
             { key: "m", label: "Details", value: (r) => r.memo ?? "", hideOnMobile: true },
             { key: "a", label: "Amount", value: (r) => fmtUsd(r.amount_micro, { sign: true }), align: "right", mono: true },
           ],
-          rows: hist,
+          rows: e.recent,
+          rowKey: (r) => r.tx_id,
           empty: "No earnings yet.",
         }),
       ),
     );
   } catch (err) {
     if (isAbortError(err) || !ctx.isCurrent()) return;
-    mount(body, errorState(err, () => void earningsTab(body, ctx)));
+    mount(body, errorState(err, () => void earningsTab(body, ctx, cfg)));
   }
 }

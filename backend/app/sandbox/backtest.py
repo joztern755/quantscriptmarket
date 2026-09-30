@@ -238,6 +238,9 @@ class StoredCandleSource(Protocol):
 
     def stored_candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list[dict[str, Any]]: ...
 
+    # optional: ``is_backfilled(coin, interval) -> bool`` — True when the store already holds everything the API
+    # served for that series (then no API call is made for the range before the first stored candle)
+
 
 class StoredFirstFetcher:
     """``CandleFetcher`` that reads stored candles first and asks the API (``api``, e.g. ``HyperliquidInfoFetcher``)
@@ -263,8 +266,9 @@ class StoredFirstFetcher:
             api_rows = self.api.candles(coin, interval, start_ms, end_ms)
         else:
             first, last = int(stored[0]["t"]), int(stored[-1]["t"])
-            if first - step > start_ms:           # store starts later than asked (not backfilled): fill the head
-                api_rows += self.api.candles(coin, interval, start_ms, first - 1)
+            backfilled = getattr(self.store, "is_backfilled", None)
+            if first - step > start_ms and not (callable(backfilled) and backfilled(coin, interval)):
+                api_rows += self.api.candles(coin, interval, start_ms, first - 1)   # store not backfilled yet
             if last + step <= end_ms:             # bars after the last stored one
                 api_rows += self.api.candles(coin, interval, last + step, end_ms)
         used_api = []

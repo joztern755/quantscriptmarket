@@ -16,6 +16,7 @@ import { fmtUsd, fmtBps, fmtTenthsBp, shortAddr, microToDecimal } from "../core/
 import type { StrategyDetail, Subscription, Balance, AgentOut, AgentCreateOut } from "./_shared/types.js";
 import { ApiError } from "../core/api.js";
 import { ensurePageCss, isAbortError, errCode, errMessage, listOf, isAddress, hlNum, usdInput, LOSS_WARNING, isRec, feesList } from "./_shared/util.js";
+import { requireAlertContacts } from "./_shared/contacts.js";
 
 /** `details.reason` of an API error (backend Conflict/Forbidden reasons, docs/API_CONTRACT.md). */
 function errReason(err: unknown): string {
@@ -808,6 +809,7 @@ class Wizard {
           kind: "primary",
           disabled: missing.length > 0 || m === null,
           onClick: async () => {
+            if (!(await requireAlertContacts(this.ctx.signal))) return; // SPEC §12: Telegram + email before the first subscription
             if (!st.subKey) {
               st.subKey = newIdempotencyKey();
               this.save();
@@ -840,6 +842,7 @@ class Wizard {
                 this.balance = null;
                 return restart({}, "Your fee balance is too low. Top up and try again.");
               }
+              if (c === "contacts_required") return restart({}, "Link Telegram and confirm your email for alerts first (Alerts page), then confirm again.");
               if (reason === "trading_address_in_use") return restart({ trading: undefined }, "That trading account already runs a strategy. Choose another account.");
               if (reason === "subscription_ack_required") return restart({ gateAccepted: false }, "Please review and accept the strategy's risks and fees again (valid for 30 minutes).");
               if (reason === "terms_changed") return restart({ gateAccepted: false }, "The strategy's price or profit share changed. Please review the new terms.");
