@@ -952,7 +952,8 @@ def executor_selftest(*, db: Any, now: datetime, runtime: Runtime | None = None)
     rt = runtime or get_runtime()
     pdb = _db(db)
     rt.bind_db(pdb)
-    return _run(pdb, _aware(now), runtime=rt, signer_factory=lambda: _attest_signer(rt))
+    return _run(pdb, _aware(now), runtime=rt, signer_factory=lambda: _attest_signer(rt),
+                encryptor_factory=lambda: _agent_encryptor(rt))
 
 
 __all__ += ["generate_agents", "tick_generate_agents", "attest_agents", "agent_substitution_scan", "executor_selftest"]

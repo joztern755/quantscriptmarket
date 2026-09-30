@@ -496,6 +496,24 @@ class ExecutorKeygenDbTest(unittest.TestCase):
         with self.assertRaises(Forbidden):
             jobs.generate_agents(db=self.db, now=T0, runtime=api_rt, decryptor=self.dec, signer=self.signer)
 
+    def test_selftest_proves_agent_key_encrypt(self) -> None:
+        """Deploy canary: a new executor revision without agent-keys ENCRYPT would leave every request stuck."""
+        from app.execution.trust_jobs import executor_selftest
+
+        rt = SimpleNamespace(settings=SimpleNamespace(is_prod=False, service_role="executor"),
+                             info=SimpleNamespace(meta=lambda: {"universe": []}), executor=lambda db, now=None: object())
+        out = executor_selftest(self.db, T0, runtime=rt, signer_factory=lambda: self.signer, open_one_key=False,
+                                encryptor_factory=lambda: self.enc)
+        self.assertTrue(out["ok"], out)
+        self.assertTrue(out["checks"]["kms_agent_encrypt"].startswith("ok"))
+
+        def no_iam() -> Any:
+            raise Forbidden("agent keys are generated and sealed only by the executor service")
+        bad = executor_selftest(self.db, T0, runtime=rt, signer_factory=lambda: self.signer, open_one_key=False,
+                                encryptor_factory=no_iam)
+        self.assertFalse(bad["ok"])
+        self.assertTrue(bad["checks"]["kms_agent_encrypt"].startswith("FAIL"))
+
     def test_infra_verify_sql_asserts_the_privilege_model(self) -> None:
         verify = ROOT / "infra/gcp/sql/20_verify.sql"
         args = ["psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", self.url, "-v", "api_user=app_api",

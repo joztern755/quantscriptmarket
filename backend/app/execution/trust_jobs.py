@@ -31,7 +31,8 @@
 ``executor_selftest(db, now, runtime=)`` — ``/v1/internal/selftest`` (deploy, before traffic moves: M4)
     A side-effect-free "dry-run tick": builds the executor composition, reads flags / latest signals / due
     subscriptions (SELECT only), reaches Hyperliquid /info, opens ONE live agent key through KMS and zeroises it
-    (no order is built or sent), and loads the attestation key's public key. Never writes the database.
+    (no order is built or sent), loads the attestation key's public key and (0016) proves the agent-keys ENCRYPT
+    permission with one discarded test envelope. Never writes the database.
 """
 from __future__ import annotations
 
@@ -265,7 +266,8 @@ def agent_substitution_scan(db: Any, now: datetime, *, info: Any = None, setting
 
 # ============================================================================================ selftest
 def executor_selftest(db: Any, now: datetime, *, runtime: Any, signer_factory: Optional[Callable[[], Any]] = None,
-                      open_one_key: bool = True) -> dict[str, Any]:
+                      open_one_key: bool = True,
+                      encryptor_factory: Optional[Callable[[], Any]] = None) -> dict[str, Any]:
     """Side-effect-free readiness probe of a NEW executor revision (see module doc). Returns {ok, checks}."""
     from app.execution.pg import PgDatabase, PgFlagRepo, PgSignalRepo, PgSubscriptionRepo
 
@@ -313,6 +315,19 @@ def executor_selftest(db: Any, now: datetime, *, runtime: Any, signer_factory: O
         signer = (signer_factory or (lambda: make_attestation_signer(runtime.settings)))()
         return f"{len(signer.public_key_spki_der())}-byte public key, {signer.key_version[-40:]}"
     run("attestation_key", _attest)
+
+    if encryptor_factory is not None:
+        def _seal() -> str:
+            # agent-keys ENCRYPT (the executor generates agent keys, 0016): one KMS encrypt of 32 zero bytes, discarded
+            from app.security.kms import zeroize
+
+            buf = bytearray(32)
+            try:
+                blob = encryptor_factory().seal(buf, b"aijalon/selftest/agent-keys-encrypt")
+            finally:
+                zeroize(buf)
+            return f"sealed a {len(blob.blob)}-byte test envelope (discarded; key version {str(blob.key_version)[-40:]})"
+        run("kms_agent_encrypt", _seal)
 
     ok = all(v.startswith("ok") for v in checks.values())
     log.info("executor_selftest", extra={"fields": {"ok": ok, **checks}})
