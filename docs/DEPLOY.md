@@ -106,7 +106,7 @@ BILLING_ACCOUNT=XXXXXX-XXXXXX-XXXXXX GITHUB_REPO_ID=$(gh api repos/joztern755/qu
 | `kms` | keyring `aijalon`; key `agent-keys` (ENCRYPT_DECRYPT, **HSM**, rotation 90 d, destroy delay 90 d); key `cloudsql` (HSM, CMEK for the database disk) + grant to the Cloud SQL service agent |
 | `registry` | Artifact Registry `aijalon` (immutable tags; vulnerability scanning) |
 | `sa` | service accounts and least-privilege bindings (table in ARCHITECTURE §3) |
-| `secrets` | the secret **names** (user-managed replication in `asia-southeast1`), per-secret accessor bindings (`SECRETS_SPEC` in `infra/gcp/env.sh`); generates random values for `AUDIT_PEPPER`, `EDGE_AUTH_SECRET`, `TELEGRAM_WEBHOOK_SECRET`, `DB_MIGRATOR_PASSWORD`, `SANDBOX_SHARED_SECRET` (never printed); seeds `ALLOWLIST_EMAILS` and `OPS_EMAILS` with the owner e-mail; creates the optional `KYC_APP_TOKEN`, `KYC_SECRET_KEY`, `KYC_WEBHOOK_SECRET` without a value (used only with `KYC_PROVIDER=sumsub`) |
+| `secrets` | the secret **names** (user-managed replication in `asia-southeast1`), per-secret accessor bindings (`SECRETS_SPEC` in `infra/gcp/env.sh`); generates random values for `AUDIT_PEPPER`, `EDGE_AUTH_SECRET`, `TELEGRAM_WEBHOOK_SECRET`, `DB_MIGRATOR_PASSWORD`, `SANDBOX_SHARED_SECRET`, `CLOID_SECRET` (never printed); seeds `ALLOWLIST_EMAILS` and `OPS_EMAILS` with the owner e-mail; creates the optional `KYC_APP_TOKEN`, `KYC_SECRET_KEY`, `KYC_WEBHOOK_SECRET` without a value (used only with `KYC_PROVIDER=sumsub`) |
 | `sql` | Cloud SQL `aijalon-pg`: Postgres 16, Enterprise edition, sized by `SQL_TIER` / `SQL_AVAILABILITY` in `infra/gcp/env.sh` — **internal phase (owner, cost): `db-custom-1-3840` ZONAL, 20 GB**; before Gate C (public): `db-custom-2-8192` **REGIONAL HA** (`gcloud sql instances patch aijalon-pg --availability-type=REGIONAL --tier=db-custom-2-8192` in the maintenance window, then set both defaults back), private IP only, `ENCRYPTED_ONLY`, CMEK, PITR (7 days of WAL), 30 automated daily backups, deletion protection, maintenance Sun 19:00 UTC, flags `cloudsql.iam_authentication=on`, `max_connections=200`, pgaudit (DDL + ROLE), connection/lock/slow-query logging; the built-in `postgres` password is set to a random value and discarded. On re-runs it only **verifies** these settings |
 | `run` | placeholder revisions of `api` (ingress internal-and-cloud-load-balancing), `executor` and `sandbox` (ingress internal); invoker IAM (api: allUsers — the LB/Armor/app gate it; executor: scheduler SA only; sandbox: api + executor SAs only) |
 | `lb` | global external HTTPS LB → serverless NEG(api); Cloud Armor: default deny, allow Cloudflare IPv4 ranges only, deny when `X-Edge-Auth` is wrong; Certificate Manager cert for `api.aijalon.trade` via DNS authorization; TLS ≥ 1.2 MODERN |
@@ -145,6 +145,7 @@ add_secret STRIPE_SECRET_KEY
 | `TREASURY_ADDRESS` | treasury wallet address, lower-case `0x…` (step 12) | hardware wallet | api, executor |
 | `DB_MIGRATOR_PASSWORD` | **generated**; used only by the migrate job and `db_bootstrap.sh` | — | migrator SA |
 | `SANDBOX_SHARED_SECRET` | **generated**; `X-Sandbox-Secret` between api/executor and the sandbox | — | api, executor, sandbox |
+| `CLOID_SECRET` | **generated**; HMAC key of our order cloids (REVIEW_MONEY H2: users must not be able to compute them); never rotate while orders are unresolved | — | executor |
 | `ALLOWLIST_EMAILS` | comma-separated e-mails allowed to sign up while `LAUNCH_PHASE=internal` (lower-cased by the app). **Seeded** with the owner e-mail; replace with the team list. Personal data → secret, not a GitHub variable. The app refuses to start in the internal phase when it is empty | owner | api, executor |
 | `OPS_EMAILS` | comma-separated ops alert recipients (e-mail leg of ops alerts). **Seeded** with the owner e-mail | owner | api, executor |
 | `KYC_APP_TOKEN`, `KYC_SECRET_KEY`, `KYC_WEBHOOK_SECRET` | **optional** — only when `KYC_PROVIDER=sumsub` (§5.4): Sumsub app token, secret key, webhook secret. Left without a version while KYC is `manual`; the api template references them only for `sumsub` | Sumsub dashboard | api |
@@ -220,6 +221,7 @@ Plain values are rendered into `infra/gcp/run/*.yaml` at deploy time (`infra/gcp
 | `ALLOWLIST_EMAILS`, `OPS_EMAILS` | api, executor | secret (personal data) | seeded with the owner e-mail | owner |
 | `AUDIT_PEPPER_B64` (secret `AUDIT_PEPPER`) | api, executor | secret | generated | bootstrap |
 | `SANDBOX_SHARED_SECRET` | api, executor, sandbox | secret | generated | bootstrap |
+| `CLOID_SECRET` | executor | secret | generated | bootstrap |
 | `SANDBOX_MAX_CONCURRENT` | sandbox | plain | `4` (read by `app/sandbox/service.py`, not config.py) | template |
 
 The api no longer carries `SCHEDULER_SA_EMAIL` / `INTERNAL_AUDIENCE`: every `/v1/internal/*` route is mounted only by `create_executor_app`.
